@@ -15,27 +15,52 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "../server.h"
-#include "../bson/util/atomic_int.h"
-#include "../util/concurrency/mvar.h"
-#include "../util/concurrency/thread_pool.h"
-#include "../util/concurrency/list.h"
-#include "../util/timer.h"
-#include <boost/thread.hpp>
-#include <boost/bind.hpp>
-#include "../db/d_concurrency.h"
-#include "../util/concurrency/synchronization.h"
-#include "../util/concurrency/qlock.h"
-#include "dbtests.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-namespace mongo { 
-    void testNonGreedy();
-}
+#include "mongo/platform/basic.h"
+
+#include <boost/thread.hpp>
+#include <boost/version.hpp>
+#include <iostream>
+
+#include "mongo/config.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/bits.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/mvar.h"
+#include "mongo/util/concurrency/rwlock.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 
 namespace ThreadedTests {
+
+    using std::auto_ptr;
+    using std::cout;
+    using std::endl;
+    using std::string;
 
     template <int nthreads_param=10>
     class ThreadedTest {
@@ -59,232 +84,212 @@ namespace ThreadedTests {
             if (!remaining) 
                 return;
 
-            boost::thread athread(boost::bind(&ThreadedTest::subthread, this, remaining));
+            boost::thread athread(stdx::bind(&ThreadedTest::subthread, this, remaining));
             launch_subthreads(remaining - 1);
             athread.join();
         }
     };
 
+
+#ifdef MONGO_PLATFORM_32
+    // Avoid OOM on Linux-32 by using fewer threads
+    const int nthr=45;
+#else
     const int nthr=135;
-    //const int nthr=7;
+#endif
     class MongoMutexTest : public ThreadedTest<nthr> {
-#if defined(_DEBUG)
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
         enum { N = 2000 };
 #else
         enum { N = 4000/*0*/ };
 #endif
         ProgressMeter pm;
-    public:
-        int upgradeWorked, upgradeFailed;
-        MongoMutexTest() : pm(N * nthreads) {
-            upgradeWorked = upgradeFailed = 0;
-        }
-        void run() {
-            DEV {
-                // in _DEBUG builds on linux we mprotect each time a writelock
-                // is taken. That can greatly slow down this test if there are
-                // many open files
-                DBDirectClient db;
-                db.simpleCommand("admin", NULL, "closeAllDatabases");
-            }
 
+    public:
+        MongoMutexTest() : pm(N * nthreads) {
+
+        }
+
+        void run() {
             Timer t;
             cout << "MongoMutexTest N:" << N << endl;
             ThreadedTest<nthr>::run();
             cout << "MongoMutexTest " << t.millis() << "ms" << endl;
         }
+
     private:
-        virtual void setup() {
-        }
+
         virtual void subthread(int tnumber) {
             Client::initThread("mongomutextest");
+
+            OperationContextImpl txn;
+
             sleepmillis(0);
             for( int i = 0; i < N; i++ ) {
                 int x = std::rand();
                 bool sometimes = (x % 15 == 0);
                 if( i % 7 == 0 ) {
-                    Lock::GlobalRead r; // nested test
-                    Lock::GlobalRead r2;
-                    if( sometimes ) {
-                        Lock::TempRelease t;
-                    }
+                    Lock::GlobalRead r(txn.lockState()); // nested test
+                    Lock::GlobalRead r2(txn.lockState());
                 }
                 else if( i % 7 == 1 ) {
-                    Lock::GlobalRead r;
-                    ASSERT( d.dbMutex.atLeastReadLocked() );
-                    ASSERT( Lock::isLocked() );
-                    if( sometimes ) {
-                        Lock::TempRelease t;
-                    }
+                    Lock::GlobalRead r(txn.lockState());
+                    ASSERT(txn.lockState()->isReadLocked());
                 }
                 else if( i % 7 == 4 && 
                          tnumber == 1 /*only one upgrader legal*/ ) {
-                    Lock::GlobalWrite w;
-                    ASSERT( d.dbMutex.isWriteLocked() );
-                    ASSERT( Lock::isW() );
+                    Lock::GlobalWrite w(txn.lockState());
+                    ASSERT( txn.lockState()->isW() );
                     if( i % 7 == 2 ) {
-                        Lock::TempRelease t;
-                    }
-                    if( sometimes ) { 
-                        w.downgrade();
-                        sleepmillis(0);
-                        bool worked = w.upgrade();
-                        if( worked) upgradeWorked++;
-                        else upgradeFailed++;
+                        Lock::TempRelease t(txn.lockState());
                     }
                 }
                 else if( i % 7 == 2 ) {
-                    Lock::GlobalWrite w;
-                    ASSERT( d.dbMutex.isWriteLocked() );
-                    ASSERT( Lock::isW() );
+                    Lock::GlobalWrite w(txn.lockState());
+                    ASSERT( txn.lockState()->isW() );
                     if( sometimes ) {
-                        Lock::TempRelease t;
+                        Lock::TempRelease t(txn.lockState());
                     }
                 }
                 else if( i % 7 == 3 ) {
-                    Lock::GlobalWrite w;
+                    Lock::GlobalWrite w(txn.lockState());
                     {
-                        Lock::TempRelease t;
+                        Lock::TempRelease t(txn.lockState());
                     }
-                    Lock::GlobalRead r;
-                    ASSERT( d.dbMutex.isWriteLocked() );
-                    ASSERT( Lock::isW() );
+                    Lock::GlobalRead r(txn.lockState());
+                    ASSERT( txn.lockState()->isW() );
                     if( sometimes ) {
-                        Lock::TempRelease t;
+                        Lock::TempRelease t(txn.lockState());
                     }
                 }
                 else if( i % 7 == 5 ) {
                     {
-                        Lock::DBRead r("foo");
-                        if( sometimes ) {
-                            Lock::TempRelease t;
-                        }
+                        ScopedTransaction scopedXact(&txn, MODE_IS);
+                        Lock::DBLock r(txn.lockState(), "foo", MODE_S);
                     }
                     {
-                        Lock::DBRead r("bar");
+                        ScopedTransaction scopedXact(&txn, MODE_IS);
+                        Lock::DBLock r(txn.lockState(), "bar", MODE_S);
                     }
                 }
                 else if( i % 7 == 6 ) {
                     if( i > N/2 ) { 
                         int q = i % 11;
                         if( q == 0 ) { 
-                            char what = Lock::dbLevelLockingEnabled() ? 'r' : 'R';
-                            Lock::DBRead r("foo");
-                            ASSERT( Lock::isLocked() == what && Lock::atLeastReadLocked("foo") );
-                            ASSERT( !Lock::nested() );
-                            Lock::DBRead r2("foo");
-                            ASSERT( Lock::nested() );
-                            ASSERT( Lock::isLocked() == what && Lock::atLeastReadLocked("foo") );
-                            Lock::DBRead r3("local");
-                            if( sometimes ) {
-                                Lock::TempRelease t;
-                            }
-                            ASSERT( Lock::isLocked() == what && Lock::atLeastReadLocked("foo") );
-                            ASSERT( Lock::isLocked() == what && Lock::atLeastReadLocked("local") );
+                            ScopedTransaction scopedXact(&txn, MODE_IS);
+
+                            Lock::DBLock r(txn.lockState(), "foo", MODE_S);
+                            ASSERT(txn.lockState()->isDbLockedForMode("foo", MODE_S));
+
+                            Lock::DBLock r2(txn.lockState(), "foo", MODE_S);
+                            ASSERT(txn.lockState()->isDbLockedForMode("foo", MODE_S));
+
+                            Lock::DBLock r3(txn.lockState(), "local", MODE_S);
+                            ASSERT(txn.lockState()->isDbLockedForMode("foo", MODE_S));
+                            ASSERT(txn.lockState()->isDbLockedForMode("local", MODE_S));
                         }
                         else if( q == 1 ) {
-                            // test locking local only -- with no preceeding lock
+                            // test locking local only -- with no preceding lock
                             { 
-                                Lock::DBRead x("local"); 
-                                //Lock::DBRead y("q");
-                                if( sometimes ) {
-                                    Lock::TempRelease t; // we don't temprelease (cant=true) here thus this is just a check that nothing weird happens...
-                                }
+                                ScopedTransaction scopedXact(&txn, MODE_IS);
+                                Lock::DBLock x(txn.lockState(), "local", MODE_S);
                             }
-                            { 
-                                Lock::DBWrite x("local"); 
+                            {
+                                ScopedTransaction scopedXact(&txn, MODE_IX);
+                                Lock::DBLock x(txn.lockState(), "local", MODE_X);
+
+                                //  No actual writing here, so no WriteUnitOfWork
                                 if( sometimes ) {
-                                    Lock::TempRelease t;
+                                    Lock::TempRelease t(txn.lockState());
                                 }
                             }
                         } else if( q == 1 ) {
-                            { Lock::DBRead  x("admin"); }
-                            { Lock::DBWrite x("admin"); }
-                        } else if( q == 2 ) { 
-                            /*Lock::DBWrite x("foo");
-                            Lock::DBWrite y("admin");
-                            { Lock::TempRelease t; }*/
+                            {
+                                ScopedTransaction scopedXact(&txn, MODE_IS);
+                                Lock::DBLock  x(txn.lockState(), "admin", MODE_S);
+                            }
+
+                            { 
+                                ScopedTransaction scopedXact(&txn, MODE_IX);
+                                Lock::DBLock x(txn.lockState(), "admin", MODE_X);
+                            }
                         }
                         else if( q == 3 ) {
-                            Lock::DBWrite x("foo");
-                            Lock::DBRead y("admin");
-                            { Lock::TempRelease t; }
-                        } 
+                            ScopedTransaction scopedXact(&txn, MODE_IX);
+
+                            Lock::DBLock x(txn.lockState(), "foo", MODE_X);
+                            Lock::DBLock y(txn.lockState(), "admin", MODE_S);
+                        }
                         else if( q == 4 ) { 
-                            Lock::DBRead x("foo2");
-                            Lock::DBRead y("admin");
-                            { Lock::TempRelease t; }
+                            ScopedTransaction scopedXact(&txn, MODE_IS);
+
+                            Lock::DBLock x(txn.lockState(), "foo2", MODE_S);
+                            Lock::DBLock y(txn.lockState(), "admin", MODE_S);
                         }
                         else { 
-                            Lock::DBWrite w("foo");
+                            ScopedTransaction scopedXact(&txn, MODE_IX);
+
+                            Lock::DBLock w(txn.lockState(), "foo", MODE_X);
+
                             {
-                                Lock::TempRelease t;
+                                Lock::TempRelease t(txn.lockState());
                             }
-                            Lock::DBRead r2("foo");
-                            Lock::DBRead r3("local");
-                            if( sometimes ) {
-                                Lock::TempRelease t;
-                            }
+
+                            Lock::DBLock r2(txn.lockState(), "foo", MODE_S);
+                            Lock::DBLock r3(txn.lockState(), "local", MODE_S);
                         }
                     }
                     else { 
-                        Lock::DBRead r("foo");
-                        Lock::DBRead r2("foo");
-                        Lock::DBRead r3("local");
+                        ScopedTransaction scopedXact(&txn, MODE_IS);
+
+                        Lock::DBLock r(txn.lockState(), "foo", MODE_S);
+                        Lock::DBLock r2(txn.lockState(), "foo", MODE_S);
+                        Lock::DBLock r3(txn.lockState(), "local", MODE_S);
                     }
-                }
-                else {
-                    Lock::ThreadSpanningOp::setWLockedNongreedy();
-                    Lock::ThreadSpanningOp::unsetW();
-                    Lock::ThreadSpanningOp::setWLockedNongreedy();
-                    Lock::ThreadSpanningOp::W_to_R();
-                    Lock::ThreadSpanningOp::unsetR();
                 }
                 pm.hit();
             }
-            cc().shutdown();
         }
+
         virtual void validate() {
-            log() << "mongomutextest validate" << endl;
-            ASSERT( !d.dbMutex.atLeastReadLocked() );
-            ASSERT( upgradeWorked > upgradeFailed );
-            ASSERT( upgradeWorked > 4 );
             {
-                    Lock::GlobalWrite w;
+                MMAPV1LockerImpl ls;
+                Lock::GlobalWrite w(&ls);
             }
             {
-                    Lock::GlobalRead r;
+                MMAPV1LockerImpl ls;
+                Lock::GlobalRead r(&ls);
             }
         }
     };
 
-    // Tested with up to 30k threads
-    class IsAtomicUIntAtomic : public ThreadedTest<> {
+    template <typename _AtomicUInt>
+    class IsAtomicWordAtomic : public ThreadedTest<> {
         static const int iterations = 1000000;
-        AtomicUInt target;
+        typedef typename _AtomicUInt::WordType WordType;
+        _AtomicUInt target;
 
         void subthread(int) {
             for(int i=0; i < iterations; i++) {
-                //target.x++; // verified to fail with this version
-                target++;
+                target.fetchAndAdd(WordType(1));
             }
         }
         void validate() {
-            ASSERT_EQUALS(target.x , unsigned(nthreads * iterations));
+            ASSERT_EQUALS(target.load() , unsigned(nthreads * iterations));
 
-            AtomicUInt u;
-            ASSERT_EQUALS(0u, u);
-            ASSERT_EQUALS(0u, u++);
-            ASSERT_EQUALS(2u, ++u);
-            ASSERT_EQUALS(2u, u--);
-            ASSERT_EQUALS(0u, --u);
-            ASSERT_EQUALS(0u, u);
-            
-            u++;
-            ASSERT( u > 0 );
+            _AtomicUInt u;
+            ASSERT_EQUALS(0u, u.load());
+            ASSERT_EQUALS(0u, u.fetchAndAdd(WordType(1)));
+            ASSERT_EQUALS(2u, u.addAndFetch(WordType(1)));
+            ASSERT_EQUALS(2u, u.fetchAndSubtract(WordType(1)));
+            ASSERT_EQUALS(0u, u.subtractAndFetch(WordType(1)));
+            ASSERT_EQUALS(0u, u.load());
 
-            u--;
-            ASSERT( ! ( u > 0 ) );
+            u.fetchAndAdd(WordType(1));
+            ASSERT_GREATER_THAN(u.load(), WordType(0));
+
+            u.fetchAndSubtract(WordType(1));
+            ASSERT_NOT_GREATER_THAN(u.load(), WordType(0));
         }
     };
 
@@ -299,7 +304,7 @@ namespace ThreadedTests {
                 int val = target.take();
 #if BOOST_VERSION >= 103500
                 //increase chances of catching failure
-                boost::this_thread::yield();
+                stdx::this_thread::yield();
 #endif
                 target.put(val+1);
             }
@@ -310,13 +315,13 @@ namespace ThreadedTests {
     };
 
     class ThreadPoolTest {
-        static const int iterations = 10000;
-        static const int nThreads = 8;
+        static const unsigned iterations = 10000;
+        static const unsigned nThreads = 8;
 
-        AtomicUInt counter;
-        void increment(int n) {
-            for (int i=0; i<n; i++) {
-                counter++;
+        AtomicUInt32 counter;
+        void increment(unsigned n) {
+            for (unsigned i=0; i<n; i++) {
+                counter.fetchAndAdd(1);
             }
         }
 
@@ -324,28 +329,13 @@ namespace ThreadedTests {
         void run() {
             ThreadPool tp(nThreads);
 
-            for (int i=0; i < iterations; i++) {
+            for (unsigned i=0; i < iterations; i++) {
                 tp.schedule(&ThreadPoolTest::increment, this, 2);
             }
 
             tp.join();
 
-            ASSERT(counter == (unsigned)(iterations * 2));
-        }
-    };
-
-    class LockTest {
-    public:
-        void run() {
-            // quick atomicint wrap test
-            // MSGID likely assumes this semantic
-            AtomicUInt counter = 0xffffffff;
-            counter++;
-            ASSERT( counter == 0 );
-
-            writelocktry lk( 0 );
-            ASSERT( lk.got() );
-            ASSERT( d.dbMutex.isWriteLocked() );
+            ASSERT_EQUALS(counter.load(), iterations * 2);
         }
     };
 
@@ -361,14 +351,14 @@ namespace ThreadedTests {
 
     class RWLockTest2 { 
     public:
-        static void worker1( RWLockRecursiveNongreedy * lk , AtomicUInt * x ) {
-            (*x)++; // 1
+        static void worker1( RWLockRecursiveNongreedy * lk , AtomicUInt32 * x ) {
+            x->fetchAndAdd(1); // 1
             RWLockRecursiveNongreedy::Exclusive b(*lk);
-            (*x)++; // 2
+            x->fetchAndAdd(1); // 2
         }
-        static void worker2( RWLockRecursiveNongreedy * lk , AtomicUInt * x ) {
+        static void worker2( RWLockRecursiveNongreedy * lk , AtomicUInt32 * x ) {
             RWLockRecursiveNongreedy::Shared c(*lk);
-            (*x)++;
+            x->fetchAndAdd(1);
         }
         void run() { 
             /**
@@ -377,34 +367,34 @@ namespace ThreadedTests {
             RWLockRecursiveNongreedy lk( "eliot2" , 120 * 1000 );
             cout << "RWLock impl: " << lk.implType() << endl;
             auto_ptr<RWLockRecursiveNongreedy::Shared> a( new RWLockRecursiveNongreedy::Shared(lk) );            
-            AtomicUInt x1 = 0;
+            AtomicUInt32 x1(0);
             cout << "A : " << &x1 << endl;
-            boost::thread t1( boost::bind( worker1 , &lk , &x1 ) );
-            while ( ! x1 );
-            verify( x1 == 1 );
+            boost::thread t1( stdx::bind( worker1 , &lk , &x1 ) );
+            while ( ! x1.load() );
+            verify( x1.load() == 1 );
             sleepmillis( 500 );
-            verify( x1 == 1 );            
-            AtomicUInt x2 = 0;
-            boost::thread t2( boost::bind( worker2, &lk , &x2 ) );
+            verify( x1.load() == 1 );            
+            AtomicUInt32 x2(0);
+            boost::thread t2( stdx::bind( worker2, &lk , &x2 ) );
             t2.join();
-            verify( x2 == 1 );
+            verify( x2.load() == 1 );
             a.reset();
             for ( int i=0; i<2000; i++ ) {
-                if ( x1 == 2 )
+                if ( x1.load() == 2 )
                     break;
                 sleepmillis(1);
             }
-            verify( x1 == 2 );
+            verify( x1.load() == 2 );
             t1.join();            
         }
     };
 
     class RWLockTest3 { 
     public:        
-        static void worker2( RWLockRecursiveNongreedy * lk , AtomicUInt * x ) {
+        static void worker2( RWLockRecursiveNongreedy * lk , AtomicUInt32 * x ) {
     	    verify( ! lk->__lock_try(0) );
             RWLockRecursiveNongreedy::Shared c( *lk  );
-            (*x)++;
+            x->fetchAndAdd(1);
         }
 
         void run() { 
@@ -416,11 +406,11 @@ namespace ThreadedTests {
             
             auto_ptr<RWLockRecursiveNongreedy::Shared> a( new RWLockRecursiveNongreedy::Shared( lk ) );
             
-            AtomicUInt x2 = 0;
+            AtomicUInt32 x2(0);
 
-            boost::thread t2( boost::bind( worker2, &lk , &x2 ) );
+            boost::thread t2( stdx::bind( worker2, &lk , &x2 ) );
             t2.join();
-            verify( x2 == 1 );
+            verify( x2.load() == 1 );
 
             a.reset();            
         }
@@ -430,8 +420,8 @@ namespace ThreadedTests {
     public:
         
 #if defined(__linux__) || defined(__APPLE__)
-        static void worker1( pthread_rwlock_t * lk , AtomicUInt * x ) {
-            (*x)++; // 1
+        static void worker1( pthread_rwlock_t * lk , AtomicUInt32 * x ) {
+            x->fetchAndAdd(1); // 1
             cout << "lock b try" << endl;
             while ( 1 ) {
                 if ( pthread_rwlock_trywrlock( lk ) == 0 )
@@ -439,14 +429,14 @@ namespace ThreadedTests {
                 sleepmillis(10);
             }
             cout << "lock b got" << endl;
-            (*x)++; // 2
+            x->fetchAndAdd(1); // 2
             pthread_rwlock_unlock( lk );
         }
 
-        static void worker2( pthread_rwlock_t * lk , AtomicUInt * x ) {
+        static void worker2( pthread_rwlock_t * lk , AtomicUInt32 * x ) {
             cout << "lock c try" << endl;
             pthread_rwlock_rdlock( lk );
-            (*x)++;
+            x->fetchAndAdd(1);
             cout << "lock c got" << endl;
             pthread_rwlock_unlock( lk );
         }
@@ -465,93 +455,30 @@ namespace ThreadedTests {
             // read lock
             verify( pthread_rwlock_rdlock( &lk ) == 0 );
             
-            AtomicUInt x1 = 0;
-            boost::thread t1( boost::bind( worker1 , &lk , &x1 ) );
-            while ( ! x1 );
-            verify( x1 == 1 );
+            AtomicUInt32 x1(0);
+            boost::thread t1( stdx::bind( worker1 , &lk , &x1 ) );
+            while ( ! x1.load() );
+            verify( x1.load() == 1 );
             sleepmillis( 500 );
-            verify( x1 == 1 );
+            verify( x1.load() == 1 );
             
-            AtomicUInt x2 = 0;
+            AtomicUInt32 x2(0);
 
-            boost::thread t2( boost::bind( worker2, &lk , &x2 ) );
+            boost::thread t2( stdx::bind( worker2, &lk , &x2 ) );
             t2.join();
-            verify( x2 == 1 );
+            verify( x2.load() == 1 );
 
             pthread_rwlock_unlock( &lk );
 
             for ( int i=0; i<2000; i++ ) {
-                if ( x1 == 2 )
+                if ( x1.load() == 2 )
                     break;
                 sleepmillis(1);
             }
 
-            verify( x1 == 2 );
+            verify( x1.load() == 2 );
             t1.join();
 #endif            
-        }
-    };
-
-    class List1Test2 : public ThreadedTest<> {
-        static const int iterations = 1000; // note: a lot of iterations will use a lot of memory as List1 leaks on purpose
-        class M : public List1<M>::Base {
-        public:
-            M(int x) : _x(x) { }
-            const int _x;
-        };
-        List1<M> l;
-    public:
-        void validate() { }
-        void subthread(int) {
-            for(int i=0; i < iterations; i++) {
-                int r = std::rand() % 256;
-                if( r == 0 ) {
-                    l.orphanAll();
-                }
-                else if( r < 4 ) { 
-                    l.push(new M(r));
-                }
-                else {
-                    M *orph = 0;
-                    for( M *m = l.head(); m; m=m->next() ) { 
-                        ASSERT( m->_x > 0 && m->_x < 4 );
-                        if( r > 192 && std::rand() % 8 == 0 )
-                            orph = m;
-                    }
-                    if( orph ) {
-                        try { 
-                            l.orphan(orph);
-                        }
-                        catch(...) { }
-                    }
-                }
-            }
-        }
-    };
-
-    class List1Test {
-    public:
-        class M : public List1<M>::Base {
-            ~M();
-        public:
-            M( int x ) {
-                num = x;
-            }
-            int num;
-        };
-
-        void run(){
-            List1<M> l;
-            
-            vector<M*> ms;
-            for ( int i=0; i<5; i++ ) {
-                M * m = new M(i);
-                ms.push_back( m );
-                l.push( m );
-            }
-            
-            // must assert as the item is missing
-            ASSERT_THROWS( l.orphan( new M( -3 ) ) , UserException );
         }
     };
 
@@ -581,15 +508,15 @@ namespace ThreadedTests {
             sleepmillis(100*x);
 
             int Z = 1;
-            log(Z) << x << ' ' << what[x] << " request" << endl;
+            LOG(Z) << x << ' ' << what[x] << " request" << endl;
             char ch = what[x];
             switch( ch ) { 
             case 'w':
                 {
                     m.lock();
-                    log(Z) << x << " w got" << endl;
+                    LOG(Z) << x << " w got" << endl;
                     sleepmillis(100);
-                    log(Z) << x << " w unlock" << endl;
+                    LOG(Z) << x << " w unlock" << endl;
                     m.unlock();
                 }
                 break;
@@ -598,26 +525,29 @@ namespace ThreadedTests {
                 {
                     Timer t;
                     RWLock::Upgradable u(m);
-                    log(Z) << x << ' ' << ch << " got" << endl;
+                    LOG(Z) << x << ' ' << ch << " got" << endl;
                     if( ch == 'U' ) {
-#ifdef MONGO_USE_SRW_ON_WINDOWS
+#if defined(NTDDI_VERSION) && defined(NTDDI_WIN7) && (NTDDI_VERSION >= NTDDI_WIN7)
                         // SRW locks are neither fair nor FIFO, as per docs
                         if( t.millis() > 2000 ) {
 #else
                         if( t.millis() > 20 ) {
 #endif
                             DEV {
-                                // a _DEBUG buildbot might be slow, try to avoid false positives
-                                log() << "warning lock upgrade was slow " << t.millis() << endl;
+                                // a debug buildbot might be slow, try to avoid false positives
+                                mongo::unittest::log() <<
+                                    "warning lock upgrade was slow " << t.millis() << endl;
                             }
                             else {
-                                log() << "assertion failure: lock upgrade was too slow: " << t.millis() << endl;
+                                mongo::unittest::log() <<
+                                    "assertion failure: lock upgrade was too slow: " <<
+                                    t.millis() << endl;
                                 ASSERT( false );
                             }
                         }
                     }
                     sleepsecs(1);
-                    log(Z) << x << ' ' << ch << " unlock" << endl;
+                    LOG(Z) << x << ' ' << ch << " unlock" << endl;
                 }
                 break;
             case 'r':
@@ -625,7 +555,7 @@ namespace ThreadedTests {
                 {
                     Timer t;
                     m.lock_shared();
-                    log(Z) << x << ' ' << ch << " got " << endl;
+                    LOG(Z) << x << ' ' << ch << " got " << endl;
                     if( what[x] == 'R' ) {
                         if( t.millis() > 15 ) { 
                             // commented out for less chatter, we aren't using upgradeable anyway right now: 
@@ -633,22 +563,20 @@ namespace ThreadedTests {
                         }
                     }
                     sleepmillis(200);
-                    log(Z) << x << ' ' << ch << " unlock" << endl;
+                    LOG(Z) << x << ' ' << ch << " unlock" << endl;
                     m.unlock_shared();
                 }
                 break;
             default:
                 ASSERT(false);
             }
-
-            cc().shutdown();
         }
     };
 
     void sleepalittle() { 
         Timer t;
         while( 1 ) { 
-            boost::this_thread::yield();
+            stdx::this_thread::yield();
             if( t.micros() > 8 )
                 break;
         }
@@ -775,90 +703,42 @@ namespace ThreadedTests {
         }
     };
 
-    class WriteLocksAreGreedy : public ThreadedTest<3> {
+    const int WriteLocksAreGreedy_ThreadCount = 3;
+    class WriteLocksAreGreedy : public ThreadedTest<WriteLocksAreGreedy_ThreadCount> {
     public:
-        WriteLocksAreGreedy() : m("gtest") {}
+        WriteLocksAreGreedy() : m("gtest"), _barrier(WriteLocksAreGreedy_ThreadCount) {}
     private:
         RWLock m;
+        boost::barrier _barrier;
         virtual void validate() { }
         virtual void subthread(int x) {
-            int Z = 1;
+            _barrier.wait();
+            int Z = 0;
             Client::initThread("utest");
             if( x == 1 ) { 
-                cout << mongo::curTimeMillis64() % 10000 << " 1" << endl;
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1" << endl;
                 rwlock_shared lk(m);
-                sleepmillis(300);
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 1x" << endl;
+                sleepmillis(400);
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 1x" << endl;
             }
             if( x == 2 ) {
                 sleepmillis(100);
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 2" << endl;
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 2" << endl;
                 rwlock lk(m, true);
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 2x" << endl;
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 2x" << endl;
             }
             if( x == 3 ) {
                 sleepmillis(200);
                 Timer t;
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 3" << endl;
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 3" << endl;
                 rwlock_shared lk(m);
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 3x" << endl;
-                log(Z) << t.millis() << endl;
+                LOG(Z) << mongo::curTimeMillis64() % 10000 << " 3x" << endl;
+                LOG(Z) << t.millis() << endl;
                 ASSERT( t.millis() > 50 );
             }
-            cc().shutdown();
         }
     };
 
-    static int pass;
-    class QLockTest : public ThreadedTest<3> {
-    public:
-        bool gotW;
-        QLockTest() : gotW(false), m() { }
-        void setup() { 
-            if( pass == 1) { 
-                m.stop_greed();
-            }
-        }
-        ~QLockTest() {
-            m.start_greed();
-        }
-    private:
-        QLock m;
-        virtual void validate() { }
-        virtual void subthread(int x) {
-            int Z = 1;
-            Client::initThread("qtest");
-            if( x == 1 ) { 
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 1 lock_r()..." << endl;
-                m.lock_r();
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 1            got" << endl;
-                sleepmillis(300);
-                m.unlock_r();
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 1 unlock_r()" << endl;
-            }
-            if( x == 2 || x == 4 ) {
-                sleepmillis(x*50);
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 2 lock_W()..." << endl;
-                m.lock_W();
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 2            got" << endl;
-                gotW = true;
-                m.unlock_W();
-            }
-            if( x == 3 ) {
-                sleepmillis(200);
-
-                Timer t;
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 3 lock_r()..." << endl;
-                m.lock_r();
-                verify( gotW );
-                log(Z) << mongo::curTimeMillis64() % 10000 << " 3            got" << gotW << endl;
-                log(Z) << t.millis() << endl;
-                m.unlock_r();
-                ASSERT( t.millis() > 50 );
-            }
-            cc().shutdown();
-        }
-    };
 
     // Tests waiting on the TicketHolder by running many more threads than can fit into the "hotel", but only
     // max _nRooms threads should ever get in at once
@@ -874,17 +754,17 @@ namespace ThreadedTests {
 
         class Hotel {
         public:
-            Hotel( int nRooms ) : _frontDesk( "frontDesk" ), _nRooms( nRooms ), _checkedIn( 0 ), _maxRooms( 0 ) {}
+            Hotel( int nRooms ) : _nRooms( nRooms ), _checkedIn( 0 ), _maxRooms( 0 ) {}
 
             void checkIn(){
-                scoped_lock lk( _frontDesk );
+                boost::lock_guard<boost::mutex> lk( _frontDesk );
                 _checkedIn++;
                 verify( _checkedIn <= _nRooms );
                 if( _checkedIn > _maxRooms ) _maxRooms = _checkedIn;
             }
 
             void checkOut(){
-                scoped_lock lk( _frontDesk );
+                boost::lock_guard<boost::mutex> lk( _frontDesk );
                 _checkedIn--;
                 verify( _checkedIn >= 0 );
             }
@@ -916,12 +796,9 @@ namespace ThreadedTests {
                 _hotel.checkOut();
 
                 if( ( i % ( checkIns / 10 ) ) == 0 )
-                    log() << "checked in " << i << " times..." << endl;
+                    mongo::unittest::log() << "checked in " << i << " times..." << endl;
 
             }
-
-            cc().shutdown();
-
         }
 
         virtual void validate() {
@@ -940,34 +817,30 @@ namespace ThreadedTests {
 
         void setupTests() {
             add< WriteLocksAreGreedy >();
-            add< QLockTest >();
-            add< QLockTest >();
 
             // Slack is a test to see how long it takes for another thread to pick up
             // and begin work after another relinquishes the lock.  e.g. a spin lock 
             // would have very little slack.
-            add< Slack<mongo::mutex , mongo::mutex::scoped_lock > >();
             add< Slack<SimpleMutex,SimpleMutex::scoped_lock> >();
             add< Slack<SimpleRWLock,SimpleRWLock::Exclusive> >();
             add< CondSlack >();
 
             add< UpgradableTest >();
-            add< List1Test >();
-            add< List1Test2 >();
 
-            add< IsAtomicUIntAtomic >();
+            add< IsAtomicWordAtomic<AtomicUInt32> >();
+            add< IsAtomicWordAtomic<AtomicUInt64> >();
             add< MVarTest >();
             add< ThreadPoolTest >();
-            add< LockTest >();
-
 
             add< RWLockTest1 >();
-            //add< RWLockTest2 >(); // SERVER-2996
+            add< RWLockTest2 >();
             add< RWLockTest3 >();
             add< RWLockTest4 >();
 
             add< MongoMutexTest >();
             add< TicketHolderWaits >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }

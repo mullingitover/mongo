@@ -15,72 +15,86 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "../util/timer.h"
-#include "../db/matcher.h"
-#include "../db/json.h"
-#include "dbtests.h"
-#include "../db/namespace_details.h"
+#include <iostream>
+
+#include "mongo/db/db_raii.h"
+#include "mongo/db/json.h"
+#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/util/timer.h"
 
 namespace MatcherTests {
 
+    using std::cout;
+    using std::endl;
+    using std::string;
+
     class CollectionBase {
     public:
-        CollectionBase() :
-        _ns( "unittests.matchertests" ) {
-        }
-        virtual ~CollectionBase() {
-            client().dropCollection( ns() );
-        }
-    protected:
-        const char * const ns() const { return _ns; }
-        DBDirectClient &client() { return _client; }
-    private:
-        const char * const _ns;
-        DBDirectClient _client;
+        CollectionBase() { }
+
+        virtual ~CollectionBase() { }
     };
-    
+
+    template <typename M>
     class Basic {
     public:
         void run() {
             BSONObj query = fromjson( "{\"a\":\"b\"}" );
-            Matcher m( query );
+            M m(query, MatchExpressionParser::WhereCallback());
             ASSERT( m.matches( fromjson( "{\"a\":\"b\"}" ) ) );
         }
     };
 
+    template <typename M>
     class DoubleEqual {
     public:
         void run() {
             BSONObj query = fromjson( "{\"a\":5}" );
-            Matcher m( query );
+            M m(query, MatchExpressionParser::WhereCallback());
             ASSERT( m.matches( fromjson( "{\"a\":5}" ) ) );
         }
     };
 
+    template <typename M>
     class MixedNumericEqual {
     public:
         void run() {
             BSONObjBuilder query;
             query.append( "a", 5 );
-            Matcher m( query.done() );
+            M m(query.done(), MatchExpressionParser::WhereCallback());
             ASSERT( m.matches( fromjson( "{\"a\":5}" ) ) );
         }
     };
 
+    template <typename M>
     class MixedNumericGt {
     public:
         void run() {
             BSONObj query = fromjson( "{\"a\":{\"$gt\":4}}" );
-            Matcher m( query );
+            M m(query, MatchExpressionParser::WhereCallback());
             BSONObjBuilder b;
             b.append( "a", 5 );
             ASSERT( m.matches( b.done() ) );
         }
     };
 
+    template <typename M>
     class MixedNumericIN {
     public:
         void run() {
@@ -88,7 +102,7 @@ namespace MatcherTests {
             ASSERT_EQUALS( 4 , query["a"].embeddedObject()["$in"].embeddedObject()["0"].number() );
             ASSERT_EQUALS( NumberInt , query["a"].embeddedObject()["$in"].embeddedObject()["0"].type() );
 
-            Matcher m( query );
+            M m(query, MatchExpressionParser::WhereCallback());
 
             {
                 BSONObjBuilder b;
@@ -112,19 +126,21 @@ namespace MatcherTests {
         }
     };
 
+    template <typename M>
     class MixedNumericEmbedded {
     public:
         void run() {
-            Matcher m( BSON( "a" << BSON( "x" << 1 ) ) );
+            M m(BSON("a" << BSON("x" << 1)), MatchExpressionParser::WhereCallback());
             ASSERT( m.matches( BSON( "a" << BSON( "x" << 1 ) ) ) );
             ASSERT( m.matches( BSON( "a" << BSON( "x" << 1.0 ) ) ) );
         }
     };
 
+    template <typename M>
     class Size {
     public:
         void run() {
-            Matcher m( fromjson( "{a:{$size:4}}" ) );
+            M m(fromjson("{a:{$size:4}}"), MatchExpressionParser::WhereCallback());
             ASSERT( m.matches( fromjson( "{a:[1,2,3,4]}" ) ) );
             ASSERT( !m.matches( fromjson( "{a:[1,2,3]}" ) ) );
             ASSERT( !m.matches( fromjson( "{a:[1,2,3,'a','b']}" ) ) );
@@ -132,11 +148,57 @@ namespace MatcherTests {
         }
     };
 
+    template <typename M>
+    class WithinBox {
+    public:
+        void run() {
+            M m(fromjson("{loc:{$within:{$box:[{x: 4, y:4},[6,6]]}}}"),
+                MatchExpressionParser::WhereCallback());
+            ASSERT(!m.matches(fromjson("{loc: [3,4]}")));
+            ASSERT(m.matches(fromjson("{loc: [4,4]}")));
+            ASSERT(m.matches(fromjson("{loc: [5,5]}")));
+            ASSERT(m.matches(fromjson("{loc: [5,5.1]}")));
+            ASSERT(m.matches(fromjson("{loc: {x: 5, y:5.1}}")));
+        }
+    };
+
+    template <typename M>
+    class WithinPolygon {
+    public:
+        void run() {
+            M m(fromjson("{loc:{$within:{$polygon:[{x:0,y:0},[0,5],[5,5],[5,0]]}}}"),
+                MatchExpressionParser::WhereCallback());
+            ASSERT(m.matches(fromjson("{loc: [3,4]}")));
+            ASSERT(m.matches(fromjson("{loc: [4,4]}")));
+            ASSERT(m.matches(fromjson("{loc: {x:5,y:5}}")));
+            ASSERT(!m.matches(fromjson("{loc: [5,5.1]}")));
+            ASSERT(!m.matches(fromjson("{loc: {}}")));
+        }
+    };
+
+    template <typename M>
+    class WithinCenter {
+    public:
+        void run() {
+            M m(fromjson("{loc:{$within:{$center:[{x:30,y:30},10]}}}"),
+                MatchExpressionParser::WhereCallback());
+            ASSERT(!m.matches(fromjson("{loc: [3,4]}")));
+            ASSERT(m.matches(fromjson("{loc: {x:30,y:30}}")));
+            ASSERT(m.matches(fromjson("{loc: [20,30]}")));
+            ASSERT(m.matches(fromjson("{loc: [30,20]}")));
+            ASSERT(m.matches(fromjson("{loc: [40,30]}")));
+            ASSERT(m.matches(fromjson("{loc: [30,40]}")));
+            ASSERT(!m.matches(fromjson("{loc: [31,40]}")));
+        }
+    };
+
     /** Test that MatchDetails::elemMatchKey() is set correctly after a match. */
+    template <typename M>
     class ElemMatchKey {
     public:
         void run() {
-            Matcher matcher( BSON( "a.b" << 1 ) );
+            M matcher(BSON("a.b" << 1),
+                      MatchExpressionParser::WhereCallback());
             MatchDetails details;
             details.requestElemMatchKey();
             ASSERT( !details.hasElemMatchKey() );
@@ -147,128 +209,77 @@ namespace MatcherTests {
         }
     };
 
-    namespace Covered { // Tests for CoveredIndexMatcher.
-    
-        /**
-         * Test that MatchDetails::elemMatchKey() is set correctly after an unindexed cursor match.
-         */
-        class ElemMatchKeyUnindexed : public CollectionBase {
-        public:
-            void run() {
-                client().insert( ns(), fromjson( "{ a:[ {}, { b:1 } ] }" ) );
-                
-                Client::ReadContext context( ns() );
+    template <typename M>
+    class WhereSimple1 {
+    public:
+        void run() {
+            OperationContextImpl txn;
+            AutoGetCollectionForRead ctx(&txn, "unittests.matchertests");
 
-                CoveredIndexMatcher matcher( BSON( "a.b" << 1 ), BSON( "$natural" << 1 ) );
-                MatchDetails details;
-                details.requestElemMatchKey();
-                boost::shared_ptr<Cursor> cursor = NamespaceDetailsTransient::getCursor( ns(), BSONObj() );
-                // Verify that the cursor is unindexed.
-                ASSERT_EQUALS( "BasicCursor", cursor->toString() );
-                ASSERT( matcher.matchesCurrent( cursor.get(), &details ) );
-                // The '1' entry of the 'a' array is matched.
-                ASSERT( details.hasElemMatchKey() );
-                ASSERT_EQUALS( string( "1" ), details.elemMatchKey() );
-            }
-        };
-        
-        /**
-         * Test that MatchDetails::elemMatchKey() is set correctly after an indexed cursor match.
-         */
-        class ElemMatchKeyIndexed : public CollectionBase {
-        public:
-            void run() {
-                client().ensureIndex( ns(), BSON( "a.b" << 1 ) );
-                client().insert( ns(), fromjson( "{ a:[ {}, { b:9 }, { b:1 } ] }" ) );
-                
-                Client::ReadContext context( ns() );
-                
-                BSONObj query = BSON( "a.b" << 1 );
-                CoveredIndexMatcher matcher( query, BSON( "a.b" << 1 ) );
-                MatchDetails details;
-                details.requestElemMatchKey();
-                boost::shared_ptr<Cursor> cursor = NamespaceDetailsTransient::getCursor( ns(), query );
-                // Verify that the cursor is indexed.
-                ASSERT_EQUALS( "BtreeCursor a.b_1", cursor->toString() );
-                ASSERT( matcher.matchesCurrent( cursor.get(), &details ) );
-                // The '2' entry of the 'a' array is matched.
-                ASSERT( details.hasElemMatchKey() );
-                ASSERT_EQUALS( string( "2" ), details.elemMatchKey() );
-            }
-        };
-        
-        /**
-         * Test that MatchDetails::elemMatchKey() is set correctly after an indexed cursor match
-         * on a non multikey index.
-         */
-        class ElemMatchKeyIndexedSingleKey : public CollectionBase {
-        public:
-            void run() {
-                client().ensureIndex( ns(), BSON( "a.b" << 1 ) );
-                client().insert( ns(), fromjson( "{ a:[ { b:1 } ] }" ) );
-                
-                Client::ReadContext context( ns() );
-                
-                BSONObj query = BSON( "a.b" << 1 );
-                CoveredIndexMatcher matcher( query, BSON( "a.b" << 1 ) );
-                MatchDetails details;
-                details.requestElemMatchKey();
-                boost::shared_ptr<Cursor> cursor = NamespaceDetailsTransient::getCursor( ns(), query );
-                // Verify that the cursor is indexed.
-                ASSERT_EQUALS( "BtreeCursor a.b_1", cursor->toString() );
-                // Verify that the cursor is not multikey.
-                ASSERT( !cursor->isMultiKey() );
-                ASSERT( matcher.matchesCurrent( cursor.get(), &details ) );
-                // The '0' entry of the 'a' array is matched.
-                ASSERT( details.hasElemMatchKey() );
-                ASSERT_EQUALS( string( "0" ), details.elemMatchKey() );
-            }
-        };
-        
-    } // namespace Covered
-    
+            M m(BSON("$where" << "function(){ return this.a == 1; }"),
+                WhereCallbackReal(&txn, StringData("unittests")));
+            ASSERT( m.matches( BSON( "a" << 1 ) ) );
+            ASSERT( !m.matches( BSON( "a" << 2 ) ) );
+        }
+    };
+
+    template< typename M >
     class TimingBase {
     public:
-        long time( const BSONObj& patt , const BSONObj& obj ) {
-            Matcher m( patt );
+        long dotime( const BSONObj& patt , const BSONObj& obj ) {
+            M m(patt, MatchExpressionParser::WhereCallback());
             Timer t;
-            for ( int i=0; i<10000; i++ ) {
-                ASSERT( m.matches( obj ) );
+            for ( int i=0; i<900000; i++ ) {
+                if ( !m.matches( obj ) ) {
+                    ASSERT( 0 );
+                }
             }
             return t.millis();
         }
     };
 
-    class AllTiming : public TimingBase {
+    template< typename M >
+    class AllTiming : public TimingBase<M> {
     public:
         void run() {
-            long normal = time( BSON( "x" << 5 ) , BSON( "x" << 5 ) );
-            long all = time( BSON( "x" << BSON( "$all" << BSON_ARRAY( 5 ) ) ) , BSON( "x" << 5 ) );
+            long normal = TimingBase<M>::dotime( BSON( "x" << 5 ),
+                                                 BSON( "x" << 5 ) );
 
-            cout << "normal: " << normal << " all: " << all << endl;
+            long all = TimingBase<M>::dotime( BSON( "x" << BSON( "$all" << BSON_ARRAY( 5 ) ) ),
+                                              BSON( "x" << 5 ) );
+
+            cout << "AllTiming " << demangleName(typeid(M))
+                 << " normal: " << normal << " all: " << all << endl;
         }
     };
-    
+
+
     class All : public Suite {
     public:
         All() : Suite( "matcher" ) {
         }
 
+#define ADD_BOTH(TEST) \
+        add< TEST<Matcher> >();
+
         void setupTests() {
-            add<Basic>();
-            add<DoubleEqual>();
-            add<MixedNumericEqual>();
-            add<MixedNumericGt>();
-            add<MixedNumericIN>();
-            add<Size>();
-            add<MixedNumericEmbedded>();
-            add<ElemMatchKey>();
-            add<Covered::ElemMatchKeyUnindexed>();
-            add<Covered::ElemMatchKeyIndexed>();
-            add<Covered::ElemMatchKeyIndexedSingleKey>();
-            add<AllTiming>();
+            ADD_BOTH(Basic);
+            ADD_BOTH(DoubleEqual);
+            ADD_BOTH(MixedNumericEqual);
+            ADD_BOTH(MixedNumericGt);
+            ADD_BOTH(MixedNumericIN);
+            ADD_BOTH(Size);
+            ADD_BOTH(MixedNumericEmbedded);
+            ADD_BOTH(ElemMatchKey);
+            ADD_BOTH(WhereSimple1);
+            ADD_BOTH(AllTiming);
+            ADD_BOTH(WithinBox);
+            ADD_BOTH(WithinCenter);
+            ADD_BOTH(WithinPolygon);
         }
-    } dball;
+    };
+
+    SuiteInstance<All> dball;
 
 } // namespace MatcherTests
 

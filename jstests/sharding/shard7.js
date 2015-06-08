@@ -8,6 +8,7 @@ c = db[ 'foo' ];
 c.drop();
 
 s.adminCommand( { enablesharding: '' + db } );
+s.ensurePrimaryShard(db.getName(), 'shard0001');
 s.adminCommand( { shardcollection: '' + c, key: { a:1,b:1 } } );
 
 // Check query operation with some satisfiable and unsatisfiable queries.
@@ -33,16 +34,13 @@ assert.eq( 0, c.count(unsatisfiable) );
 assert.eq( [], c.distinct('a',unsatisfiable) );
 
 aggregate = c.aggregate( { $match:unsatisfiable } );
-assert.commandWorked( aggregate );
-assert.eq( 0, aggregate.result.length );
+assert.eq( 0, aggregate.toArray().length );
 
 c.save( {a:null,b:null} );
 c.save( {a:1,b:1} );
-c.remove( unsatisfiable );
-assert( !db.getLastError() );
+assert.writeOK( c.remove( unsatisfiable ));
 assert.eq( 2, c.count() );
-c.update( unsatisfiable, {$set:{c:1}}, false, true );
-assert( !db.getLastError() );
+assert.writeOK( c.update( unsatisfiable, {$set:{c:1}}, false, true ));
 assert.eq( 2, c.count() );
 assert.eq( 0, c.count( {c:1} ) );
 

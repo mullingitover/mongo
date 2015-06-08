@@ -1,8 +1,7 @@
-/* commands.cpp
-   db "commands" (sent via db.$cmd.findOne(...))
- */
+// dbeval.cpp
 
 /**
+*    Copyright (C) 2012 10gen Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -15,31 +14,64 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
-#include "ops/query.h"
-#include "pdfile.h"
-#include "jsobj.h"
-#include "../bson/util/builder.h"
-#include <time.h>
-#include "introspect.h"
-#include "btree.h"
-#include "../util/lruishmap.h"
-#include "json.h"
-#include "repl.h"
-#include "commands.h"
-#include "cmdline.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "../scripting/engine.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/introspect.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/json.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::dec;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+
+namespace {
+
     const int edebug=0;
 
-    bool dbEval(const string& dbName, BSONObj& cmd, BSONObjBuilder& result, string& errmsg) {
-        BSONElement e = cmd.firstElement();
-        uassert( 10046 ,  "eval needs Code" , e.type() == Code || e.type() == CodeWScope || e.type() == String );
+    bool dbEval(OperationContext* txn,
+                const string& dbName,
+                const BSONObj& cmd,
+                BSONObjBuilder& result,
+                string& errmsg) {
+
+        RARELY {
+            warning() << "the eval command is deprecated" << startupWarningsLog;
+        }
+
+        const BSONElement e = cmd.firstElement();
+        uassert(10046,
+                "eval needs Code",
+                e.type() == Code || e.type() == CodeWScope || e.type() == String);
 
         const char *code = 0;
         switch ( e.type() ) {
@@ -53,23 +85,28 @@ namespace mongo {
         default:
             verify(0);
         }
-        verify( code );
 
-        if ( ! globalScriptEngine ) {
+        verify(code);
+
+        if (!globalScriptEngine) {
             errmsg = "db side execution is disabled";
             return false;
         }
 
-        auto_ptr<Scope> s = globalScriptEngine->getPooledScope( dbName );
+        scoped_ptr<Scope> s(globalScriptEngine->newScope());
+        s->registerOperation(txn);
+
         ScriptingFunction f = s->createFunction(code);
-        if ( f == 0 ) {
-            errmsg = (string)"compile failed: " + s->getError();
+        if (f == 0) {
+            errmsg = string("compile failed: ") + s->getError();
             return false;
         }
 
-        if ( e.type() == CodeWScope )
-            s->init( e.codeWScopeScopeData() );
-        s->localConnect( dbName.c_str() );
+        s->localConnectForDbEval(txn, dbName.c_str());
+
+        if (e.type() == CodeWScope) {
+            s->init(e.codeWScopeScopeDataUnsafe());
+        }
 
         BSONObj args;
         {
@@ -77,8 +114,8 @@ namespace mongo {
             if ( argsElement.type() == Array ) {
                 args = argsElement.embeddedObject();
                 if ( edebug ) {
-                    out() << "args:" << args.toString() << endl;
-                    out() << "code:\n" << code << endl;
+                    log() << "args:" << args.toString() << endl;
+                    log() << "code:\n" << code << endl;
                 }
             }
         }
@@ -86,52 +123,73 @@ namespace mongo {
         int res;
         {
             Timer t;
-            res = s->invoke(f, &args, 0, cmdLine.quota ? 10 * 60 * 1000 : 0 );
+            res = s->invoke(f, &args, 0, 0);
             int m = t.millis();
-            if ( m > cmdLine.slowMS ) {
-                out() << "dbeval slow, time: " << dec << m << "ms " << dbName << endl;
+            if (m > serverGlobalParams.slowMS) {
+                log() << "dbeval slow, time: " << dec << m << "ms " << dbName << endl;
                 if ( m >= 1000 ) log() << code << endl;
                 else OCCASIONALLY log() << code << endl;
             }
         }
-        if ( res ) {
+
+        if (res || s->isLastRetNativeCode()) {
             result.append("errno", (double) res);
             errmsg = "invoke failed: ";
-            errmsg += s->getError();
+            if (s->isLastRetNativeCode())
+                errmsg += "cannot return native function";
+            else
+                errmsg += s->getError();
+
             return false;
         }
 
-        s->append( result , "retval" , "return" );
+        s->append(result, "retval", "__returnValue");
 
         return true;
     }
 
-    // SERVER-4328 todo review for concurrency
+
     class CmdEval : public Command {
     public:
         virtual bool slaveOk() const {
             return false;
         }
-        virtual void help( stringstream &help ) const {
-            help << "Evaluate javascript at the server.\n" "http://www.mongodb.org/display/DOCS/Server-side+Code+Execution";
+
+        virtual void help(stringstream &help) const {
+            help << "DEPRECATED\n"
+                 << "Evaluate javascript at the server.\n"
+                 << "http://dochub.mongodb.org/core/serversidecodeexecution";
         }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+
+            RoleGraph::generateUniversalPrivileges(out);
+        }
+
         CmdEval() : Command("eval", false, "$eval") { }
-        bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 
-            AuthenticationInfo *ai = cc().getAuthenticationInfo();
-            uassert( 12598 , "$eval reads unauthorized", ai->isAuthorizedReads(dbname.c_str()) );
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int options,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
-            if ( cmdObj["nolock"].trueValue() ) {
-                return dbEval(dbname, cmdObj, result, errmsg);
+            if (cmdObj["nolock"].trueValue()) {
+                return dbEval(txn, dbname, cmdObj, result, errmsg);
             }
 
-            // write security will be enforced in DBDirectClient
-            mongolock lk( ai->isAuthorized( dbname.c_str() ) );
-            Client::Context ctx( dbname );
+            ScopedTransaction transaction(txn, MODE_X);
+            Lock::GlobalWrite lk(txn->lockState());
 
-            return dbEval(dbname, cmdObj, result, errmsg);
+            OldClientContext ctx(txn, dbname);
+
+            return dbEval(txn, dbname, cmdObj, result, errmsg);
         }
+
     } cmdeval;
 
+} // namespace
 } // namespace mongo

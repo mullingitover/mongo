@@ -20,99 +20,101 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include <fstream>
-#include "../db/ops/query.h"
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
-#include "../db/lasterror.h"
-#include "../db/ops/update.h"
-#include "../db/taskqueue.h"
-#include "../util/timer.h"
-#include "dbtests.h"
-#include "../db/dur_stats.h"
-#include "../util/checksum.h"
-#include "../util/version.h"
-#include "../db/key.h"
-#include "../util/compress.h"
-#include "../util/concurrency/qlock.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
 #include <boost/filesystem/operations.hpp>
+#include <boost/shared_ptr.hpp>
+#include <boost/thread/thread.hpp>
+#include <boost/thread/condition.hpp>
+#include <boost/version.hpp>
+#include <iomanip>
+#include <iostream>
+#include <fstream>
+#include <mutex>
 
-using namespace bson;
-
-namespace mongo {
-    namespace dbtests {
-        extern unsigned perfHist;
-    }
-}
+#include "mongo/config.h"
+#include "mongo/db/client.h"
+#include "mongo/db/db.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/json.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/btree/key.h"
+#include "mongo/db/storage/mmap_v1/compress.h"
+#include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
+#include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/db/storage/mmap_v1/mmap.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/framework_options.h"
+#include "mongo/util/allocator.h"
+#include "mongo/util/checksum.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/log.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/version.h"
+#include "mongo/db/concurrency/lock_state.h"
 
 namespace PerfTests {
 
-    using mongo::dbtests::perfHist;
+    using boost::shared_ptr;
+    using std::cout;
+    using std::endl;
+    using std::fixed;
+    using std::ifstream;
+    using std::left;
+    using std::min;
+    using std::right;
+    using std::setprecision;
+    using std::setw;
+    using std::string;
+    using std::vector;
 
     const bool profiling = false;
 
-    typedef DBDirectClient DBClientType;
-    //typedef DBClientConnection DBClientType;
-
     class ClientBase {
     public:
-        // NOTE: Not bothering to backup the old error record.
-        ClientBase() {
-            //_client.connect("localhost");
-            mongo::lastError.reset( new LastError() );
+        ClientBase() : _client(&_txn) {
+            mongo::LastError::get(_txn.getClient()).reset();
         }
         virtual ~ClientBase() {
-            //mongo::lastError.release();
+            mongo::LastError::get(_txn.getClient()).reset();
         }
+
     protected:
-        static void insert( const char *ns, BSONObj o ) {
+        void insert( const char *ns, BSONObj o ) {
             _client.insert( ns, o );
         }
-        static void update( const char *ns, BSONObj q, BSONObj o, bool upsert = 0 ) {
+        void update( const char *ns, BSONObj q, BSONObj o, bool upsert = 0 ) {
             _client.update( ns, Query( q ), o, upsert );
         }
-        static bool error() {
+        bool error() {
             return !_client.getPrevError().getField( "err" ).isNull();
         }
-        DBClientBase &client() const { return _client; }
+
+        DBClientBase* client() { return &_client; }
+        OperationContext* txn() { return &_txn; }
+
     private:
-        static DBClientType _client;
+        OperationContextImpl _txn;
+        DBDirectClient _client;
     };
-    DBClientType ClientBase::_client;
-
-    // todo: use a couple threads. not a very good test yet.
-#if 0
-    class TaskQueueTest {
-        static int tot;
-        struct V {
-            int val;
-            static void go(const V &v) { tot += v.val; }
-        };
-    public:
-        void run() {
-            tot = 0;
-            TaskQueue<V> d;
-            int x = 0;
-            for( int i = 0; i < 100; i++ ) {
-                if( i % 30 == 0 )
-                    d.invoke();
-
-                x += i;
-                writelock lk;
-                V v;
-                v.val = i;
-                d.defer(v);
-            }
-            d.invoke();
-            verify( x == tot );
-        }
-    };
-    int TaskQueueTest::tot;
-#endif
 
     /* if you want recording of the timings, place the password for the perf database
         in ./../settings.py:
@@ -121,7 +123,7 @@ namespace PerfTests {
     static boost::shared_ptr<DBClientConnection> conn;
     static string _perfhostname;
     void pstatsConnect() {
-        // no writing to perf db if _DEBUG
+        // no writing to perf db if this is a debug build
         DEV return;
 
         const char *fn = "../../settings.py";
@@ -152,9 +154,9 @@ namespace PerfTests {
                     }
                 }
 
-                boost::shared_ptr<DBClientConnection> c(new DBClientConnection(false, 0, 60));
+                boost::shared_ptr<DBClientConnection> c(new DBClientConnection(false, 60));
                 string err;
-                if( c->connect("perfdb.10gen.cc", err) ) {
+                if( c->connect(HostAndPort("perfdb.10gen.cc"), err) ) {
                     if( !c->auth("perf", "perf", pwd, err) ) {
                         cout << "info: authentication with stats db failed: " << err << endl;
                         verify(false);
@@ -191,11 +193,17 @@ namespace PerfTests {
         // anything you want to do before being timed
         virtual void prep() { }
 
+        // anything you want to do before threaded test
+        virtual void prepThreaded() {}
+
         virtual void timed() = 0;
 
-        // optional 2nd test phase to be timed separately
-        // return name of it
-        virtual string timed2(DBClientBase&) { return ""; }
+        // optional 2nd test phase to be timed separately. You must provide it with a unique
+        // name in order for it to run by overloading 'name2'.
+        virtual void timed2(DBClientBase*) {}
+
+        // return name of second test.
+        virtual string name2() { return name(); }
 
         virtual void post() { }
 
@@ -210,23 +218,26 @@ namespace PerfTests {
     public:
         virtual unsigned batchSize() { return 50; }
 
-        void say(unsigned long long n, int ms, string s) {
-            unsigned long long rps = n*1000/ms;
-            cout << "stats " << setw(42) << left << s << ' ' << right << setw(9) << rps << ' ' << right << setw(5) << ms << "ms ";
-            if( showDurStats() )
-                cout << dur::stats.curr->_asCSV();
+        void say(unsigned long long n, long long us, string s) {
+            unsigned long long rps = (n*1000*1000)/(us > 0 ? us : 1);
+            cout << "stats " << setw(42) << left << s << ' ' << right << setw(9) << rps << ' ' << right << setw(5) << us/1000 << "ms ";
+            if (showDurStats()) {
+                cout << dur::stats.curr()->_asCSV();
+            }
             cout << endl;
 
             if( conn && !conn->isFailed() ) {
                 const char *ns = "perf.pstats";
-                if( perfHist ) {
+                if(frameworkGlobalParams.perfHist) {
                     static bool needver = true;
                     try {
                         // try to report rps from last time */
                         Query q;
                         {
                             BSONObjBuilder b;
-                            b.append("host",_perfhostname).append("test",s).append("dur",cmdLine.dur);
+                            b.append("host", _perfhostname);
+                            b.append("test", s);
+                            b.append("dur", storageGlobalParams.dur);
                             DEV { b.append("info.DEBUG",true); }
                             else b.appendNull("info.DEBUG");
                             if( sizeof(int*) == 4 )
@@ -237,7 +248,7 @@ namespace PerfTests {
                         }
                         BSONObj fields = BSON( "rps" << 1 << "info" << 1 );
                         vector<BSONObj> v;
-                        conn->findN(v, ns, q, perfHist, 0, &fields);
+                        conn->findN(v, ns, q, frameworkGlobalParams.perfHist, 0, &fields);
                         for( vector<BSONObj>::iterator i = v.begin(); i != v.end(); i++ ) {
                             BSONObj o = *i;
                             double lastrps = o["rps"].Number();
@@ -260,10 +271,12 @@ namespace PerfTests {
                     b.appendTimeT("when", time(0));
                     b.append("test", s);
                     b.append("rps", (int) rps);
-                    b.append("millis", ms);
-                    b.appendBool("dur", cmdLine.dur);
-                    if( showDurStats() && cmdLine.dur )
-                        b.append("durStats", dur::stats.curr->_asObj());
+                    b.append("millis", us/1000);
+                    b.appendBool("dur", storageGlobalParams.dur);
+                    if (showDurStats() && storageGlobalParams.dur) {
+                        b.append("durStats", dur::stats.asObj());
+                    }
+
                     {
                         bob inf;
                         inf.append("version", versionString);
@@ -273,6 +286,9 @@ namespace PerfTests {
                         inf.append("os", "win");
 #endif
                         inf.append("git", gitVersion());
+#ifdef MONGO_CONFIG_SSL
+                        inf.append("OpenSSL", openSSLVersion());
+#endif
                         inf.append("boost", BOOST_VERSION);
                         b.append("info", inf.obj());
                     }
@@ -288,32 +304,30 @@ namespace PerfTests {
             }
         }
 
-        /** if true runs timed2() again with several threads (8 at time of this writing 
-            shouldn't be just timed2, that is legacy and can be cleaned up one day
+        /** if true runs timed2() again with several threads (8 at time of this writing).
         */
         virtual bool testThreaded() { return false; }
-
-        unsigned long long n;
 
         int howLong() { 
             int hlm = howLongMillis();
             DEV {
-                // don't run very long with _DEBUG - not very meaningful anyway on that build
+                // don't run very long with in debug mode - not very meaningful anyway on that build
                 hlm = min(hlm, 500);
             }
             return hlm;
         }
 
         void run() {
+
+            unsigned long long n = 0;
+
             _ns = string("perftest.") + name();
-            client().dropCollection(ns());
+            client()->dropCollection(ns());
             prep();
             int hlm = howLong();
-            dur::stats._intervalMicros = 0; // no auto rotate
-            dur::stats.curr->reset();
             mongo::Timer t;
             n = 0;
-            const unsigned Batch = batchSize();
+            const unsigned int Batch = batchSize();
 
             if( hlm == 0 ) {
                 // means just do once
@@ -321,36 +335,34 @@ namespace PerfTests {
             }
             else {
                 do {
-                    unsigned i;
+                    unsigned int i;
                     for( i = 0; i < Batch; i++ )
                         timed();
                     n += i;
-                } while( t.micros() < (unsigned) hlm * 1000 );
+                } while( t.micros() < (hlm * 1000) );
             }
 
-            client().getLastError(); // block until all ops are finished
-            int ms = t.millis();
+            client()->getLastError(); // block until all ops are finished
 
-            say(n, ms, name());
+            say(n, t.micros(), name());
 
             post();
 
-            string test2name = timed2(client());
+            string test2name = name2();
             {
-                if( test2name.size() != 0 ) {
-                    dur::stats.curr->reset();
+                if( test2name != name() ) {
+                    dur::stats.curr()->reset();
                     mongo::Timer t;
                     unsigned long long n = 0;
                     while( 1 ) {
-                        unsigned i;
+                        unsigned int i;
                         for( i = 0; i < Batch; i++ )
                             timed2(client());
                         n += i;
                         if( t.millis() > hlm )
                             break;
                     }
-                    int ms = t.millis();
-                    say(n, ms, test2name);
+                    say(n, t.micros(), test2name);
                 }
             }
 
@@ -358,40 +370,48 @@ namespace PerfTests {
                 const int nThreads = 8;
                 //cout << "testThreaded nThreads:" << nThreads << endl;
                 mongo::Timer t;
-                launchThreads(nThreads);
-                say(n, t.millis(), test2name+"-threaded");
+                const unsigned long long result = launchThreads(nThreads);
+                say(result/nThreads, t.micros(), test2name+"-threaded");
             }
         }
 
         bool stop;
 
-        void thread() {
+        void thread(unsigned long long* counter) {
 #if defined(_WIN32)
             static int z;
             srand( ++z ^ (unsigned) time(0));
 #endif
-            DBClientType c;
             Client::initThreadIfNotAlready("perftestthr");
+            OperationContextImpl txn;
+            DBDirectClient c(&txn);
+
+            const unsigned int Batch = batchSize();
+            prepThreaded();
             while( 1 ) {
-                for( int i = 0; i < 8; i++ )
-                    timed2(c);
+                unsigned int i = 0;
+                for( i = 0; i < Batch; i++ )
+                    timed2(&c);
+                *counter += i;
                 if( stop ) 
                     break;
             }
-            cc().shutdown();
         }
 
-        void launchThreads(int remaining) {
+        unsigned long long launchThreads(int remaining) {
             stop = false;
             if (!remaining) {
                 int hlm = howLong();
                 sleepmillis(hlm);
                 stop = true;
-                return;
+                return 0;
             }
-            boost::thread athread(boost::bind(&B::thread, this));
-            launchThreads(remaining - 1);
+            unsigned long long counter = 0;
+            boost::thread athread(stdx::bind(&B::thread, this, &counter));
+            unsigned long long child = launchThreads(remaining - 1);
             athread.join();
+            unsigned long long accum = child + counter;
+            return accum;
         }
     };
 
@@ -515,16 +535,38 @@ namespace PerfTests {
 
     RWLock lk("testrw");
     SimpleMutex m("simptst");
-    mongo::mutex mtest("mtest");
+    boost::mutex mboost;
+    boost::timed_mutex mboost_timed;
+    std::mutex mstd;
+    std::timed_mutex mstd_timed;
     SpinLock s;
+    boost::condition c;
 
-    class mutexspeed : public B {
+    class NotifyOne : public B {
     public:
-        string name() { return "mutex"; }
+        string name() { return "notify_one"; }
         virtual int howLongMillis() { return 500; }
         virtual bool showDurStats() { return false; }
         void timed() {
-            mongo::mutex::scoped_lock lk(mtest);
+            c.notify_one();
+        }
+    };
+    class boostmutexspeed : public B {
+    public:
+        string name() { return "boost::mutex"; }
+        virtual int howLongMillis() { return 500; }
+        virtual bool showDurStats() { return false; }
+        void timed() {
+            boost::lock_guard<boost::mutex> lk(mboost);
+        }
+    };
+    class boosttimed_mutexspeed : public B {
+    public:
+        string name() { return "boost::timed_mutex"; }
+        virtual int howLongMillis() { return 500; }
+        virtual bool showDurStats() { return false; }
+        void timed() {
+            boost::lock_guard<boost::timed_mutex> lk(mboost_timed);
         }
     };
     class simplemutexspeed : public B {
@@ -536,6 +578,26 @@ namespace PerfTests {
             SimpleMutex::scoped_lock lk(m);
         }
     };
+
+    class stdmutexspeed : public B {
+    public:
+        string name() { return "std::mutex"; }
+        virtual int howLongMillis() { return 500; }
+        virtual bool showDurStats() { return false; }
+        void timed() {
+            std::lock_guard<std::mutex> lk(mstd);
+        }
+    };
+    class stdtimed_mutexspeed : public B {
+    public:
+        string name() { return "std::timed_mutex"; }
+        virtual int howLongMillis() { return 500; }
+        virtual bool showDurStats() { return false; }
+        void timed() {
+            std::lock_guard<std::timed_mutex> lk(mstd_timed);
+        }
+    };
+
     class spinlockspeed : public B {
     public:
         string name() { return "spinlock"; }
@@ -579,31 +641,112 @@ namespace PerfTests {
         }
     };
 
-    QLock _qlock;
-
-    class qlock : public B {
+    class locker_test : public B {
     public:
-        string name() { return "qlock"; }
-        //virtual int howLongMillis() { return 500; }
+        boost::thread_specific_ptr<ResourceId> resId;
+        boost::thread_specific_ptr<MMAPV1LockerImpl> locker;
+        boost::thread_specific_ptr<int> id;
+        boost::mutex lock;
+
+        // The following members are intitialized in the constructor
+        LockMode lockMode;
+        LockMode glockMode;
+
+        locker_test(LockMode m = MODE_X, LockMode gm = MODE_IX)
+            : lockMode(m),
+              glockMode(gm) { }
+        virtual string name() {
+            return (str::stream() << "locker_contested" << lockMode);
+        }
         virtual bool showDurStats() { return false; }
+        virtual bool testThreaded() { return true; }
+        virtual void prep() {
+            resId.reset(new ResourceId(RESOURCE_COLLECTION, std::string("TestDB.collection")));
+            locker.reset(new MMAPV1LockerImpl());
+        }
+
+        virtual void prepThreaded() {
+            resId.reset(new ResourceId(RESOURCE_COLLECTION, std::string("TestDB.collection")));
+            id.reset(new int);
+            lock.lock();
+            lock.unlock();
+            locker.reset(new MMAPV1LockerImpl());
+        }
+
         void timed() {
-            _qlock.lock_r();
-            _qlock.unlock_r();
+            locker->lockGlobal(glockMode);
+            locker->lock(*resId, lockMode);
+            locker->unlockAll();
+        }
+
+        void timed2(DBClientBase* c) {
+            locker->lockGlobal(glockMode);
+            locker->lock(*resId, lockMode);
+            locker->unlockAll();
         }
     };
 
-#if 0
-    class ulock : public B {
+    class glockerIX : public locker_test {
     public:
-        string name() { return "ulock"; }
-        virtual int howLongMillis() { return 500; }
-        virtual bool showDurStats() { return false; }
+        virtual string name() {
+            return (str::stream() << "glocker" << glockMode);
+        }
+
         void timed() {
-            lk.lockAsUpgradable();
-            lk.unlockFromUpgradable();
+            locker->lockGlobal(glockMode);
+            locker->unlockAll();
+        }
+
+        void timed2(DBClientBase* c) {
+            locker->lockGlobal(glockMode);
+            locker->unlockAll();
         }
     };
-#endif
+
+    class locker_test_uncontested : public locker_test {
+    public:
+        locker_test_uncontested(LockMode m = MODE_IX, LockMode gm = MODE_IX)
+            : locker_test(m, gm) { }
+        virtual string name() {
+            return (str::stream() << "locker_uncontested" << lockMode);
+        }
+
+        virtual void prepThreaded() {
+            id.reset(new int);
+
+            lock.lock();
+            lock.unlock();
+            locker.reset(new LockerImpl<true>);
+            resId.reset(new ResourceId(RESOURCE_COLLECTION,
+                                       str::stream() << "TestDB.collection" << *id));
+        }
+    };
+
+
+    class glockerIS : public glockerIX {
+    public:
+        glockerIS() : glockerIX() { glockMode = MODE_IS; }
+    };
+
+    class locker_contestedX : public locker_test {
+    public:
+        locker_contestedX() : locker_test(MODE_X, MODE_IX) { }
+    };
+
+    class locker_contestedS : public locker_test {
+    public:
+        locker_contestedS() : locker_test(MODE_S, MODE_IS) { }
+    };
+
+    class locker_uncontestedX : public locker_test_uncontested {
+    public:
+        locker_uncontestedX() : locker_test_uncontested(MODE_X, MODE_IX) { }
+    };
+
+    class locker_uncontestedS : public locker_test_uncontested {
+    public:
+        locker_uncontestedS() : locker_test_uncontested(MODE_S, MODE_IS) { }
+    };
 
     class CTM : public B {
     public:
@@ -616,6 +759,33 @@ namespace PerfTests {
         unsigned n;
         void timed() {
             unsigned long long x = curTimeMillis64();
+            aaa += x;
+            if( last ) {
+                unsigned long long delt = x-last;
+                if( delt ) {
+                    delts += delt;
+                    n++;
+                }
+            }
+            last = x;
+        }
+        void post() {
+            // we need to know if timing is highly ungranular - that could be relevant in some places
+            if( n )
+                cout << "      avg timer granularity: " << ((double)delts)/n << "ms " << endl;
+        }
+    };
+    class CTMicros : public B {
+    public:
+        CTMicros() : last(0), delts(0), n(0) { }
+        string name() { return "curTimeMicros64"; }
+        virtual int howLongMillis() { return 500; }
+        virtual bool showDurStats() { return false; }
+        unsigned long long last;
+        unsigned long long delts;
+        unsigned n;
+        void timed() {
+            unsigned long long x = curTimeMicros64();
             aaa += x;
             if( last ) {
                 unsigned long long delt = x-last;
@@ -698,8 +868,7 @@ namespace PerfTests {
         virtual int howLongMillis() { return 3000; }
         string name() { return "thread-local-storage"; }
         void timed() {
-            if( &cc() )
-                dontOptimizeOutHopefully++;
+            dontOptimizeOutHopefully++;
         }
         virtual bool showDurStats() { return false; }
     };
@@ -718,14 +887,14 @@ namespace PerfTests {
         if( dontOptimizeOutHopefully ) { 
             throw TestException();
         }
-        log() << "hmmm" << endl;
+        mongo::unittest::log() << "hmmm" << endl;
     }
     void thr2(int n) { 
         if( --n <= 0 ) {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         Z z;
         try { 
@@ -739,7 +908,7 @@ namespace PerfTests {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         try { 
             Z z;
@@ -753,7 +922,7 @@ namespace PerfTests {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         Z z;
         thr4(n-1);
@@ -810,7 +979,7 @@ namespace PerfTests {
         virtual bool showDurStats() { return false; }
         virtual int howLongMillis() { return 4000; }
         void prep() {
-            p = malloc(sz);
+            p = mongoMalloc(sz);
             // this isn't a fair test as it is mostly rands but we just want a rough perf check
             static int last;
             for (unsigned i = 0; i<sz; i++) {
@@ -903,13 +1072,13 @@ namespace PerfTests {
             return "insert-duplicate-_ids";
         }
         void prep() {
-            client().insert( ns(), o );
+            client()->insert( ns(), o );
         }
         void timed() {
-            client().insert( ns(), o );
+            client()->insert( ns(), o );
         }
         void post() {
-            verify( client().count(ns()) == 1 );
+            verify( client()->count(ns()) == 1 );
         }
     };
 
@@ -928,21 +1097,24 @@ namespace PerfTests {
         unsigned i;
         void timed() {
             BSONObj o = BSON( "_id" << i++ << "x" << 99 );
-            client().insert( ns(), o );
+            client()->insert( ns(), o );
         }
         virtual bool testThreaded() { 
             if( profiling ) 
                 return false;
             return true; 
         }
-        string timed2(DBClientBase& c) {
-            Query q = QUERY( "_id" << (unsigned) (rand() % i) );
-            c.findOne(ns(), q);
+        string name2() {
             return "findOne_by_id";
         }
+
+        void timed2(DBClientBase* c) {
+            Query q = QUERY( "_id" << (unsigned) (rand() % i) );
+            c->findOne(ns(), q);
+        }
         void post() {
-#if !defined(_DEBUG)
-            verify( client().count(ns()) > 50 );
+#if !defined(MONGO_CONFIG_DEBUG_BUILD)
+            verify( client()->count(ns()) > 50 );
 #endif
         }
     };
@@ -950,8 +1122,14 @@ namespace PerfTests {
     class InsertBig : public B {
         BSONObj x;
         virtual int howLongMillis() {
-            if( sizeof(void*) == 4 )
-                return 1000;  // could exceed mmapping if run too long, as this function adds a lot fasta
+            if (sizeof(void*) == 4) {
+                // See SERVER-12556 - Running this test for some time causes occasional failures
+                // on Windows 32-bit, because the virtual address space is used up and remapping 
+                // starts to fail. Value of zero means that only one iteration of the test
+                // will run.
+                //
+                return 0;
+            }
             return 5000;
         }
     public:
@@ -964,7 +1142,7 @@ namespace PerfTests {
         }
         string name() { return "insert-big"; }
         void timed() {
-            client().insert( ns(), x );
+            client()->insert( ns(), x );
         }
     };
 
@@ -973,13 +1151,13 @@ namespace PerfTests {
         virtual int howLongMillis() { return profiling ? 30000 : 5000; }
         string name() { return "random-inserts"; }
         void prep() {
-            client().insert( ns(), BSONObj() );
-            client().ensureIndex(ns(), BSON("x"<<1));
+            client()->insert( ns(), BSONObj() );
+            ASSERT_OK(dbtests::createIndex(txn(), ns(), BSON("x"<<1)));
         }
         void timed() {
             int x = rand();
             BSONObj y = BSON("x" << x << "y" << rand() << "z" << 33);
-            client().insert(ns(), y);
+            client()->insert(ns(), y);
         }
     };
 
@@ -993,23 +1171,26 @@ namespace PerfTests {
         }
         virtual string name() { return "random-upserts"; }
         void prep() {
-            client().insert( ns(), BSONObj() );
-            client().ensureIndex(ns(), BSON("x"<<1));
+            client()->insert( ns(), BSONObj() );
+            ASSERT_OK(dbtests::createIndex(txn(), ns(), BSON("x"<<1)));
         }
         void timed() {
             int x = rand();
             BSONObj q = BSON("x" << x);
             BSONObj y = BSON("x" << x << "y" << rand() << "z" << 33);
-            client().update(ns(), q, y, /*upsert*/true);
+            client()->update(ns(), q, y, /*upsert*/true);
         }
         virtual bool testThreaded() { return true; }
-        virtual string timed2(DBClientBase& c) {
+        virtual string name2() {
+            return name()+"-inc";
+        }
+
+        virtual void timed2(DBClientBase* c) {
             static BSONObj I = BSON( "$inc" << BSON( "y" << 1 ) );
             // test some $inc's
             int x = rand();
             BSONObj q = BSON("x" << x);
-            c.update(ns(), q, I);
-            return name()+"-inc";
+            c->update(ns(), q, I);
         }
     };
 
@@ -1019,16 +1200,88 @@ namespace PerfTests {
         string name() { return T::name() + "-more-indexes"; }
         void prep() {
             T::prep();
-            this->client().ensureIndex(this->ns(), BSON("y"<<1));
-            this->client().ensureIndex(this->ns(), BSON("z"<<1));
+            ASSERT_OK(dbtests::createIndex(this->txn(), this->ns(), BSON("y"<<1)));
+            ASSERT_OK(dbtests::createIndex(this->txn(), this->ns(), BSON("z"<<1)));
         }
+    };
+
+    // Tests what the worst case is for the overhead of enabling a fail point. If 'fpInjected'
+    // is false, then the fail point will be compiled out. If 'fpInjected' is true, then the
+    // fail point will be compiled in. Since the conditioned block is more or less trivial, any
+    // difference in performance is almost entirely attributable to the cost of checking
+    // whether the failpoint is enabled.
+    //
+    // If fpEnabled is true, then the failpoint will be enabled, using the 'nTimes' model since
+    // this looks to be the most expensive code path through the fail point enable detection
+    // logic.
+    //
+    // It makes no sense to trigger the slow path if the fp is not injected, so that will fail
+    // to compile.
+    template <bool fpInjected, bool fpEnabled>
+    class FailPointTest : public B {
+    public:
+
+        BOOST_STATIC_ASSERT(fpInjected || !fpEnabled);
+
+        FailPointTest()
+            : B()
+            , _value(0) {
+            if (fpEnabled) {
+                _fp.setMode(
+                    FailPoint::nTimes,
+                    std::numeric_limits<FailPoint::ValType>::max());
+                verify(_fp.shouldFail());
+            } else {
+                verify(!_fp.shouldFail());
+            }
+        }
+
+        virtual string name() {
+            return std::string("failpoint")
+                + (fpInjected ? "-present" : "-absent")
+                + (fpInjected ? (fpEnabled ? "-enabled" : "-disabled") : "");
+        }
+
+        virtual int howLongMillis() { return 5000; }
+        virtual bool showDurStats() { return false; }
+
+        virtual void timed() {
+            if (MONGO_unlikely(_value != 0) || (fpInjected && MONGO_FAIL_POINT(_fp))) {
+                // We should only get here if the failpoint is enabled.
+                verify(fpEnabled);
+            }
+        }
+
+        virtual string name2() {
+            // Will inhibit running 'timed2' as its own test, but will cause it to be run as a
+            // threaded test.
+            return name();
+        }
+
+        virtual void timed2(DBClientBase*) {
+            // We just want to re-run 'timed' when timed2 is invoked as a threaded test, so it
+            // invoke 'timed' statically to avoid overhead of virtual function call.
+            this->FailPointTest::timed();
+        }
+
+        virtual bool testThreaded() {
+            return true;
+        }
+
+    private:
+        // The failpoint under test.
+        FailPoint _fp;
+
+        // _value should always be zero for this test to behave as expected, but we don't want
+        // the compiler exploiting this fact to compile out our check, so mark it volatile.
+        const volatile int _value;
     };
 
     void t() {
         for( int i = 0; i < 20; i++ ) {
             sleepmillis(21);
             string fn = "/tmp/t1";
-            MongoMMF f;
+            DurableMappedFile f;
             unsigned long long len = 1 * 1024 * 1024;
             verify( f.create(fn, len, /*sequential*/rand()%2==0) );
             {
@@ -1037,7 +1290,7 @@ namespace PerfTests {
                 // write something to the private view as a test
                 strcpy(p, "hello");
             }
-            if( cmdLine.dur ) {
+            if (storageGlobalParams.dur) {
                 char *w = (char *) f.view_write();
                 strcpy(w + 6, "world");
             }
@@ -1046,13 +1299,113 @@ namespace PerfTests {
         }
     }
 
+    class StatusTestBase : public B {
+    public:
+        StatusTestBase()
+            : _message("Some string data that should not fit in a short string optimization") {
+        }
+
+        virtual int howLongMillis() { return 2000; }
+        virtual bool showDurStats() { return false; }
+    protected:
+        NOINLINE_DECL Status doThingOK() const {
+            return Status::OK();
+        }
+
+        NOINLINE_DECL Status doThingNotOK() const{
+            return Status(
+                ErrorCodes::InternalError,
+                _message,
+                42);
+        }
+    private:
+        const std::string _message;
+    };
+
+    class ReturnOKStatus : public StatusTestBase {
+    public:
+        string name() { return "return-ok-status"; }
+        void timed() {
+            doThingOK();
+        }
+    };
+
+    class ReturnNotOKStatus : public StatusTestBase {
+    public:
+        string name() { return "return-not-ok-status"; }
+        void timed() {
+            doThingNotOK();
+        }
+    };
+
+    class CopyOKStatus : public StatusTestBase {
+    public:
+        CopyOKStatus()
+            : _status(doThingOK()) {}
+
+        string name() { return "copy-ok-status"; }
+        void timed() {
+            const Status copy = _status;
+        }
+
+    private:
+        const Status _status;
+    };
+
+    class CopyNotOKStatus : public StatusTestBase {
+    public:
+        CopyNotOKStatus()
+            : _status(doThingNotOK()) {}
+
+        string name() { return "copy-not-ok-status"; }
+        void timed() {
+            const Status copy = _status;
+        }
+
+    private:
+        const Status _status;
+    };
+
+    class StatusMoveTestBase : public StatusTestBase {
+    public:
+        StatusMoveTestBase(bool ok)
+            : StatusTestBase()
+            , _a(ok ? doThingOK() : doThingNotOK())
+            , _b(_a.isOK() ? Status::OK() : Status(_a.code(), _a.reason().c_str(), _a.location())) {
+        }
+
+        void timed() {
+            Status temp(std::move(_a));
+            _a = std::move(_b);
+            _b = std::move(temp);
+        }
+
+    protected:
+        Status _a;
+        Status _b;
+    };
+
+    class MoveOKStatus : public StatusMoveTestBase  {
+    public:
+        MoveOKStatus()
+            : StatusMoveTestBase(true) {}
+        string name() { return "move-ok-status"; }
+    };
+
+    class MoveNotOKStatus : public StatusMoveTestBase {
+    public:
+        MoveNotOKStatus()
+            : StatusMoveTestBase(false) {}
+        string name() { return "move-not-ok-status"; }
+    };
+
     class All : public Suite {
     public:
         All() : Suite( "perf" ) { }
 
-        Result * run( const string& filter ) {
+        Result * run( const string& filter, int runsPerTest ) {
             boost::thread a(t);
-            Result * res = Suite::run(filter);
+            Result * res = Suite::run(filter, runsPerTest);
             a.join();
             return res;
         }
@@ -1061,7 +1414,7 @@ namespace PerfTests {
             pstatsConnect();
             cout
                 << "stats test                                       rps------  time-- "
-                << dur::stats.curr->_CSVHeader() << endl;
+                << dur::stats.curr()->_CSVHeader() << endl;
             if( profiling ) {
                 add< Insert1 >();
             }
@@ -1086,15 +1439,24 @@ namespace PerfTests {
 #endif
                 add< rlock >();
                 add< wlock >();
-                add< qlock >();
-                //add< ulock >();
-                add< mutexspeed >();
+                add< glockerIX > ();
+                add< glockerIS > ();
+                add< locker_contestedX >();
+                add< locker_uncontestedX >();
+                add< locker_contestedS >();
+                add< locker_uncontestedS >();
+                add< NotifyOne >();
                 add< simplemutexspeed >();
+                add< boostmutexspeed >();
+                add< boosttimed_mutexspeed >();
+                add< stdmutexspeed >();
+                add< stdtimed_mutexspeed >();
                 add< spinlockspeed >();
 #ifdef RUNCOMPARESWAP
                 add< casspeed >();
 #endif
                 add< CTM >();
+                add< CTMicros >();
                 add< KeyTest >();
                 add< Bldr >();
                 add< StkBldr >();
@@ -1109,6 +1471,16 @@ namespace PerfTests {
                 add< Update1 >();
                 add< MoreIndexes<Update1> >();
                 add< InsertBig >();
+                add< FailPointTest<false, false> >();
+                add< FailPointTest<true, false> >();
+                add< FailPointTest<true, true> >();
+
+                add< ReturnOKStatus >();
+                add< ReturnNotOKStatus >();
+                add< CopyOKStatus >();
+                add< CopyNotOKStatus >();
+                add< MoveOKStatus >();
+                add< MoveNotOKStatus >();
             }
         }
     } myall;

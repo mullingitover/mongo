@@ -1,0 +1,212 @@
+# -*- mode: python -*-
+
+Import("env")
+
+# Contains only the core ConnectionString functionality, *not* the ability to call connect()
+# and return a DBClientBase* back. For that you need to link against the 'clientdriver' library.
+env.Library(
+    target='connection_string',
+    source=[
+        'connection_string.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/net/hostandport',
+    ]
+)
+
+env.CppUnitTest(
+    target='connection_string_test',
+    source=[
+        'connection_string_test.cpp',
+    ],
+    LIBDEPS=[
+        'connection_string',
+    ]
+)
+
+env.Library(
+    target=[
+        'read_preference',
+    ],
+    source=[
+        'read_preference.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/bson/util/bson_extract',
+    ],
+)
+
+env.CppUnitTest(
+    target=[
+        'read_preference_test',
+    ],
+    source=[
+        'read_preference_test.cpp',
+    ],
+    LIBDEPS=[
+        'read_preference',
+    ],
+)
+
+env.Library('clientdriver', [
+            "connection_string_connect.cpp",
+            "connpool.cpp",
+            "dbclient.cpp",
+            "dbclient_rs.cpp",
+            "dbclientcursor.cpp",
+            'native_sasl_client_session.cpp',
+            "replica_set_monitor.cpp",
+            'sasl_client_authenticate.cpp',
+            "sasl_client_authenticate_impl.cpp",
+            'sasl_client_conversation.cpp',
+            'sasl_client_session.cpp',
+            'sasl_plain_client_conversation.cpp',
+            'sasl_scramsha1_client_conversation.cpp',
+            "syncclusterconnection.cpp",
+            "$BUILD_DIR/mongo/db/dbmessage.cpp"
+            ],
+            LIBDEPS=['connection_string',
+                     '$BUILD_DIR/mongo/bson/util/bson_extract',
+                     '$BUILD_DIR/mongo/crypto/scramauth',
+                     '$BUILD_DIR/mongo/db/auth/authcommon',
+                     '$BUILD_DIR/mongo/rpc/command_status',
+                     '$BUILD_DIR/mongo/rpc/rpc',
+                     '$BUILD_DIR/mongo/util/net/network',
+                     'cyrus_sasl_client_session',
+                     'read_preference',
+            ])
+
+env.Library(
+    target='connection_pool',
+    source=[
+        'connection_pool.cpp',
+    ],
+    LIBDEPS=[
+        'clientdriver',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+    ]
+)
+
+env.Library(
+    target='remote_command_runner',
+    source=[
+        'remote_command_runner.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/util/foundation',
+        '$BUILD_DIR/mongo/util/net/hostandport',
+    ]
+)
+
+env.Library(
+    target='remote_command_runner_impl',
+    source=[
+        'remote_command_runner_impl.cpp',
+    ],
+    LIBDEPS=[
+        'connection_pool',
+        'remote_command_runner',
+        '$BUILD_DIR/mongo/db/query/command_request_response',
+        '$BUILD_DIR/mongo/db/query/lite_parsed_query',
+    ]
+)
+
+env.Library(
+    target='remote_command_runner_mock',
+    source=[
+        'remote_command_runner_mock.cpp',
+    ],
+    LIBDEPS=[
+         'remote_command_runner',
+    ]
+)
+
+env.Library(
+    target='remote_command_targeter',
+    source=[
+        'remote_command_targeter_rs.cpp',
+        'remote_command_targeter_standalone.cpp',
+    ],
+    LIBDEPS=[
+
+    ]
+)
+
+env.Library(
+    target='remote_command_targeter_mock',
+    source=[
+        'remote_command_targeter_mock.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/net/hostandport',
+    ]
+)
+
+env.CppUnitTest(
+    target='replica_set_monitor_test',
+    source=[
+        'replica_set_monitor_node_test.cpp',
+        'replica_set_monitor_read_preference_test.cpp',
+        'replica_set_monitor_test.cpp',
+    ],
+    LIBDEPS=[
+        'clientdriver'
+    ]
+)
+
+env.CppUnitTest("dbclient_rs_test",
+                ["dbclient_rs_test.cpp"],
+                LIBDEPS=['clientdriver', '$BUILD_DIR/mongo/dbtests/mocklib'])
+
+if env['MONGO_BUILD_SASL_CLIENT']:
+    saslLibs = ['sasl2']
+    if env.TargetOSIs('windows'):
+        saslLibs.extend(["secur32"])
+
+    env.Library(
+        target='cyrus_sasl_client_session',
+        source=[
+            'cyrus_sasl_client_session.cpp',
+            'sasl_sspi.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/util/foundation',
+            '$BUILD_DIR/mongo/util/signal_handlers_synchronous',
+        ],
+        SYSLIBDEPS=saslLibs,
+    )
+else:
+    # Create a dummy sasl client library so that other targets can unconditionally
+    # link to it, without needing to first test MONGO_BUILD_SASL_CLIENT.
+    env.Library(
+        target='cyrus_sasl_client_session',
+        source=[],
+        LIBDEPS=[]
+    )
+
+env.CppUnitTest(
+    target="scoped_db_conn_test",
+    source=[
+        "scoped_db_conn_test.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/coredb",
+        "$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init",
+        "$BUILD_DIR/mongo/util/net/message_server_port",
+        "$BUILD_DIR/mongo/s/coreshard",
+        "$BUILD_DIR/mongo/s/mongoscore",
+        "$BUILD_DIR/mongo/util/ntservice_mock",
+    ],
+    NO_CRUTCH=True,
+)
+
+env.Library(
+    target="parallel",
+    source=[
+        'parallel.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)

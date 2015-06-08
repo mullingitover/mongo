@@ -3,7 +3,7 @@
 var baseName = "jstests_disk_repair";
 
 port = allocatePorts( 1 )[ 0 ];
-dbpath = "/data/db/" + baseName + "/";
+dbpath = MongoRunner.dataPath + baseName + "/";
 repairpath = dbpath + "repairDir/"
 
 resetDbpath( dbpath );
@@ -22,14 +22,14 @@ function check() {
     assert.eq.automsg( "1", "db[ baseName ].count()" );
 }
 check();
-stopMongod( port );
+MongoRunner.stopMongod( port );
 
 resetDbpath( repairpath );
 m = startMongoProgram( "mongod", "--port", port, "--dbpath", dbpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );
 db = m.getDB( baseName );
 assert.commandWorked( db.runCommand( {repairDatabase:1} ) );
 check();
-stopMongod( port );
+MongoRunner.stopMongod( port );
 
 resetDbpath( repairpath );
 rc = runMongoProgram( "mongod", "--repair", "--port", port, "--dbpath", dbpath, "--repairpath", repairpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );
@@ -37,7 +37,7 @@ assert.eq.automsg( "0", "rc" );
 m = startMongoProgram( "mongod", "--port", port, "--dbpath", dbpath, "--repairpath", repairpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );
 db = m.getDB( baseName );
 check();
-stopMongod( port );
+MongoRunner.stopMongod( port );
 
 resetDbpath( repairpath );
 rc = runMongoProgram( "mongod", "--repair", "--port", port, "--dbpath", dbpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );

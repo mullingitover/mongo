@@ -1,3 +1,4 @@
+if (0) { // Test disabled until SERVER-3853 is finished.
 var name = "dumprestore9";
 function step(msg) {
     msg = msg || "";
@@ -5,11 +6,12 @@ function step(msg) {
     print('\n' + name + ".js step " + this.x + ' ' + msg);
 }
 
-s = new ShardingTest( "dumprestore9a", 2, 0, 3, {chunksize:1} );
+s = new ShardingTest( "dumprestore9a", 2, 0, 3, { chunksize : 1, enableBalancer : 1 } );
 
 step("Shard collection");
 
 s.adminCommand( { enablesharding : "aaa" } ); // Make this db alphabetically before 'config' so it gets restored first
+s.ensurePrimaryShard('aaa', 'shard0001');
 s.adminCommand( { shardcollection : "aaa.foo" , key : { x : 1 } } );
 
 db = s.getDB( "aaa" );
@@ -35,7 +37,7 @@ assert.eq(numDocs, coll.count(), "Documents weren't inserted correctly");
 
 step("dump cluster");
 
-dumpdir = "/data/db/dumprestore9-dump1/";
+dumpdir = MongoRunner.dataDir + "/dumprestore9-dump1/";
 resetDbpath(dumpdir);
 runMongoProgram( "mongodump", "--host", s._mongos[0].host, "--out", dumpdir );
 
@@ -75,3 +77,4 @@ for (var i = 0; i < s._connections.length; i++) {
 step("Stop cluster");
 s.stop();
 step("SUCCESS");
+}

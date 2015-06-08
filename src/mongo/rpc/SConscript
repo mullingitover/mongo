@@ -1,0 +1,153 @@
+# -*- mode: python -*-
+
+Import("env")
+
+env.Library(
+    target=[
+        'command_status',
+    ],
+    source=[
+        'get_status_from_command_result.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/util/foundation'
+    ],
+)
+
+env.Library(
+    target=[
+        'document_range',
+    ],
+    source=[
+        'document_range.cpp'
+    ],
+)
+
+env.Library(
+    target=[
+        'protocol',
+    ],
+    source=[
+        'protocol.cpp',
+    ],
+)
+
+env.Library(
+    target=[
+        'rpc',
+    ],
+    source=[
+        'factory.cpp',
+    ],
+    LIBDEPS=[
+        'command_reply',
+        'command_request',
+        'legacy_reply',
+        'legacy_request',
+        'metadata',
+        'protocol',
+        '$BUILD_DIR/mongo/db/server_parameters',
+    ],
+)
+
+env.Library(
+    target=[
+        'command_request',
+    ],
+    source=[
+        'command_request.cpp',
+        'command_request_builder.cpp',
+    ],
+    LIBDEPS=[
+        'document_range',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target=[
+        'legacy_request',
+    ],
+    source=[
+        'legacy_request.cpp',
+        'legacy_request_builder.cpp',
+    ],
+    LIBDEPS=[
+        'document_range',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target=[
+        'command_reply',
+    ],
+    source=[
+        'command_reply.cpp',
+        'command_reply_builder.cpp',
+        'reply_builder_interface.cpp',
+    ],
+    LIBDEPS=[
+        'document_range',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target=[
+        'legacy_reply',
+    ],
+    source=[
+        'legacy_reply.cpp',
+        'legacy_reply_builder.cpp'
+    ],
+    LIBDEPS=[
+        'document_range',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target=[
+        'metadata',
+    ],
+    source=[
+        'metadata.cpp',
+        'metadata/server_selection_metadata.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/read_preference',
+        '$BUILD_DIR/mongo/util/decorable',
+    ],
+)
+
+env.CppUnitTest(
+    target=[
+        'metadata_test',
+    ],
+    source=[
+        'metadata/server_selection_metadata_test.cpp',
+    ],
+    LIBDEPS=[
+        'metadata',
+    ],
+)
+
+env.CppUnitTest(
+    target=[
+        'rpc_test',
+    ],
+    source=[
+        'command_reply_builder_test.cpp',
+        'command_reply_test.cpp',
+        'command_request_builder_test.cpp',
+        'command_request_test.cpp',
+        'protocol_test.cpp',
+    ],
+    LIBDEPS=[
+        'command_request',
+        'command_reply',
+        'protocol',
+    ],
+)

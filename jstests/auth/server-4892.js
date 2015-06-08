@@ -6,7 +6,7 @@
  */
 
 var baseName = 'jstests_auth_server4892';
-var dbpath = '/data/db/' + baseName;
+var dbpath = MongoRunner.dataPath + baseName;
 var port = allocatePorts( 1 )[ 0 ];
 var mongod_common_args = [
     '--port', port, '--dbpath', dbpath, '--bind_ip', '127.0.0.1', '--nohttpinterface' ];
@@ -24,7 +24,7 @@ function with_mongod( extra_mongod_args, operation ) {
     try {
         operation( mongod );
     } finally {
-        stopMongod( port );
+        MongoRunner.stopMongod( port );
     }
 }
 
@@ -49,13 +49,14 @@ with_mongod( ['--noauth'], function setupTest( mongod ) {
     conn = new Mongo( mongod.host );
     admin = conn.getDB( 'admin' );
     somedb = conn.getDB( 'somedb' );
-    admin.addUser( 'admin', 'admin' );
-    somedb.addUser( 'frim', 'fram' );
+    admin.createUser({user: 'admin', pwd: 'admin', roles: jsTest.adminUserRoles});
+    admin.auth('admin', 'admin');
+    somedb.createUser({user: 'frim', pwd: 'fram', roles: jsTest.basicUserRoles});
     somedb.data.drop();
     for (var i = 0; i < 10; ++i) {
-        somedb.data.insert( { val: i } );
-        assert ( ! somedb.getLastError() );
+        assert.writeOK(somedb.data.insert( { val: i } ));
     }
+    admin.logout();
 } );
 
 with_mongod( ['--auth'], function runTest( mongod ) {

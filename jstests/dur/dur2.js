@@ -36,11 +36,7 @@ function work() {
 
     // go long enough we will have time to kill it later during recovery
     var j = 2;
-    var MaxTime = 15;
-    if (Math.random() < 0.1) {
-        print("dur2.js DOING A LONGER (120 sec) PASS - if an error, try long pass to replicate");
-        MaxTime = 120;
-    }
+    var MaxTime = 90;
     while (1) {
         d.foo.insert({ _id: j, z: x });
         d.foo.update({ _id: j }, { $inc: { a: 1} });
@@ -69,24 +65,36 @@ if( debugging ) {
 }
 
 // directories
-var path = "/data/db/" + testname+"dur";
+var path = MongoRunner.dataPath + testname+"dur";
 
 log("run mongod with --dur");
-conn = startMongodEmpty("--port", 30001, "--dbpath", path, "--dur", "--smallfiles", "--durOptions", /*DurParanoid*/8, "--master", "--oplogSize", 64);
+conn = MongoRunner.runMongod({dbpath: path,
+                              journal: "",
+                              smallfiles: "",
+                              journalOptions: 8 /*DurParanoid*/,
+                              master: "",
+                              oplogSize: 64});
 work();
 
 log("kill -9");
-stopMongod(30001, /*signal*/9);
+MongoRunner.stopMongod(conn, /*signal*/9);
 
 // journal file should be present, and non-empty as we killed hard
 assert(listFiles(path + "/journal/").length > 0, "journal directory is unexpectantly empty after kill");
 
 // restart and recover
 log("restart mongod and recover");
-conn = startMongodNoReset("--port", 30002, "--dbpath", path, "--dur", "--smallfiles", "--durOptions", 8, "--master", "--oplogSize", 64);
+conn = MongoRunner.runMongod({restart: true,
+                              cleanData: false,
+                              dbpath: path,
+                              journal: "",
+                              smallfiles: "",
+                              journalOptions: 8,
+                              master: "",
+                              oplogSize: 64});
 verify();
 
-log("stopping mongod 30002");
-stopMongod(30002);
+log("stopping mongod " + conn.port);
+MongoRunner.stopMongod(conn);
 
 print(testname + " SUCCESS");

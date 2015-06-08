@@ -1,6 +1,7 @@
 // mr.h
 
 /**
+ *    Copyright (C) 2012 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -13,17 +14,43 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "pch.h"
+#include <boost/noncopyable.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <string>
+#include <vector>
+
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
 
+    class Collection;
+    class Database;
+    class OperationContext;
+
     namespace mr {
 
-        typedef vector<BSONObj> BSONList;
+        typedef std::vector<BSONObj> BSONList;
 
         class State;
 
@@ -72,7 +99,7 @@ namespace mongo {
             /**
              * @param type (map|reduce|finalize)
              */
-            JSFunction( string type , const BSONElement& e );
+            JSFunction( const std::string& type , const BSONElement& e );
             virtual ~JSFunction() {}
 
             virtual void init( State * state );
@@ -81,8 +108,8 @@ namespace mongo {
             ScriptingFunction func() const { return _func; }
 
         private:
-            string _type;
-            string _code; // actual javascript code
+            std::string _type;
+            std::string _code; // actual javascript code
             BSONObj _wantedScope; // this is for CodeWScope
 
             Scope * _scope; // this is not owned by us, and might be shared
@@ -111,7 +138,7 @@ namespace mongo {
         private:
 
             /**
-             * result in "return"
+             * result in "__returnValue"
              * @param key OUT
              * @param endSizeEstimate OUT
             */
@@ -141,17 +168,17 @@ namespace mongo {
             }
         };
 
-        typedef map< BSONObj,BSONList,TupleKeyCmp > InMemory; // from key to list of tuples
+        typedef std::map< BSONObj,BSONList,TupleKeyCmp > InMemory; // from key to list of tuples
 
         /**
          * holds map/reduce config information
          */
         class Config {
         public:
-            Config( const string& _dbname , const BSONObj& cmdObj );
+            Config( const std::string& _dbname , const BSONObj& cmdObj );
 
-            string dbname;
-            string ns;
+            std::string dbname;
+            std::string ns;
 
             // options
             bool verbose;
@@ -166,21 +193,33 @@ namespace mongo {
 
             // functions
 
-            scoped_ptr<Mapper> mapper;
-            scoped_ptr<Reducer> reducer;
-            scoped_ptr<Finalizer> finalizer;
+            boost::scoped_ptr<Mapper> mapper;
+            boost::scoped_ptr<Reducer> reducer;
+            boost::scoped_ptr<Finalizer> finalizer;
 
             BSONObj mapParams;
             BSONObj scopeSetup;
 
             // output tables
-            string incLong;
-            string tempLong;
+            std::string incLong;
+            std::string tempNamespace;
 
-            string finalShort;
-            string finalLong;
+            enum OutputType {
+                REPLACE , // atomically replace the collection
+                MERGE ,  // merge keys, override dups
+                REDUCE , // merge keys, reduce dups
+                INMEMORY // only store in memory, limited in size
+            };
+            struct OutputOptions {
+                std::string outDB;
+                std::string collectionName;
+                std::string finalNamespace;
+                // if true, no lock during output operation
+                bool outNonAtomic;
+                OutputType outType;
+            } outputOptions;
 
-            string outDB;
+            static OutputOptions parseOutputOptions(const std::string& dbname, const BSONObj& cmdObj);
 
             // max number of keys allowed in JS map before switching mode
             long jsMaxKeys;
@@ -189,19 +228,10 @@ namespace mongo {
             // maximum size of map before it gets dumped to disk
             long maxInMemSize;
 
-            enum { REPLACE , // atomically replace the collection
-                   MERGE ,  // merge keys, override dups
-                   REDUCE , // merge keys, reduce dups
-                   INMEMORY // only store in memory, limited in size
-                 } outType;
-
-            // if true, no lock during output operation
-            bool outNonAtomic;
-
             // true when called from mongos to do phase-1 of M/R
             bool shardedFirstPass;
 
-            static AtomicUInt JOB_NUMBER;
+            static AtomicUInt32 JOB_NUMBER;
         }; // end MRsetup
 
         /**
@@ -210,7 +240,10 @@ namespace mongo {
          */
         class State {
         public:
-            State( const Config& c );
+            /**
+             * txn must outlive this State.
+             */
+            State( OperationContext* txn, const Config& c );
             ~State();
 
             void init();
@@ -228,10 +261,14 @@ namespace mongo {
             void emit( const BSONObj& a );
 
             /**
-             * if size is big, run a reduce
-             * if its still big, dump to temp collection
-             */
-            void checkSize();
+            * Checks the size of the transient in-memory results accumulated so far and potentially
+            * runs reduce in order to compact them. If the data is still too large, it will be 
+            * spilled to the output collection.
+            *
+            * NOTE: Make sure that no DB locks are held, when calling this function, because it may
+            * try to acquire write DB lock for the write to the output collection.
+            */
+            void reduceAndSpillInMemoryStateIfNeeded();
 
             /**
              * run reduce on _temp
@@ -256,10 +293,17 @@ namespace mongo {
             // ------- cleanup/data positioning ----------
 
             /**
+             * Clean up the temporary and incremental collections
+             */
+            void dropTempCollections();
+
+            /**
                @return number objects in collection
              */
-            long long postProcessCollection( CurOp* op , ProgressMeterHolder& pm );
-            long long postProcessCollectionNonAtomic( CurOp* op , ProgressMeterHolder& pm );
+            long long postProcessCollection(
+                            OperationContext* txn, CurOp* op, ProgressMeterHolder& pm);
+            long long postProcessCollectionNonAtomic(
+                            OperationContext* txn, CurOp* op, ProgressMeterHolder& pm);
 
             /**
              * if INMEMORY will append
@@ -272,7 +316,7 @@ namespace mongo {
             /**
              * inserts with correct replication semantics
              */
-            void insert( const string& ns , const BSONObj& o );
+            void insert( const std::string& ns , const BSONObj& o );
 
             // ------ simple accessors -----
 
@@ -281,7 +325,7 @@ namespace mongo {
 
             const Config& config() { return _config; }
 
-            const bool isOnDisk() { return _onDisk; }
+            bool isOnDisk() { return _onDisk; }
 
             long long numEmits() const { if (_jsMode) return _scope->getNumberLongLong("_emitCt"); return _numEmits; }
             long long numReduces() const { if (_jsMode) return _scope->getNumberLongLong("_redCt"); return _config.reducer->numReduces; }
@@ -291,17 +335,27 @@ namespace mongo {
             void switchMode(bool jsMode);
             void bailFromJS();
 
+            Collection* getCollectionOrUassert(Database* db, StringData ns);
+
             const Config& _config;
             DBDirectClient _db;
+            bool _useIncremental;   // use an incremental collection
 
         protected:
 
-            void _add( InMemory* im , const BSONObj& a , long& size );
+            /**
+             * Appends a new document to the in-memory list of tuples, which are under that
+             * document's key.
+             *
+             * @return estimated in-memory size occupied by the newly added document.
+             */
+            int _add(InMemory* im , const BSONObj& a);
 
-            scoped_ptr<Scope> _scope;
+            OperationContext* _txn;
+            boost::scoped_ptr<Scope> _scope;
             bool _onDisk; // if the end result of this map reduce is disk or not
 
-            scoped_ptr<InMemory> _temp;
+            boost::scoped_ptr<InMemory> _temp;
             long _size; // bytes in _temp
             long _dupCount; // number of duplicate key entries
 
@@ -317,6 +371,10 @@ namespace mongo {
         BSONObj fast_emit( const BSONObj& args, void* data );
         BSONObj _bailFromJS( const BSONObj& args, void* data );
 
+        void addPrivilegesRequiredForMapReduce(Command* commandTemplate,
+                                               const std::string& dbname,
+                                               const BSONObj& cmdObj,
+                                               std::vector<Privilege>* out);
     } // end mr namespace
 }
 

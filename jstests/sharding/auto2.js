@@ -3,6 +3,7 @@
 s = new ShardingTest( "auto2" , 2 , 1 , 2 );
 
 s.adminCommand( { enablesharding : "test" } );
+s.ensurePrimaryShard('test', 'shard0001');
 s.adminCommand( { shardcollection : "test.foo" , key : { num : 1 } } );
 
 bigString = "";
@@ -12,23 +13,30 @@ while ( bigString.length < 1024 * 50 )
 db = s.getDB( "test" )
 coll = db.foo;
 
-var i=0;
+// Temporarily disable balancer so it will not interfere with auto-splitting
+s.stopBalancer();
 
+var i=0;
 for ( j=0; j<30; j++ ){
     print( "j:" + j + " : " + 
            Date.timeFunc( 
                function(){
+                   var bulk = coll.initializeUnorderedBulkOp();
                    for ( var k=0; k<100; k++ ){
-                       coll.save( { num : i , s : bigString } );
+                       bulk.insert( { num : i , s : bigString } );
                        i++;
                    }
+                   assert.writeOK(bulk.execute());
                } 
            ) );
     
 }
+
+s.startBalancer();
+
 assert.eq( i , j * 100 , "setup" );
-s.adminCommand( "connpoolsync" );
-db.getLastError();
+// Until SERVER-9715 is fixed, the sync command must be run on a diff connection
+new Mongo( s.s.host ).adminCommand( "connpoolsync" );
 
 print( "done inserting data" );
 
@@ -41,10 +49,15 @@ function doCountsGlobal(){
     return counta + countb;
 }
 
-doCountsGlobal()
+// Wait for the chunks to distribute
+assert.soon( function(){
+    doCountsGlobal()
 
-assert( counta > 0 , "diff1" );
-assert( countb > 0 , "diff2" );
+    print( "Counts: " + counta + countb)
+    
+    return counta > 0 && countb > 0
+})
+
 
 print( "checkpoint B" )
 
@@ -116,15 +129,6 @@ s.stopBalancer()
 
 print( "checkpoint E")
 
-x = db.runCommand( "connPoolStats" );
-printjson( x )
-for ( host in x.hosts ){
-    var foo = x.hosts[host];
-    assert.lt( 0 , foo.available , "pool: " + host );
-}
-
-print( "checkpoint F")
-
 assert( t.findOne() , "check close 0" );
 
 for ( i=0; i<20; i++ ){
@@ -136,10 +140,10 @@ for ( i=0; i<20; i++ ){
     gc();
 }
 
-print( "checkpoint G")
+print( "checkpoint F")
 
 assert.throws( function(){ s.getDB( "test" ).foo.find().sort( { s : 1 } ).forEach( function( x ){ printjsononeline( x.substring( 0, x.length > 30 ? 30 : x.length ) ) } ) } )
 
-print( "checkpoint H")
+print( "checkpoint G")
 
 s.stop();

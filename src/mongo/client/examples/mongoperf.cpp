@@ -1,3 +1,30 @@
+/*    Copyright 2009 10gen Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
+
 /* 
    How to build and run:
 
@@ -10,27 +37,30 @@
 // so we define the following macro
 #define MONGO_EXPOSE_MACROS 1
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
 #include <iostream>
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/thread/thread.hpp>
 
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/util/logfile.h"
-#include "mongo/util/mmap.h"
+#include "mongo/db/storage/mmap_v1/mmap.h"
+#include "mongo/db/storage/mmap_v1/logfile.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/allocator.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/processinfo.h"
 
 
 using namespace std;
 using namespace mongo;
-using namespace bson;
 
 int dummy;
+unsigned recSizeKB;
 LogFile *lf = 0;
 MemoryMappedFile *mmfFile;
 char *mmf = 0;
@@ -40,7 +70,7 @@ const unsigned PG = 4096;
 unsigned nThreadsRunning = 0;
 
 // as this is incremented A LOT, at some point this becomes a bottleneck if very high ops/second (in cache) things are happening.
-AtomicUInt iops;
+AtomicUInt32 iops;
 
 SimpleMutex m("mperf");
 
@@ -74,30 +104,39 @@ unsigned long long rrand() {
 void workerThread() {
     bool r = options["r"].trueValue();
     bool w = options["w"].trueValue();
-    //cout << "read:" << r << " write:" << w << endl;
+    cout << "read:" << r << " write:" << w << endl;
     long long su = options["sleepMicros"].numberLong();
     Aligned a;
     while( 1 ) { 
         unsigned long long rofs = (rrand() * PG) % len;
         unsigned long long wofs = (rrand() * PG) % len;
+        const unsigned P = PG/1024;
         if( mmf ) { 
             if( r ) {
-                dummy += mmf[rofs];
-                iops++;
+                for( unsigned p = P; p <= recSizeKB; p += P ) {
+                    if( rofs < len ) 
+                        dummy += mmf[rofs];
+                    rofs += PG;
+                }
+                iops.fetchAndAdd(1);
             }
             if( w ) {
-                mmf[wofs] = 3;
-                iops++;
+                for( unsigned p = P; p <= recSizeKB; p += P ) {
+                    if( wofs < len )
+                        mmf[wofs] = 3;
+                    wofs += PG;
+                }
+                iops.fetchAndAdd(1);
             }
         }
         else {
             if( r ) {
-                lf->readAt(rofs, a.addr(), PG);
-                iops++;
+                lf->readAt(rofs, a.addr(), recSizeKB * 1024);
+                iops.fetchAndAdd(1);
             }
             if( w ) {
-                lf->writeAt(wofs, a.addr(), PG);
-                iops++;
+                lf->writeAt(wofs, a.addr(), recSizeKB * 1024);
+                iops.fetchAndAdd(1);
             }
         }
         long long micros = su / nThreadsRunning;
@@ -109,6 +148,12 @@ void workerThread() {
 
 void go() {
     verify( options["r"].trueValue() || options["w"].trueValue() );
+
+    recSizeKB = options["recSizeKB"].numberInt();
+    if( recSizeKB == 0 )
+        recSizeKB = 4;
+    verify( recSizeKB <= 64000 && recSizeKB > 0 );
+
     MemoryMappedFile f;
     cout << "creating test file size:";
     len = options["fileSizeMB"].numberLong();
@@ -131,7 +176,7 @@ void go() {
     }
     lf = new LogFile(fname,true);
     const unsigned sz = 1024 * 1024 * 32; // needs to be big as we are using synchronousAppend.  if we used a regular MongoFile it wouldn't have to be
-    char *buf = (char*) malloc(sz+4096);
+    char *buf = (char*) mongoMalloc(sz+4096);
     const char *p = round(buf);
     for( unsigned long long i = 0; i < len; i += sz ) { 
         lf->synchronousAppend(p, sz);
@@ -156,7 +201,13 @@ void go() {
 
     cout << "testing..."<< endl;
 
-    unsigned wthr = (unsigned) o["nThreads"].Int();
+    cout << "options:" << o.toString() << endl;
+    unsigned wthr = 1;
+    if( !o["nThreads"].eoo() ) {
+        wthr = (unsigned) o["nThreads"].Int();
+    }
+    cout << "wthr " << wthr << endl;
+
     if( wthr < 1 ) { 
         cout << "bad threads field value" << endl;
         return;
@@ -176,8 +227,8 @@ void go() {
             }
         }
         sleepsecs(1);
-        unsigned long long w = iops.get();
-        iops.zero();
+        unsigned long long w = iops.loadRelaxed();
+        iops.store(0);
         w /= 1; // 1 secs
         cout << w << " ops/sec ";
         if( mmf == 0 ) 
@@ -207,6 +258,7 @@ cout <<
 "    mmf:<bool>,       // if true do i/o's via memory mapped files (default false)\n"
 "    r:<bool>,         // do reads (default false)\n"
 "    w:<bool>,         // do writes (default false)\n"
+"    recSizeKB:<n>,    // size of each write (default 4KB)\n"
 "    syncDelay:<n>     // secs between fsyncs, like --syncdelay in mongod. (default 0/never)\n"
 "  }\n"
 "\n"
@@ -242,31 +294,9 @@ cout <<
             return EXIT_FAILURE;
         }
         cout << "parsed options:\n" << options.toString() << endl;
+        ProcessInfo::initializeSystemInfo();
 
         go();
-#if 0
-        cout << "connecting to localhost..." << endl;
-        DBClientConnection c;
-        c.connect("localhost");
-        cout << "connected ok" << endl;
-        unsigned long long count = c.count("test.foo");
-        cout << "count of exiting documents in collection test.foo : " << count << endl;
-
-        bo o = BSON( "hello" << "world" );
-        c.insert("test.foo", o);
-
-        string e = c.getLastError();
-        if( !e.empty() ) { 
-            cout << "insert #1 failed: " << e << endl;
-        }
-
-        // make an index with a unique key constraint
-        c.ensureIndex("test.foo", BSON("hello"<<1), /*unique*/true);
-
-        c.insert("test.foo", o); // will cause a dup key error on "hello" field
-        cout << "we expect a dup key error here:" << endl;
-        cout << "  " << c.getLastErrorDetailed().toString() << endl;
-#endif
     } 
     catch(DBException& e) { 
         cout << "caught DBException " << e.toString() << endl;

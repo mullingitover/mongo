@@ -1,4 +1,5 @@
 
+import codecs
 import re
 import socket
 import time
@@ -7,27 +8,40 @@ import os.path
 import itertools
 import subprocess
 import sys
+import hashlib
+
 # various utilities that are handy
 
 def getAllSourceFiles( arr=None , prefix="." ):
     if arr is None:
         arr = []
-
+    
+    if not os.path.isdir( prefix ):
+        # assume a file
+        arr.append( prefix )
+        return arr
+        
     for x in os.listdir( prefix ):
         if x.startswith( "." ) or x.startswith( "pcre-" ) or x.startswith( "32bit" ) or x.startswith( "mongodb-" ) or x.startswith("debian") or x.startswith( "mongo-cxx-driver" ):
+            continue
+        # XXX: Avoid conflict between v8 and v8-3.25 source files in
+        #      src/mongo/scripting
+        #      Remove after v8-3.25 migration.
+        if x.find("v8-3.25") != -1:
             continue
         full = prefix + "/" + x
         if os.path.isdir( full ) and not os.path.islink( full ):
             getAllSourceFiles( arr , full )
         else:
             if full.endswith( ".cpp" ) or full.endswith( ".h" ) or full.endswith( ".c" ):
+                full = full.replace( "//" , "/" )
                 arr.append( full )
 
     return arr
 
 
 def getGitBranch():
-    if not os.path.exists( ".git" ):
+    if not os.path.exists( ".git" ) or not os.path.isdir(".git"):
         return None
 
     version = open( ".git/HEAD" ,'r' ).read().strip()
@@ -54,7 +68,7 @@ def getGitBranchString( prefix="" , postfix="" ):
     return prefix + b + postfix
 
 def getGitVersion():
-    if not os.path.exists( ".git" ):
+    if not os.path.exists( ".git" ) or not os.path.isdir(".git"):
         return "nogitversion"
 
     version = open( ".git/HEAD" ,'r' ).read().strip()
@@ -65,6 +79,15 @@ def getGitVersion():
     if not os.path.exists( f ):
         return version
     return open( f , 'r' ).read().strip()
+
+def getGitDescribe():
+    with open(os.devnull, "r+") as devnull:
+        proc = subprocess.Popen("git describe",
+            stdout=subprocess.PIPE,
+            stderr=devnull,
+            stdin=devnull,
+            shell=True)
+        return proc.communicate()[0].strip()
 
 def execsys( args ):
     import subprocess
@@ -78,7 +101,7 @@ def execsys( args ):
 def getprocesslist():
     raw = ""
     try:
-        raw = execsys( "/bin/ps -ax" )[0]
+        raw = execsys( "/bin/ps axww" )[0]
     except Exception,e:
         print( "can't get processlist: " + str( e ) )
 
@@ -154,6 +177,13 @@ def which(executable):
 
     return executable
 
+def md5sum( file ):
+    #TODO error handling, etc..
+    return execsys( "md5sum " + file )[0].partition(" ")[0]
+
+def md5string( a_string ):
+    return hashlib.md5(a_string).hexdigest()
+
 def find_python(min_version=(2, 5)):
     try:
         if sys.version_info >= min_version:
@@ -183,11 +213,32 @@ def smoke_command(*args):
     # invocation of smoke.py
     here = os.path.dirname(__file__)
     smoke_py = os.path.abspath(os.path.join(here, 'smoke.py'))
-    return [find_python(), smoke_py] + list(args)
+    # the --with-cleanbb argument causes smoke.py to run
+    # buildscripts/cleanbb.py before each test phase; this
+    # prevents us from running out of disk space on slaves
+    return [find_python(), smoke_py, '--with-cleanbb'] + list(args)
 
 def run_smoke_command(*args):
     # to run a command line script from a scons Alias (or any
     # Action), the command sequence must be enclosed in a list,
     # otherwise SCons treats it as a list of dependencies.
     return [smoke_command(*args)]
+
+# unicode is a pain. some strings cannot be unicode()'d
+# but we want to just preserve the bytes in a human-readable
+# fashion. this codec error handler will substitute the
+# repr() of the offending bytes into the decoded string
+# at the position they occurred
+def replace_with_repr(unicode_error):
+    offender = unicode_error.object[unicode_error.start:unicode_error.end]
+    return (unicode(repr(offender).strip("'").strip('"')), unicode_error.end)
+
+codecs.register_error('repr', replace_with_repr)
+
+def unicode_dammit(string, encoding='utf8'):
+    # convert a string to a unicode, using the Python
+    # representation of non-ascii bytes when necessary
+    #
+    # name inpsired by BeautifulSoup's "UnicodeDammit"
+    return string.decode(encoding, 'repr')
 

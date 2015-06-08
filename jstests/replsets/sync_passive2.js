@@ -6,7 +6,7 @@ load("jstests/replsets/rslib.js");
 
 var name = "sync_passive2";
 var host = getHostName();
-  
+
 var replTest = new ReplSetTest( {name: name, nodes: 5} );
 var nodes = replTest.startSet();
 
@@ -131,6 +131,7 @@ print("sync from self: error");
 var result = replTest.nodes[3].getDB("admin").runCommand({replSetSyncFrom: replTest.host+":"+replTest.ports[3]});
 printjson(result);
 assert.eq(result.ok, 0);
+assert.eq(result.errmsg, "I cannot sync from myself");
 
 print("sync from arbiter: error");
 result = replTest.nodes[3].getDB("admin").runCommand({replSetSyncFrom: replTest.host+":"+replTest.ports[1]});
@@ -171,21 +172,48 @@ assert.soon(function() {
     return checkSyncingFrom(nodes[3], replTest.host+":"+replTest.ports[2])
 });
 
-print("sync primary on stepdown");
-result = replTest.nodes[0].getDB("admin").runCommand({replSetSyncFrom: replTest.host+":"+replTest.ports[3]});
-printjson(result)
-assert.eq(result.ok, 1);
+/**
+ * Test forcing a primary to sync from another member
+ */
 
+print("sync a primary from another member: error");
+result = replTest.nodes[0].getDB("admin").runCommand({replSetSyncFrom: replTest.host+":"+replTest.ports[2]});
+printjson(result);
+assert.eq(result.ok, 0);
+assert.eq(result.errmsg, "primaries don't sync");
+
+/**
+ * Check sync target re-evaluation:
+ * - Set member 3 to be slave delayed by 40 seconds.
+ * - Force 2 to sync from 3
+ * - Do some writes
+ * - Check who 2 is syncing from, it should be someone other than three after ~30 seconds
+ */
+print("check sync target re-evaluation");
+master = replTest.getMaster();
+config = master.getDB("local").system.replset.findOne();
+config.members[3].slaveDelay = 40;
+config.members[3].priority = 0;
+config.version++;
 try {
-    replTest.nodes[0].getDB("admin").runCommand({replSetStepDown:60});
-}
-catch (e) {
-    print(e);
-}
+    replTest.getMaster().getDB("admin").runCommand({replSetReconfig:config});
+} catch (x) { /* expected */ }
 
-// hammer this, because it's probably not going to stick to it for long
+replTest.awaitReplication(60000);
+printjson(replTest.status());
+
+print("force 2 to sync from 3");
+// This briefly causes 2 to sync from 3, but members have a strong preference for not syncing from
+// a slave delayed node so it may switch to another sync source quickly.
+result = replTest.nodes[2].getDB("admin")
+    .runCommand({replSetSyncFrom: replTest.host+":"+replTest.ports[3]});
+printjson(result);
+assert.eq(1, result.ok);
+
+print("do writes and check that 2 changes sync targets");
 assert.soon(function() {
-    return checkSyncingFrom(nodes[0], replTest.host+":"+replTest.ports[3])
-}, "stepdown", 30000, 0);
+    replTest.getMaster().getDB("foo").bar.insert({x:1});
+    return !checkSyncingFrom(nodes[2], replTest.host+":"+replTest.ports[3]);
+}, 'failed to change sync target', 60000);
 
 replTest.stopSet();

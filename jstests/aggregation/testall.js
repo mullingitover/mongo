@@ -3,10 +3,7 @@
 */
 
 /* load the test documents */
-load('jstests/aggregation/articles.js');
-
-/* load the test utilities */
-load('jstests/aggregation/utils.js');
+load('jstests/aggregation/data/articles.js');
 
 // make sure we're using the right db; this is the same as "use mydb;" in shell
 db = db.getSiblingDB("aggdb");
@@ -23,7 +20,7 @@ var p1 = db.runCommand(
 
 var p1result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "pageViews" : 5,
         "tags" : [
             "fun",
@@ -32,7 +29,7 @@ var p1result = [
         ]
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "pageViews" : 7,
         "tags" : [
             "fun",
@@ -40,7 +37,7 @@ var p1result = [
         ]
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "pageViews" : 6,
         "tags" : [
             "nasty",
@@ -49,7 +46,7 @@ var p1result = [
     }
 ];
 
-assert(arrayEq(p1.result, p1result), 'p1 failed');
+assert.docEq(p1.result, p1result, 'p1 failed');
 
 
 // a simple array unwinding
@@ -60,7 +57,7 @@ var u1 = db.runCommand(
 
 var u1result = [
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a8fe"),
+        "_id" : 1,
         "title" : "this is my title",
         "author" : "bob",
         "posted" : ISODate("2004-03-21T18:59:54Z"),
@@ -81,7 +78,7 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a8fe"),
+        "_id" : 1,
         "title" : "this is my title",
         "author" : "bob",
         "posted" : ISODate("2004-03-21T18:59:54Z"),
@@ -102,7 +99,7 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a8fe"),
+        "_id" : 1,
         "title" : "this is my title",
         "author" : "bob",
         "posted" : ISODate("2004-03-21T18:59:54Z"),
@@ -123,10 +120,10 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a8ff"),
+        "_id" : 2,
         "title" : "this is your title",
         "author" : "dave",
-        "posted" : ISODate("2100-08-08T04:11:10Z"),
+        "posted" : ISODate("2030-08-08T04:11:10Z"),
         "pageViews" : 7,
         "tags" : "fun",
         "comments" : [
@@ -145,10 +142,10 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a8ff"),
+        "_id" : 2,
         "title" : "this is your title",
         "author" : "dave",
-        "posted" : ISODate("2100-08-08T04:11:10Z"),
+        "posted" : ISODate("2030-08-08T04:11:10Z"),
         "pageViews" : 7,
         "tags" : "nasty",
         "comments" : [
@@ -167,7 +164,7 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a900"),
+        "_id" : 3,
         "title" : "this is some other title",
         "author" : "jane",
         "posted" : ISODate("2000-12-31T05:17:14Z"),
@@ -188,7 +185,7 @@ var u1result = [
         }
     },
     {
-        "_id" : ObjectId("4e7bdfa4909a512bf221a900"),
+        "_id" : 3,
         "title" : "this is some other title",
         "author" : "jane",
         "posted" : ISODate("2000-12-31T05:17:14Z"),
@@ -210,11 +207,11 @@ var u1result = [
     }
 ];
 
-assert(arrayEq(u1.result, u1result), 'u1 failed');
+assert.docEq(u1.result, u1result, 'u1 failed');
 
 // unwind an array at the end of a dotted path
 db.ut.drop();
-db.ut.save({a:1, b:{e:7, f:[4, 3, 2, 1]}, c:12, d:17});
+db.ut.save({_id: 4, a:1, b:{e:7, f:[4, 3, 2, 1]}, c:12, d:17});
 var u2 = db.runCommand(
 { aggregate : "ut", pipeline : [
     { $unwind : "$b.f" }
@@ -222,7 +219,7 @@ var u2 = db.runCommand(
 
 var u2result = [
     {
-        "_id" : ObjectId("4e7be21a702bfc656111df9b"),
+        "_id" : 4,
         "a" : 1,
         "b" : {
             "e" : 7,
@@ -232,7 +229,7 @@ var u2result = [
         "d" : 17
     },
     {
-        "_id" : ObjectId("4e7be21a702bfc656111df9b"),
+        "_id" : 4,
         "a" : 1,
         "b" : {
             "e" : 7,
@@ -242,7 +239,7 @@ var u2result = [
         "d" : 17
     },
     {
-        "_id" : ObjectId("4e7be21a702bfc656111df9b"),
+        "_id" : 4,
         "a" : 1,
         "b" : {
             "e" : 7,
@@ -252,7 +249,7 @@ var u2result = [
         "d" : 17
     },
     {
-        "_id" : ObjectId("4e7be21a702bfc656111df9b"),
+        "_id" : 4,
         "a" : 1,
         "b" : {
             "e" : 7,
@@ -263,7 +260,7 @@ var u2result = [
     }
 ];
 
-assert(arrayEq(u2.result, u2result), 'u2 failed');
+assert.docEq(u2.result, u2result, 'u2 failed');
 
 
 // combining a projection with unwinding an array
@@ -279,50 +276,50 @@ var p2 = db.runCommand(
 
 var p2result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tags" : "fun"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tags" : "good"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tags" : "fun"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "pageViews" : 7,
         "tags" : "fun"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "pageViews" : 7,
         "tags" : "nasty"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "pageViews" : 6,
         "tags" : "nasty"
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "pageViews" : 6,
         "tags" : "filthy"
     }
 ];
 
-assert(arrayEq(p2.result, p2result), 'p2 failed');
+assert.docEq(p2.result, p2result, 'p2 failed');
 
 
 // pulling values out of subdocuments
@@ -336,20 +333,20 @@ var p3 = db.runCommand(
 
 var p3result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "otherfoo" : 5
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "otherbar" : 14
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "otherbar" : 14
     }
 ];
 
-assert(arrayEq(p3.result, p3result), 'p3 failed');
+assert.docEq(p3.result, p3result, 'p3 failed');
 
 
 // projection includes a computed value
@@ -363,23 +360,23 @@ var p4 = db.runCommand(
 
 var p4result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "daveWroteIt" : false
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "daveWroteIt" : true
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "daveWroteIt" : false
     }
 ];
 
-assert(arrayEq(p4.result, p4result), 'p4 failed');
+assert.docEq(p4.result, p4result, 'p4 failed');
 
 
 // projection includes a virtual (fabricated) document
@@ -399,7 +396,7 @@ var p5 = db.runCommand(
 
 var p5result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "subDocument" : {
             "foo" : 5,
@@ -407,7 +404,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "subDocument" : {
             "foo" : 5,
@@ -415,7 +412,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "subDocument" : {
             "foo" : 5,
@@ -423,7 +420,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "subDocument" : {
             "foo" : 7,
@@ -431,7 +428,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "subDocument" : {
             "foo" : 7,
@@ -439,7 +436,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "subDocument" : {
             "foo" : 6,
@@ -447,7 +444,7 @@ var p5result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "subDocument" : {
             "foo" : 6,
@@ -456,7 +453,7 @@ var p5result = [
     }
 ];
 
-assert(arrayEq(p5.result, p5result), 'p5 failed');
+assert.docEq(p5.result, p5result, 'p5 failed');
 
 
 // multi-step aggregate
@@ -481,7 +478,7 @@ var p6 = db.runCommand(
 
 var p6result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tag" : "fun",
@@ -489,7 +486,7 @@ var p6result = [
         "weLikeIt" : false
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tag" : "good",
@@ -497,7 +494,7 @@ var p6result = [
         "weLikeIt" : true
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "author" : "bob",
         "pageViews" : 5,
         "tag" : "fun",
@@ -505,7 +502,7 @@ var p6result = [
         "weLikeIt" : false
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "pageViews" : 7,
         "tag" : "fun",
@@ -513,7 +510,7 @@ var p6result = [
         "weLikeIt" : true
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "author" : "dave",
         "pageViews" : 7,
         "tag" : "nasty",
@@ -521,7 +518,7 @@ var p6result = [
         "weLikeIt" : true
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "pageViews" : 6,
         "tag" : "nasty",
@@ -529,7 +526,7 @@ var p6result = [
         "weLikeIt" : false
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "author" : "jane",
         "pageViews" : 6,
         "tag" : "filthy",
@@ -538,7 +535,7 @@ var p6result = [
     }
 ];
 
-assert(arrayEq(p6.result, p6result), 'p6 failed');
+assert.docEq(p6.result, p6result, 'p6 failed');
 
 
 // slightly more complex computed expression; $ifNull
@@ -553,20 +550,20 @@ var p7 = db.runCommand(
 
 var p7result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce6"),
+        "_id" : 1,
         "theSum" : 10
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "theSum" : 21
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce8"),
+        "_id" : 3,
         "theSum" : 20
     }
 ];
 
-assert(arrayEq(p7.result, p7result), 'p7 failed');
+assert.docEq(p7.result, p7result, 'p7 failed');
 
 
 // dotted path inclusion; _id exclusion
@@ -584,6 +581,7 @@ var p8 = db.runCommand(
 var p8result = [
     {
         "author" : "bob",
+        "tags" : "fun",
         "comments" : [
             {
                 "author" : "joe"
@@ -591,11 +589,11 @@ var p8result = [
             {
                 "author" : "sam"
             }
-        ],
-        "tags" : "fun"
+        ]
     },
     {
         "author" : "bob",
+        "tags" : "good",
         "comments" : [
             {
                 "author" : "joe"
@@ -603,11 +601,11 @@ var p8result = [
             {
                 "author" : "sam"
             }
-        ],
-        "tags" : "good"
+        ]
     },
     {
         "author" : "bob",
+        "tags" : "fun",
         "comments" : [
             {
                 "author" : "joe"
@@ -615,11 +613,11 @@ var p8result = [
             {
                 "author" : "sam"
             }
-        ],
-        "tags" : "fun"
+        ]
     },
     {
         "author" : "dave",
+        "tags" : "fun",
         "comments" : [
             {
                 "author" : "barbara"
@@ -627,11 +625,11 @@ var p8result = [
             {
                 "author" : "jenny"
             }
-        ],
-        "tags" : "fun"
+        ]
     },
     {
         "author" : "dave",
+        "tags" : "nasty",
         "comments" : [
             {
                 "author" : "barbara"
@@ -639,11 +637,11 @@ var p8result = [
             {
                 "author" : "jenny"
             }
-        ],
-        "tags" : "nasty"
+        ]
     },
     {
         "author" : "jane",
+        "tags" : "nasty",
         "comments" : [
             {
                 "author" : "will"
@@ -651,11 +649,11 @@ var p8result = [
             {
                 "author" : "jenny"
             }
-        ],
-        "tags" : "nasty"
+        ]
     },
     {
         "author" : "jane",
+        "tags" : "filthy",
         "comments" : [
             {
                 "author" : "will"
@@ -663,12 +661,11 @@ var p8result = [
             {
                 "author" : "jenny"
             }
-        ],
-        "tags" : "filthy"
+        ]
     }
 ];
 
-assert(arrayEq(p8.result, p8result), 'p8 failed');
+assert.docEq(p8.result, p8result, 'p8 failed');
 
 
 // collapse a dotted path with an intervening array
@@ -705,7 +702,7 @@ var p9result = [
     }
 ];
 
-assert(arrayEq(p9.result, p9result), 'p9 failed');
+assert.docEq(p9.result, p9result, 'p9 failed');
 
 
 // simple sort
@@ -717,10 +714,10 @@ var p10 = db.runCommand(
 
 var p10result = [
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066d"),
+        "_id" : 1,
         "title" : "this is my title",
         "author" : "bob",
-        "posted" : ISODate("2011-05-03T22:21:33.251Z"),
+        "posted" : ISODate("2004-03-21T18:59:54Z"),
         "pageViews" : 5,
         "tags" : [
             "fun",
@@ -742,10 +739,10 @@ var p10result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066f"),
+        "_id" : 3,
         "title" : "this is some other title",
         "author" : "jane",
-        "posted" : ISODate("2011-05-03T22:21:33.252Z"),
+        "posted" : ISODate("2000-12-31T05:17:14Z"),
         "pageViews" : 6,
         "tags" : [
             "nasty",
@@ -766,10 +763,10 @@ var p10result = [
         }
     },
     {
-        "_id" : ObjectId("4dc07fedd8420ab8d0d4066e"),
+        "_id" : 2,
         "title" : "this is your title",
         "author" : "dave",
-        "posted" : ISODate("2011-05-03T22:21:33.251Z"),
+        "posted" : ISODate("2030-08-08T04:11:10Z"),
         "pageViews" : 7,
         "tags" : [
             "fun",
@@ -792,12 +789,13 @@ var p10result = [
     }
 ];
 
-assert(orderedArrayEq(p10.result, p10result), 'p10 failed');
+assert.docEq(p10.result, p10result, 'p10 failed');
 
 
 // unwind on nested array
 db.p11.drop();
 db.p11.save( {
+    _id : 5,
     name : 'MongoDB',
     items : {
         authors : ['jay', 'vivek', 'bjornar'],
@@ -817,23 +815,23 @@ var p11 = db.runCommand(
 
 p11result = [
     {
-        "_id" : ObjectId("4ded2e7d4a0eb8caae28044d"),
+        "_id" : 5,
         "name" : "MongoDB",
         "author" : "jay"
     },
     {
-        "_id" : ObjectId("4ded2e7d4a0eb8caae28044d"),
+        "_id" : 5,
         "name" : "MongoDB",
         "author" : "vivek"
     },
     {
-        "_id" : ObjectId("4ded2e7d4a0eb8caae28044d"),
+        "_id" : 5,
         "name" : "MongoDB",
         "author" : "bjornar"
     }
 ];
 
-assert(arrayEq(p11.result, p11result), 'p11 failed');
+assert.docEq(p11.result, p11result, 'p11 failed');
 
 
 // multiply test
@@ -848,20 +846,20 @@ var p12 = db.runCommand(
 
 var p12result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce6"),
+        "_id" : 1,
         "theProduct" : 25
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "theProduct" : 98
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce8"),
+        "_id" : 3,
         "theProduct" : 84
     }
 ];
 
-assert(arrayEq(p12.result, p12result), 'p12 failed');
+assert.docEq(p12.result, p12result, 'p12 failed');
 
 
 // subtraction test
@@ -876,20 +874,20 @@ var p13 = db.runCommand(
 
 var p13result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce6"),
+        "_id" : 1,
         "theDifference" : 0
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "theDifference" : -7
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce8"),
+        "_id" : 3,
         "theDifference" : -8
     }
 ];
 
-assert(arrayEq(p13.result, p13result), 'p13 failed');
+assert.docEq(p13.result, p13result, 'p13 failed');
 
 
 // mod test
@@ -905,20 +903,20 @@ var p14 = db.runCommand(
 
 var p14result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce6"),
+        "_id" : 1,
         "theRemainder" : 0
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "theRemainder" : 0
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce8"),
+        "_id" : 3,
         "theRemainder" : 2
     }
 ];
 
-assert(arrayEq(p14.result, p14result), 'p14 failed');
+assert.docEq(p14.result, p14result, 'p14 failed');
 
 
 // toUpper test
@@ -932,23 +930,23 @@ var p15 = db.runCommand(
 
 var p15result = [
     {
-        "_id" : ObjectId("4e09d403278071aa11bd1560"),
-        "pageViews" : 5,
-        "author" : "BOB"
+        "_id" : 1,
+        "author" : "BOB",
+        "pageViews" : 5
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c4"),
-        "pageViews" : 7,
-        "author" : "DAVE"
+        "_id" : 2,
+        "author" : "DAVE",
+        "pageViews" : 7
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c5"),
-        "pageViews" : 6,
-        "author" : "JANE"
+        "_id" : 3,
+        "author" : "JANE",
+        "pageViews" : 6
     }
 ];
 
-assert(arrayEq(p15.result, p15result), 'p15 failed');
+assert.docEq(p15.result, p15result, 'p15 failed');
 
 
 // toLower test
@@ -966,23 +964,23 @@ var p16 = db.runCommand(
 
 var p16result = [
     {
-        "_id" : ObjectId("4e09d403278071aa11bd1560"),
+        "_id" : 1,
+        "author" : "bob",
         "pageViews" : 5,
-        "author" : "bob"
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c4"),
+        "_id" : 2,
+        "author" : "dave",
         "pageViews" : 7,
-        "author" : "dave"
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c5"),
+        "_id" : 3,
+        "author" : "jane",
         "pageViews" : 6,
-        "author" : "jane"
     }
 ];
 
-assert(arrayEq(p16.result, p16result), 'p16 failed');
+assert.docEq(p16.result, p16result, 'p16 failed');
 
 
 // substr test
@@ -995,20 +993,20 @@ var p17 = db.runCommand(
 
 var p17result = [
     {
-        "_id" : ObjectId("4e09d403278071aa11bd1560"),
+        "_id" : 1,
         "author" : "ob"
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c4"),
+        "_id" : 2,
         "author" : "av"
     },
     {
-        "_id" : ObjectId("4e09d656c705acb9967683c5"),
+        "_id" : 3,
         "author" : "an"
     }
 ];
 
-assert(arrayEq(p17.result, p17result), 'p17 failed');
+assert.docEq(p17.result, p17result, 'p17 failed');
 
 
 // strcasecmp test
@@ -1023,7 +1021,7 @@ var p18 = db.runCommand(
 
 var p18result = [
     {
-        "_id" : ObjectId("4e09ee2d75f2a257194c996e"),
+        "_id" : 1,
         "tags" : [
             "fun",
             "good",
@@ -1033,7 +1031,7 @@ var p18result = [
         "thisisalamepass" : 0
     },
     {
-        "_id" : ObjectId("4e09ee2d75f2a257194c996f"),
+        "_id" : 2,
         "tags" : [
             "fun",
             "nasty"
@@ -1042,7 +1040,7 @@ var p18result = [
         "thisisalamepass" : 0
     },
     {
-        "_id" : ObjectId("4e09ee2d75f2a257194c9970"),
+        "_id" : 3,
         "tags" : [
             "nasty",
             "filthy"
@@ -1052,7 +1050,7 @@ var p18result = [
     }
 ];
 
-assert(arrayEq(p18.result, p18result), 'p18 failed');
+assert.docEq(p18.result, p18result, 'p18 failed');
 
 
 // date tests
@@ -1069,43 +1067,12 @@ var p19 = db.runCommand({aggregate : "article", pipeline : [
         month: {$month: "$posted"},
         week: {$week: "$posted"},
         year: {$year: "$posted"}
-    }},
-    { $project : {
-        authors: 1,
-        posted: 1,
-        seconds: 1,
-        minutes: 1,
-        hour: 1,
-        dayOfYear: 1,
-        dayOfMonth: 1,
-        dayOfWeek: 1,
-        month: 1,
-        week: 1,
-        year: 1,
-        testDate: {$isoDate:{
-            year: "$year", month: "$month", dayOfMonth: "$dayOfMonth",
-            hour: "$hour", minute: "$minutes", second: "$seconds"}}
-    }},
-    { $project : {
-        authors: 1,
-        posted: 1,
-        seconds: 1,
-        minutes: 1,
-        hour: 1,
-        dayOfYear: 1,
-        dayOfMonth: 1,
-        dayOfWeek: 1,
-        month: 1,
-        week: 1,
-        year: 1,
-        testDate: 1,
-        isEqual: {$eq:["$posted", "$testDate"]}
     }}
 ]});
 
 var p19result = [
     {
-        "_id" : ObjectId("4f44151eda0a3d90cf03ccb5"),
+        "_id" : 1,
         "posted" : ISODate("2004-03-21T18:59:54Z"),
         "seconds" : 54,
         "minutes" : 59,
@@ -1116,11 +1083,9 @@ var p19result = [
         "month" : 3,
         "week" : 12,
         "year" : 2004,
-        "testDate" : ISODate("2004-03-21T18:59:54Z"),
-        "isEqual" : true
     },
     {
-        "_id" : ObjectId("4f44151eda0a3d90cf03ccb6"),
+        "_id" : 2,
         "posted" : ISODate("2030-08-08T04:11:10Z"),
         "seconds" : 10,
         "minutes" : 11,
@@ -1131,11 +1096,9 @@ var p19result = [
         "month" : 8,
         "week" : 31,
         "year" : 2030,
-        "testDate" : ISODate("2030-08-08T04:11:10Z"),
-        "isEqual" : true
     },
     {
-        "_id" : ObjectId("4f44151eda0a3d90cf03ccb7"),
+        "_id" : 3,
         "posted" : ISODate("2000-12-31T05:17:14Z"),
         "seconds" : 14,
         "minutes" : 17,
@@ -1146,47 +1109,14 @@ var p19result = [
         "month" : 12,
         "week" : 53,
         "year" : 2000,
-        "testDate" : ISODate("2000-12-31T05:17:14Z"),
-        "isEqual" : true
     }
 ];
 
-assert(arrayEq(p19.result, p19result), 'p19 failed');
+assert.docEq(p19.result, p19result, 'p19 failed');
 
 
 db.vartype.drop();
 db.vartype.save({ x : 17, y : "foo"});
-
-// just passing through fields
-var p20 = db.runCommand(
-{ aggregate : "vartype", pipeline : [
-    { $project : {
-        all_numbers : { $add:[1, "$x", 2, "$x"] },
-        string_fields : { $add:[3, "$y", 4, "$y"] },
-        number_fields : { $add:["a", "$x", "b", "$x"] },
-        all_strings : { $add:["c", "$y", "d", "$y"] },
-        potpourri_1 : { $add:[5, "$y", "e", "$x"] },
-        potpourri_2 : { $add:[6, "$x", "f", "$y"] },
-        potpourri_3 : { $add:["g", "$y", 7, "$x"] },
-        potpourri_4 : { $add:["h", "$x", 8, "$y"] },
-        _id: 0
-    }}
-]});
-
-var p20result = [
-    {
-        "all_numbers" : 37,
-        "string_fields" : "3foo4foo",
-        "number_fields" : "a17b17",
-        "all_strings" : "cfoodfoo",
-        "potpourri_1" : "5fooe17",
-        "potpourri_2" : "617ffoo",
-        "potpourri_3" : "gfoo717",
-        "potpourri_4" : "h178foo"
-    }
-];
-
-assert(arrayEq(p20.result, p20result), 'p20 failed');
 
 // ternary conditional operator
 var p21 = db.runCommand(
@@ -1215,7 +1145,7 @@ var p21result = [
     }
 ];
 
-assert(arrayEq(p21.result, p21result), 'p21 failed');
+assert.docEq(p21.result, p21result, 'p21 failed');
 
 
 // simple matching
@@ -1226,10 +1156,10 @@ var m1 = db.runCommand(
 
 var m1result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "title" : "this is your title",
         "author" : "dave",
-        "posted" : ISODate("2011-05-31T20:02:32.256Z"),
+        "posted" : ISODate("2030-08-08T04:11:10Z"),
         "pageViews" : 7,
         "tags" : [
             "fun",
@@ -1252,7 +1182,7 @@ var m1result = [
     }
 ];
 
-assert(arrayEq(m1.result, m1result), 'm1 failed');
+assert.docEq(m1.result, m1result, 'm1 failed');
 
 
 // combining matching with a projection
@@ -1271,10 +1201,11 @@ var m2 = db.runCommand(
 
 var m2result = [
     {
-        "_id" : ObjectId("4de54958bf1505139918fce7"),
+        "_id" : 2,
         "title" : "this is your title",
         "author" : "dave",
         "pageViews" : 7,
+        "tags" : "nasty",
         "comments" : [
             {
                 "author" : "barbara",
@@ -1285,14 +1216,14 @@ var m2result = [
                 "text" : "i like to play pinball",
                 "votes" : 10
             }
-        ],
-        "tags" : "nasty"
+        ]
     },
     {
-        "_id" : ObjectId("4de54958bf1505139918fce8"),
+        "_id" : 3,
         "title" : "this is some other title",
         "author" : "jane",
         "pageViews" : 6,
+        "tags" : "nasty",
         "comments" : [
             {
                 "author" : "will",
@@ -1302,12 +1233,11 @@ var m2result = [
                 "author" : "jenny",
                 "text" : "can i get that in green?"
             }
-        ],
-        "tags" : "nasty"
+        ]
     }
 ];
 
-assert(arrayEq(m2.result, m2result), 'm2 failed');
+assert.docEq(m2.result, m2result, 'm2 failed');
 
 
 // group by tag, _id is a field reference
@@ -1323,7 +1253,8 @@ var g1 = db.runCommand(
         _id : "$tags",
         docsByTag : { $sum : 1 },
         viewsByTag : { $sum : "$pageViews" }
-    }}
+    }},
+    {$sort: {'_id': 1}}
 ]});
 
 var g1result = [
@@ -1346,10 +1277,10 @@ var g1result = [
         "_id" : "nasty",
         "docsByTag" : 2,
         "viewsByTag" : 13
-    }
+    },
 ];
 
-assert(arrayEq(g1.result, g1result), 'g1 failed');
+assert.docEq(g1.result, g1result, 'g1 failed');
 
 
 // $max, and averaging in a final projection; _id is structured
@@ -1362,7 +1293,7 @@ var g2 = db.runCommand(
     }},
     { $unwind : "$tags" },
     { $group : {
-        _id: { tags : 1 },
+        _id: { tags : "$tags" },
         docsByTag : { $sum : 1 },
         viewsByTag : { $sum : "$pageViews" },
         mostViewsByTag : { $max : "$pageViews" },
@@ -1374,24 +1305,11 @@ var g2 = db.runCommand(
         docsByTag : 1,
         viewsByTag : 1,
         avgByTag : { $divide:["$viewsByTag", "$docsByTag"] }
-    }}
+    }},
+    {$sort: {'docsByTag': 1, 'viewsByTag': 1}}
 ]});
 
 var g2result = [
-    {
-        "docsByTag" : 1,
-        "viewsByTag" : 6,
-        "mostViewsByTag" : 6,
-        "tag" : "filthy",
-        "avgByTag" : 6
-    },
-    {
-        "docsByTag" : 3,
-        "viewsByTag" : 17,
-        "mostViewsByTag" : 7,
-        "tag" : "fun",
-        "avgByTag" : 5.666666666666667
-    },
     {
         "docsByTag" : 1,
         "viewsByTag" : 5,
@@ -1400,15 +1318,29 @@ var g2result = [
         "avgByTag" : 5
     },
     {
+        "docsByTag" : 1,
+        "viewsByTag" : 6,
+        "mostViewsByTag" : 6,
+        "tag" : "filthy",
+        "avgByTag" : 6
+    },
+    {
         "docsByTag" : 2,
         "viewsByTag" : 13,
         "mostViewsByTag" : 7,
         "tag" : "nasty",
         "avgByTag" : 6.5
+    },
+    {
+        "docsByTag" : 3,
+        "viewsByTag" : 17,
+        "mostViewsByTag" : 7,
+        "tag" : "fun",
+        "avgByTag" : 5.666666666666667
     }
 ];
 
-assert(arrayEq(g2.result, g2result), 'g2 failed');
+assert.docEq(g2.result, g2result, 'g2 failed');
 
 
 // $push as an accumulator; can pivot data
@@ -1420,9 +1352,10 @@ var g3 = db.runCommand(
     }},
     { $unwind : "$tags" },
     { $group : {
-        _id : { tags : 1 },
+        _id : { tags : "$tags" },
         authors : { $push : "$author" }
-    }}
+    }},
+    {$sort: {'_id': 1}}
 ]});
 
 var g3result = [
@@ -1463,7 +1396,7 @@ var g3result = [
     }
 ];
 
-assert(arrayEq(g3.result, g3result), 'g3 failed');
+assert.docEq(g3.result, g3result, 'g3 failed');
 
 
 // $avg, and averaging in a final projection
@@ -1476,11 +1409,12 @@ var g4 = db.runCommand(
     }},
     { $unwind : "$tags" },
     { $group : {
-        _id: { tags : 1 },
+        _id: { tags : "$tags" },
         docsByTag : { $sum : 1 },
         viewsByTag : { $sum : "$pageViews" },
         avgByTag : { $avg : "$pageViews" },
-    }}
+    }},
+    {$sort: {'_id': 1}}
 ]});
 
 var g4result = [
@@ -1518,7 +1452,7 @@ var g4result = [
     }
 ];
 
-assert(arrayEq(g4.result, g4result), 'g4 failed');
+assert.docEq(g4.result, g4result, 'g4 failed');
 
 
 // $addToSet as an accumulator; can pivot data
@@ -1530,10 +1464,16 @@ var g5 = db.runCommand(
     }},
     { $unwind : "$tags" },
     { $group : {
-        _id : { tags : 1 },
+        _id : { tags : "$tags" },
         authors : { $addToSet : "$author" }
-    }}
+    }},
+    {$sort: {'_id': 1}}
 ]});
+
+// $addToSet doesn't guarantee order so we shouldn't test for it.
+g5.result.forEach(function(obj) {
+    obj.authors.sort();
+});
 
 var g5result = [
     {
@@ -1550,7 +1490,7 @@ var g5result = [
         },
         "authors" : [
             "bob",
-            "dave"
+            "dave",
         ]
     },
     {
@@ -1567,12 +1507,12 @@ var g5result = [
         },
         "authors" : [
             "dave",
-            "jane"
+            "jane",
         ]
     }
 ];
 
-assert(arrayEq(g5.result, g5result), 'g5 failed');
+assert.docEq(g5.result, g5result, 'g5 failed');
 
 
 // $first and $last accumulators, constant _id
@@ -1596,4 +1536,13 @@ var g6result = [
     }
 ];
 
-assert(arrayEq(g6.result, g6result), 'g6 failed');
+// Test unwind on an unused field
+var g7 = db.runCommand(
+{ aggregate : "article", pipeline : [
+    { $unwind : '$tags' },
+    { $group : {
+        _id : "tag_count", /* constant string, *not* a field reference */
+        count : { $sum : 1 }
+    }}
+]});
+assert.eq(g7.result[0].count, 7);

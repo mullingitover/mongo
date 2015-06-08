@@ -1,223 +1,218 @@
-// group.cpp
-
 /**
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ *    Copyright (C) 2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#include "pch.h"
-#include "../commands.h"
-#include "../instance.h"
-#include "../../scripting/engine.h"
-#include "../clientcursor.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/commands/group.h"
+
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/exec/group.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/get_executor.h"
 
 namespace mongo {
 
-    class GroupCommand : public Command {
-    public:
-        GroupCommand() : Command("group") {}
-        virtual LockType locktype() const { return READ; }
-        virtual bool slaveOk() const { return false; }
-        virtual bool slaveOverrideOk() const { return true; }
-        virtual void help( stringstream &help ) const {
-            help << "http://www.mongodb.org/display/DOCS/Aggregation";
+    using boost::scoped_ptr;
+    using std::string;
+
+    static GroupCommand cmdGroup;
+
+    GroupCommand::GroupCommand() : Command("group") {}
+
+    Status GroupCommand::checkAuthForCommand(ClientBasic* client,
+                                             const std::string& dbname,
+                                             const BSONObj& cmdObj) {
+        std::string ns = parseNs(dbname, cmdObj);
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
+                NamespaceString(ns), ActionType::find)) {
+            return Status(ErrorCodes::Unauthorized, "unauthorized");
+        }
+        return Status::OK();
+    }
+
+    std::string GroupCommand::parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
+        const BSONObj& p = cmdObj.firstElement().embeddedObjectUserCheck();
+        uassert(17211, "ns has to be set", p["ns"].type() == String);
+        return dbname + "." + p["ns"].String();
+    }
+
+    Status GroupCommand::parseRequest(const string& dbname,
+                                      const BSONObj& cmdObj,
+                                      GroupRequest* request) const {
+        request->ns = parseNs(dbname, cmdObj);
+
+        // By default, group requests are regular group not explain of group.
+        request->explain = false;
+
+        const BSONObj& p = cmdObj.firstElement().embeddedObjectUserCheck();
+
+        if (p["cond"].type() == Object) {
+            request->query = p["cond"].embeddedObject().getOwned();
+        }
+        else if (p["condition"].type() == Object) {
+            request->query = p["condition"].embeddedObject().getOwned();
+        }
+        else if (p["query"].type() == Object) {
+            request->query = p["query"].embeddedObject().getOwned();
+        }
+        else if (p["q"].type() == Object) {
+            request->query = p["q"].embeddedObject().getOwned();
         }
 
-        BSONObj getKey( const BSONObj& obj , const BSONObj& keyPattern , ScriptingFunction func , double avgSize , Scope * s ) {
-            if ( func ) {
-                BSONObjBuilder b( obj.objsize() + 32 );
-                b.append( "0" , obj );
-                const BSONObj& key = b.obj();
-                int res = s->invoke( func , &key, 0 );
-                uassert( 10041 ,  (string)"invoke failed in $keyf: " + s->getError() , res == 0 );
-                int type = s->type("return");
-                uassert( 10042 ,  "return of $key has to be an object" , type == Object );
-                return s->getObject( "return" );
+        if (p["key"].type() == Object) {
+            request->keyPattern = p["key"].embeddedObjectUserCheck().getOwned();
+            if (!p["$keyf"].eoo()) {
+                return Status(ErrorCodes::BadValue, "can't have key and $keyf");
             }
-            return obj.extractFields( keyPattern , true ).getOwned();
+        }
+        else if (!p["$keyf"].eoo()) {
+            request->keyFunctionCode = p["$keyf"]._asCode();
+        }
+        else {
+            // No key specified.  Use the entire object as the key.
         }
 
-        bool group( string realdbname , const string& ns , const BSONObj& query ,
-                    BSONObj keyPattern , string keyFunctionCode , string reduceCode , const char * reduceScope ,
-                    BSONObj initial , string finalize ,
-                    string& errmsg , BSONObjBuilder& result ) {
+        BSONElement reduce = p["$reduce"];
+        if (reduce.eoo()) {
+            return Status(ErrorCodes::BadValue, "$reduce has to be set");
+        }
+        request->reduceCode = reduce._asCode();
 
-
-            auto_ptr<Scope> s = globalScriptEngine->getPooledScope( realdbname );
-            s->localConnect( realdbname.c_str() );
-
-            if ( reduceScope )
-                s->init( reduceScope );
-
-            s->setObject( "$initial" , initial , true );
-
-            s->exec( "$reduce = " + reduceCode , "reduce setup" , false , true , true , 100 );
-            s->exec( "$arr = [];" , "reduce setup 2" , false , true , true , 100 );
-            ScriptingFunction f = s->createFunction(
-                                      "function(){ "
-                                      "  if ( $arr[n] == null ){ "
-                                      "    next = {}; "
-                                      "    Object.extend( next , $key ); "
-                                      "    Object.extend( next , $initial , true ); "
-                                      "    $arr[n] = next; "
-                                      "    next = null; "
-                                      "  } "
-                                      "  $reduce( obj , $arr[n] ); "
-                                      "}" );
-
-            ScriptingFunction keyFunction = 0;
-            if ( keyFunctionCode.size() ) {
-                keyFunction = s->createFunction( keyFunctionCode.c_str() );
-            }
-
-
-            double keysize = keyPattern.objsize() * 3;
-            double keynum = 1;
-
-            map<BSONObj,int,BSONObjCmp> map;
-            list<BSONObj> blah;
-
-            shared_ptr<Cursor> cursor = NamespaceDetailsTransient::getCursor(ns.c_str() , query);
-            ClientCursor::CleanupPointer ccPointer;
-            ccPointer.reset( new ClientCursor( QueryOption_NoCursorTimeout, cursor, ns ) );
-
-            while ( cursor->ok() ) {
-                
-                if ( !ccPointer->yieldSometimes( ClientCursor::MaybeCovered ) ||
-                    !cursor->ok() ) {
-                    break;
-                }
-                
-                if ( !cursor->currentMatches() || cursor->getsetdup( cursor->currLoc() ) ) {
-                    cursor->advance();
-                    continue;
-                }
-
-                if ( !ccPointer->yieldSometimes( ClientCursor::WillNeed ) ||
-                    !cursor->ok() ) {
-                    break;
-                }
-                
-                BSONObj obj = cursor->current();
-                cursor->advance();
-
-                BSONObj key = getKey( obj , keyPattern , keyFunction , keysize / keynum , s.get() );
-                keysize += key.objsize();
-                keynum++;
-
-                int& n = map[key];
-                if ( n == 0 ) {
-                    n = map.size();
-                    s->setObject( "$key" , key , true );
-
-                    uassert( 10043 ,  "group() can't handle more than 20000 unique keys" , n <= 20000 );
-                }
-
-                s->setObject( "obj" , obj , true );
-                s->setNumber( "n" , n - 1 );
-                if ( s->invoke( f , 0, 0 , 0 , true ) ) {
-                    throw UserException( 9010 , (string)"reduce invoke failed: " + s->getError() );
-                }
-            }
-            ccPointer.reset();
-
-            if (!finalize.empty()) {
-                s->exec( "$finalize = " + finalize , "finalize define" , false , true , true , 100 );
-                ScriptingFunction g = s->createFunction(
-                                          "function(){ "
-                                          "  for(var i=0; i < $arr.length; i++){ "
-                                          "  var ret = $finalize($arr[i]); "
-                                          "  if (ret !== undefined) "
-                                          "    $arr[i] = ret; "
-                                          "  } "
-                                          "}" );
-                s->invoke( g , 0, 0 , 0 , true );
-            }
-
-            result.appendArray( "retval" , s->getObject( "$arr" ) );
-            result.append( "count" , keynum - 1 );
-            result.append( "keys" , (int)(map.size()) );
-            s->exec( "$arr = [];" , "reduce setup 2" , false , true , true , 100 );
-            s->gc();
-
-            return true;
+        if (reduce.type() == CodeWScope) {
+            request->reduceScope = reduce.codeWScopeObject().getOwned();
         }
 
-        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        if (p["initial"].type() != Object) {
+            return Status(ErrorCodes::BadValue, "initial has to be an object");
+        }
+        request->initial = p["initial"].embeddedObject().getOwned();
 
-            if ( !globalScriptEngine ) {
-                errmsg = "server-side JavaScript execution is disabled";
-                return false;
-            }
-            
-            /* db.$cmd.findOne( { group : <p> } ) */
-            const BSONObj& p = jsobj.firstElement().embeddedObjectUserCheck();
-
-            BSONObj q;
-            if ( p["cond"].type() == Object )
-                q = p["cond"].embeddedObject();
-            else if ( p["condition"].type() == Object )
-                q = p["condition"].embeddedObject();
-            else
-                q = getQuery( p );
-
-            if ( p["ns"].type() != String ) {
-                errmsg = "ns has to be set";
-                return false;
-            }
-
-            string ns = dbname + "." + p["ns"].String();
-
-            BSONObj key;
-            string keyf;
-            if ( p["key"].type() == Object ) {
-                key = p["key"].embeddedObjectUserCheck();
-                if ( ! p["$keyf"].eoo() ) {
-                    errmsg = "can't have key and $keyf";
-                    return false;
-                }
-            }
-            else if ( p["$keyf"].type() ) {
-                keyf = p["$keyf"]._asCode();
-            }
-            else {
-                // no key specified, will use entire object as key
-            }
-
-            BSONElement reduce = p["$reduce"];
-            if ( reduce.eoo() ) {
-                errmsg = "$reduce has to be set";
-                return false;
-            }
-
-            BSONElement initial = p["initial"];
-            if ( initial.type() != Object ) {
-                errmsg = "initial has to be an object";
-                return false;
-            }
-
-
-            string finalize;
-            if (p["finalize"].type())
-                finalize = p["finalize"]._asCode();
-
-            return group( dbname , ns , q ,
-                          key , keyf , reduce._asCode() , reduce.type() != CodeWScope ? 0 : reduce.codeWScopeScopeData() ,
-                          initial.embeddedObject() , finalize ,
-                          errmsg , result );
+        if (!p["finalize"].eoo()) {
+            request->finalize = p["finalize"]._asCode();
         }
 
-    } cmdGroup;
+        return Status::OK();
+    }
 
+    bool GroupCommand::run(OperationContext* txn,
+                           const std::string& dbname,
+                           BSONObj& cmdObj,
+                           int,
+                           std::string& errmsg,
+                           BSONObjBuilder& out) {
+        GroupRequest groupRequest;
+        Status parseRequestStatus = parseRequest(dbname, cmdObj, &groupRequest);
+        if (!parseRequestStatus.isOK()) {
+            return appendCommandStatus(out, parseRequestStatus);
+        }
 
-} // namespace mongo
+        AutoGetCollectionForRead ctx(txn, groupRequest.ns);
+        Collection* coll = ctx.getCollection();
+
+        PlanExecutor *rawPlanExecutor;
+        Status getExecStatus = getExecutorGroup(txn,
+                                                coll,
+                                                groupRequest,
+                                                PlanExecutor::YIELD_AUTO,
+                                                &rawPlanExecutor);
+        if (!getExecStatus.isOK()) {
+            return appendCommandStatus(out, getExecStatus);
+        }
+
+        scoped_ptr<PlanExecutor> planExecutor(rawPlanExecutor);
+
+        // Group executors return ADVANCED exactly once, with the entire group result.
+        BSONObj retval;
+        PlanExecutor::ExecState state = planExecutor->getNext(&retval, NULL);
+        if (PlanExecutor::ADVANCED != state) {
+            if (PlanExecutor::FAILURE == state &&
+                WorkingSetCommon::isValidStatusMemberObject(retval)) {
+                return appendCommandStatus(out, WorkingSetCommon::getMemberObjectStatus(retval));
+            }
+            return appendCommandStatus(out,
+                                       Status(ErrorCodes::BadValue,
+                                              str::stream() << "error encountered during group "
+                                                            << "operation, executor returned "
+                                                            << PlanExecutor::statestr(state)));
+        }
+        invariant(planExecutor->isEOF());
+
+        invariant(STAGE_GROUP == planExecutor->getRootStage()->stageType());
+        GroupStage* groupStage = static_cast<GroupStage*>(planExecutor->getRootStage());
+        const GroupStats* groupStats =
+            static_cast<const GroupStats*>(groupStage->getSpecificStats());
+        const CommonStats* groupChildStats = groupStage->getChildren()[0]->getCommonStats();
+
+        out.appendArray("retval", retval);
+        out.append("count", static_cast<long long>(groupChildStats->advanced));
+        out.append("keys", static_cast<long long>(groupStats->nGroups));
+
+        return true;
+    }
+
+    Status GroupCommand::explain(OperationContext* txn,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj,
+                                 ExplainCommon::Verbosity verbosity,
+                                 BSONObjBuilder* out) const {
+        GroupRequest groupRequest;
+        Status parseRequestStatus = parseRequest(dbname, cmdObj, &groupRequest);
+        if (!parseRequestStatus.isOK()) {
+            return parseRequestStatus;
+        }
+
+        groupRequest.explain = true;
+
+        AutoGetCollectionForRead ctx(txn, groupRequest.ns);
+        Collection* coll = ctx.getCollection();
+
+        PlanExecutor *rawPlanExecutor;
+        Status getExecStatus = getExecutorGroup(txn,
+                                                coll,
+                                                groupRequest,
+                                                PlanExecutor::YIELD_AUTO,
+                                                &rawPlanExecutor);
+        if (!getExecStatus.isOK()) {
+            return getExecStatus;
+        }
+
+        scoped_ptr<PlanExecutor> planExecutor(rawPlanExecutor);
+
+        Explain::explainStages(planExecutor.get(), verbosity, out);
+        return Status::OK();
+    }
+
+}  // namespace mongo

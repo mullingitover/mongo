@@ -15,17 +15,41 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "../db/jsobj.h"
-#include "../db/json.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "dbtests.h"
+#include "mongo/platform/basic.h"
 
 #include <limits>
 
+#include "mongo/db/jsobj.h"
+#include "mongo/db/json.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/util/log.h"
+
+
 namespace JsonTests {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     namespace JsonStringTests {
 
         class Empty {
@@ -136,6 +160,64 @@ namespace JsonTests {
             }
         };
 
+        class NumberLongStrict {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", 20000LL);
+                ASSERT_EQUALS("{ \"a\" : { \"$numberLong\" : \"20000\" } }",
+                              b.done().jsonString(Strict));
+            }
+        };
+
+        // Test a NumberLong that is too big to fit into a 32 bit integer
+        class NumberLongStrictLarge {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", 9223372036854775807LL);
+                ASSERT_EQUALS("{ \"a\" : { \"$numberLong\" : \"9223372036854775807\" } }",
+                              b.done().jsonString(Strict));
+            }
+        };
+
+        class NumberLongStrictNegative {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", -20000LL);
+                ASSERT_EQUALS("{ \"a\" : { \"$numberLong\" : \"-20000\" } }",
+                              b.done().jsonString(Strict));
+            }
+        };
+
+        class NumberDoubleNaN {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", std::numeric_limits<double>::quiet_NaN());
+                ASSERT_EQUALS("{ \"a\" : NaN }", b.done().jsonString(Strict));
+            }
+        };
+
+        class NumberDoubleInfinity {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", std::numeric_limits<double>::infinity());
+                ASSERT_EQUALS("{ \"a\" : Infinity }", b.done().jsonString(Strict));
+            }
+        };
+
+        class NumberDoubleNegativeInfinity {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.append("a", -std::numeric_limits<double>::infinity());
+                ASSERT_EQUALS("{ \"a\" : -Infinity }", b.done().jsonString(Strict));
+            }
+        };
+
         class SingleBoolMember {
         public:
             void run() {
@@ -155,6 +237,17 @@ namespace JsonTests {
                 BSONObjBuilder b;
                 b.appendNull( "a" );
                 ASSERT_EQUALS( "{ \"a\" : null }", b.done().jsonString( Strict ) );
+            }
+        };
+
+        class SingleUndefinedMember {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.appendUndefined( "a" );
+                ASSERT_EQUALS( "{ \"a\" : { \"$undefined\" : true } }", b.done().jsonString( Strict ) );
+                ASSERT_EQUALS( "{ \"a\" : undefined }", b.done().jsonString( JS ) );
+                ASSERT_EQUALS( "{ \"a\" : undefined }", b.done().jsonString( TenGen ) );
             }
         };
 
@@ -202,8 +295,9 @@ namespace JsonTests {
         class DBRef {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0xff, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0xff, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendDBRef( "a", "namespace", oid );
                 BSONObj built = b.done();
@@ -219,8 +313,9 @@ namespace JsonTests {
         class DBRefZero {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendDBRef( "a", "namespace", oid );
                 ASSERT_EQUALS( "{ \"a\" : { \"$ref\" : \"namespace\", \"$id\" : \"000000000000000000000000\" } }",
@@ -231,8 +326,9 @@ namespace JsonTests {
         class ObjectId {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0xff, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0xff, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendOID( "a", &oid );
                 BSONObj built = b.done();
@@ -279,15 +375,88 @@ namespace JsonTests {
             }
         };
 
+#ifdef _WIN32
+            char tzEnvString[] = "TZ=EST+5EDT";
+#else
+            char tzEnvString[] = "TZ=America/New_York";
+#endif
+
         class Date {
+        public:
+            Date() {
+                char *_oldTimezonePtr = getenv("TZ");
+                _oldTimezone = std::string(_oldTimezonePtr ? _oldTimezonePtr : "");
+                if (-1 == putenv(tzEnvString)) {
+                    FAIL(errnoWithDescription());
+                }
+                tzset();
+            }
+            ~Date() {
+                if (!_oldTimezone.empty()) {
+#ifdef _WIN32
+                    errno_t ret = _putenv_s("TZ", _oldTimezone.c_str());
+                    if (0 != ret) {
+                        StringBuilder sb;
+                        sb << "Error setting TZ environment variable to:  " << _oldTimezone
+                           << ".  Error code:  " << ret;
+                        FAIL(sb.str());
+                    }
+#else
+                    if (-1 == setenv("TZ", _oldTimezone.c_str(), 1)) {
+                        FAIL(errnoWithDescription());
+                    }
+#endif
+                }
+                else {
+#ifdef _WIN32
+                    errno_t ret = _putenv_s("TZ", "");
+                    if (0 != ret) {
+                        StringBuilder sb;
+                        sb << "Error unsetting TZ environment variable.  Error code:  " << ret;
+                        FAIL(sb.str());
+                    }
+#else
+                    if (-1 == unsetenv("TZ")) {
+                        FAIL(errnoWithDescription());
+                    }
+#endif
+                }
+                tzset();
+            }
+
+            void run() {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t() );
+                BSONObj built = b.done();
+                ASSERT_EQUALS( "{ \"a\" : { \"$date\" : \"1969-12-31T19:00:00.000-0500\" } }",
+                               built.jsonString( Strict ) );
+                ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( TenGen ) );
+                ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( JS ) );
+
+                // Test dates above our maximum formattable date.  See SERVER-13760.
+                BSONObjBuilder b2;
+                b2.appendDate("a", Date_t::fromMillisSinceEpoch(32535262800000LL));
+                BSONObj built2 = b2.done();
+                ASSERT_EQUALS(
+                            "{ \"a\" : { \"$date\" : { \"$numberLong\" : \"32535262800000\" } } }",
+                            built2.jsonString( Strict ) );
+            }
+
+        private:
+            std::string _oldTimezone;
+
+        };
+
+        class DateNegative {
         public:
             void run() {
                 BSONObjBuilder b;
-                b.appendDate( "a", 0 );
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
                 BSONObj built = b.done();
-                ASSERT_EQUALS( "{ \"a\" : { \"$date\" : 0 } }", built.jsonString( Strict ) );
-                ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( TenGen ) );
-                ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( JS ) );
+                ASSERT_EQUALS( "{ \"a\" : { \"$date\" : { \"$numberLong\" : \"-1\" } } }",
+                               built.jsonString( Strict ) );
+                ASSERT_EQUALS( "{ \"a\" : Date( -1 ) }", built.jsonString( TenGen ) );
+                ASSERT_EQUALS( "{ \"a\" : Date( -1 ) }", built.jsonString( JS ) );
             }
         };
 
@@ -334,9 +503,25 @@ namespace JsonTests {
         public:
             void run() {
                 BSONObjBuilder b;
-                b.appendCode( "x" , "function(){ return 1; }" );
+                b.appendCode( "x" , "function(arg){ var string = \"\\n\"; return 1; }" );
                 BSONObj o = b.obj();
-                ASSERT_EQUALS( "{ \"x\" : function(){ return 1; } }" , o.jsonString() );
+                ASSERT_EQUALS( "{ \"x\" : \"function(arg){ var string = \\\"\\\\n\\\"; "
+                                                          "return 1; }\" }" , o.jsonString() );
+            }
+        };
+
+        class CodeWScopeTests {
+        public:
+            void run() {
+                BSONObjBuilder b;
+                b.appendCodeWScope( "x" , "function(arg){ var string = \"\\n\"; return x; }" ,
+                                           BSON("x" << 1 ) );
+                BSONObj o = b.obj();
+                ASSERT_EQUALS( "{ \"x\" : "
+                                 "{ \"$code\" : "
+                                   "\"function(arg){ var string = \\\"\\\\n\\\"; return x; }\" , "
+                                   "\"$scope\" : { \"x\" : 1 } } }" ,
+                               o.jsonString() );
             }
         };
 
@@ -344,9 +529,13 @@ namespace JsonTests {
         public:
             void run() {
                 BSONObjBuilder b;
-                b.appendTimestamp( "x" , 4000 , 10 );
+                b.append( "x" , Timestamp(4, 10) );
                 BSONObj o = b.obj();
-                ASSERT_EQUALS( "{ \"x\" : { \"t\" : 4000 , \"i\" : 10 } }" , o.jsonString() );
+                ASSERT_EQUALS( "{ \"x\" : { \"$timestamp\" : { \"t\" : 4, \"i\" : 10 } } }",
+                        o.jsonString( Strict ) );
+                ASSERT_EQUALS( "{ \"x\" : { \"$timestamp\" : { \"t\" : 4, \"i\" : 10 } } }",
+                        o.jsonString( JS ) );
+                ASSERT_EQUALS( "{ \"x\" : Timestamp( 4, 10 ) }", o.jsonString( TenGen ) );
             }
         };
 
@@ -376,7 +565,7 @@ namespace JsonTests {
                 b.appendUndefined( "h" );
                 b.append( "i" , oid );
                 b.appendBool( "j" , 1 );
-                b.appendDate( "k" , 123 );
+                b.appendDate( "k" , Date_t::fromMillisSinceEpoch(123) );
                 b.appendNull( "l" );
                 b.appendRegex( "m" , "a" );
                 b.appendDBRef( "n" , "foo" , oid );
@@ -403,23 +592,31 @@ namespace JsonTests {
             virtual ~Base() {}
             void run() {
                 ASSERT( fromjson( json() ).valid() );
-                assertEquals( bson(), fromjson( json() ) );
-                assertEquals( bson(), fromjson( bson().jsonString( Strict ) ) );
-                assertEquals( bson(), fromjson( bson().jsonString( TenGen ) ) );
-                assertEquals( bson(), fromjson( bson().jsonString( JS ) ) );
+                assertEquals( bson(), fromjson( json() ), "mode: json-to-bson" );
+                assertEquals( bson(), fromjson( tojson( bson() ) ), "mode: <default>" );
+                assertEquals( bson(), fromjson( tojson( bson(), Strict ) ), "mode: strict" );
+                assertEquals( bson(), fromjson( tojson( bson(), TenGen ) ), "mode: tengen" );
+                assertEquals( bson(), fromjson( tojson( bson(), JS ) ), "mode: js" );
             }
         protected:
             virtual BSONObj bson() const = 0;
             virtual string json() const = 0;
         private:
-            static void assertEquals( const BSONObj &expected, const BSONObj &actual ) {
-                if ( expected.woCompare( actual ) ) {
-                    out() << "want:" << expected.jsonString() << " size: " << expected.objsize() << endl;
-                    out() << "got :" << actual.jsonString() << " size: " << actual.objsize() << endl;
-                    out() << expected.hexDump() << endl;
-                    out() << actual.hexDump() << endl;
+            void assertEquals( const BSONObj &expected,
+                               const BSONObj &actual,
+                               const char* msg) {
+                const bool bad = expected.woCompare( actual );
+                if ( bad ) {
+                    ::mongo::log() << "want:" << expected.jsonString()
+                                   << " size: " << expected.objsize() << endl;
+                    ::mongo::log() << "got :" << actual.jsonString()
+                                   << " size: " << actual.objsize() << endl;
+                    ::mongo::log() << expected.hexDump() << endl;
+                    ::mongo::log() << actual.hexDump() << endl;
+                    ::mongo::log() << msg << endl;
+                    ::mongo::log() << "orig json:" << this->json();
                 }
-                ASSERT( !expected.woCompare( actual ) );
+                ASSERT( !bad );
             }
         };
 
@@ -478,6 +675,42 @@ namespace JsonTests {
         class ReservedFieldName : public Bad {
             virtual string json() const {
                 return "{ \"$oid\" : \"b\" }";
+            }
+        };
+
+        class ReservedFieldName1 : public Bad {
+            virtual string json() const {
+                return "{ \"$ref\" : \"b\" }";
+            }
+        };
+
+        class NumberFieldName : public Bad {
+            virtual string json() const {
+                return "{ 0 : \"b\" }";
+            }
+        };
+
+        class InvalidFieldName : public Bad {
+            virtual string json() const {
+                return "{ test.test : \"b\" }";
+            }
+        };
+
+        class QuotedNullName : public Bad {
+            virtual string json() const {
+                return "{ \"nc\0nc\" : \"b\" }";
+            }
+        };
+
+        class NoValue : public Bad {
+            virtual string json() const {
+                return "{ a : }";
+            }
+        };
+
+        class InvalidValue : public Bad {
+            virtual string json() const {
+                return "{ a : a }";
             }
         };
 
@@ -550,6 +783,40 @@ namespace JsonTests {
             }
         };
 
+        class DeeplyNestedObject : public Base {
+            virtual string buildJson(int depth) const {
+                if (depth == 0) {
+                    return "{\"0\":true}";
+                }
+                else {
+                    std::stringstream ss;
+                    ss << "{\"" << depth << "\":" << buildJson(depth - 1) << "}";
+                    depth--;
+                    return ss.str();
+                }
+            }
+            virtual BSONObj buildBson(int depth) const {
+                BSONObjBuilder builder;
+                if (depth == 0) {
+                    builder.append( "0", true );
+                    return builder.obj();
+                }
+                else {
+                    std::stringstream ss;
+                    ss << depth;
+                    depth--;
+                    builder.append(ss.str(), buildBson(depth));
+                    return builder.obj();
+                }
+            }
+            virtual BSONObj bson() const {
+                return buildBson(35);
+            }
+            virtual string json() const {
+                return buildJson(35);
+            }
+        };
+
         class ArrayEmpty : public Base {
             virtual BSONObj bson() const {
                 vector< int > arr;
@@ -559,6 +826,27 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ \"a\" : [] }";
+            }
+        };
+
+        class TopLevelArrayEmpty : public Base {
+            virtual BSONObj bson() const {
+                return BSONArray();
+            }
+            virtual string json() const {
+                return "[]";
+            }
+        };
+
+        class TopLevelArray : public Base {
+            virtual BSONObj bson() const {
+                BSONArrayBuilder builder;
+                builder.append(123);
+                builder.append("abc");
+                return builder.arr();
+            }
+            virtual string json() const {
+                return "[ 123, \"abc\" ]";
             }
         };
 
@@ -610,6 +898,34 @@ namespace JsonTests {
             }
         };
 
+        class Undefined : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendUndefined( "a" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : undefined }";
+            }
+        };
+
+        class UndefinedStrict : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendUndefined( "a" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$undefined\" : true } }";
+            }
+        };
+        
+        class UndefinedStrictBad : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$undefined\" : false } }";
+            }
+        };
+
         class EscapedCharacters : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
@@ -640,6 +956,23 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ \"a\" : \"\x7f\" }";
+            }
+        };
+
+        class InvalidControlCharacter : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : \"\x1f\" }";
+            }
+        };
+
+        class NumbersInFieldName : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "b1", "b" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ b1 : \"b\" }";
             }
         };
 
@@ -721,33 +1054,179 @@ namespace JsonTests {
             }
         };
 
-        class DBRef : public Base {
-            virtual BSONObj bson() const {
-                BSONObjBuilder b;
-                OID o;
-                memset( &o, 0, 12 );
-                b.appendDBRef( "a", "foo", o );
-                return b.obj();
-            }
-            // NOTE Testing other formats handled by by Base class.
+        class Utf8Invalid : public Bad {
             virtual string json() const {
-                return "{ \"a\" : { \"$ref\" : \"foo\", \"$id\" : \"000000000000000000000000\" } }";
+                return "{ \"a\" : \"\\u0ZZZ\" }";
             }
         };
 
-        class NewDBRef : public Base {
+        class Utf8TooShort : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : \"\\u000\" }";
+            }
+        };
+
+        class DBRefConstructor : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Dbref( \"ns\", \"000000000000000000000000\" ) }";
+            }
+        };
+
+        // Added for consistency with the mongo shell
+        class DBRefConstructorCapitals : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : DBRef( \"ns\", \"000000000000000000000000\" ) }";
+            }
+        };
+
+        class DBRefConstructorDbName : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.append("$db", "dbname");
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Dbref( \"ns\", \"000000000000000000000000\", \"dbname\" ) }";
+            }
+        };
+
+        class DBRefConstructorNumber : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", 1);
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Dbref( \"ns\", 1 ) }";
+            }
+        };
+
+        class DBRefConstructorObject : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                BSONObjBuilder idSubBuilder(subBuilder.subobjStart("$id"));
+                idSubBuilder.append("b", true);
+                idSubBuilder.done();
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Dbref( \"ns\", { \"b\" : true } ) }";
+            }
+        };
+
+        class DBRefNumberId : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", 1);
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : 1 } }";
+            }
+        };
+
+        class DBRefObjectAsId : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                BSONObjBuilder idSubBuilder(subBuilder.subobjStart("$id"));
+                idSubBuilder.append("b", true);
+                idSubBuilder.done();
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : { \"b\" : true } } }";
+            }
+        };
+
+        class DBRefStringId : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : \"000000000000000000000000\" } }";
+            }
+        };
+
+        class DBRefObjectIDObject : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
                 OID o;
-                memset( &o, 0, 12 );
-                b.append( "$ref", "items" );
-                b.appendOID( "$id", &o );
-                BSONObjBuilder c;
-                c.append( "refval", b.done() );
-                return c.obj();
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", o);
+                subBuilder.done();
+                return b.obj();
             }
             virtual string json() const {
-                return "{ \"refval\" : { \"$ref\" : \"items\", \"$id\" : ObjectId( \"000000000000000000000000\" ) } }";
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : { \"$oid\" : \"000000000000000000000000\" } } }";
+            }
+        };
+
+        class DBRefObjectIDConstructor : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                OID o;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", o);
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : ObjectId( \"000000000000000000000000\" ) } }";
+            }
+        };
+
+        class DBRefDbName : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.append("$db", "dbname");
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$ref\" : \"ns\", \"$id\" : \"000000000000000000000000\""
+                       ", \"$db\" : \"dbname\" } }";
             }
         };
 
@@ -765,13 +1244,50 @@ namespace JsonTests {
         class Oid2 : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                OID o;
-                memset( &o, 0x0f, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0x0f, OID::kOIDSize );
+                OID o = OID::from(OIDbytes);
                 b.appendOID( "_id", &o );
                 return b.obj();
             }
             virtual string json() const {
                 return "{ \"_id\" : ObjectId( \"0f0f0f0f0f0f0f0f0f0f0f0f\" ) }";
+            }
+        };
+
+        class OidTooLong : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : { \"$oid\" : \"0000000000000000000000000\" } }";
+            }
+        };
+
+        class Oid2TooLong : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : ObjectId( \"0f0f0f0f0f0f0f0f0f0f0f0f0\" ) }";
+            }
+        };
+
+        class OidTooShort : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : { \"$oid\" : \"00000000000000000000000\" } }";
+            }
+        };
+
+        class Oid2TooShort : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : ObjectId( \"0f0f0f0f0f0f0f0f0f0f0f0\" ) }";
+            }
+        };
+
+        class OidInvalidChar : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : { \"$oid\" : \"00000000000Z000000000000\" } }";
+            }
+        };
+
+        class Oid2InvalidChar : public Bad {
+            virtual string json() const {
+                return "{ \"_id\" : ObjectId( \"0f0f0f0f0f0fZf0f0f0f0f0f\" ) }";
             }
         };
 
@@ -798,6 +1314,96 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinData1 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, Function, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"01\" } }";
+            }
+        };
+
+        class BinData2 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, ByteArrayDeprecated, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"02\" } }";
+            }
+        };
+
+        class BinData3 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, bdtUUID, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"03\" } }";
+            }
+        };
+
+        class BinData4 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, newUUID, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"04\" } }";
+            }
+        };
+
+        class BinData5 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, MD5Type, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"05\" } }";
+            }
+        };
+
+        class BinData80 : public Base {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, bdtCustom, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YWJj\", \"$type\" : \"80\" } }";
             }
         };
 
@@ -846,10 +1452,88 @@ namespace JsonTests {
             }
         };
 
+        class BinDataBadLength : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQ=\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataBadLength1 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQ\", \"$type\" : \"00\" } }";
+            }
+        };
+        
+        class BinDataBadLength2 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQX==\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataBadLength3 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQX\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataBadLength4 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQXZ=\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataBadLength5 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"YQXZ==\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataBadChars : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"a...\", \"$type\" : \"00\" } }";
+            }
+        };
+
+        class BinDataTypeTooShort : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\", \"$type\" : \"0\" } }";
+            }
+        };
+
+        class BinDataTypeTooLong : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\", \"$type\" : \"000\" } }";
+            }
+        };
+
+        class BinDataTypeBadChars : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\", \"$type\" : \"ZZ\" } }";
+            }
+        };
+
+        class BinDataEmptyType : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\", \"$type\" : \"\" } }";
+            }
+        };
+
+        class BinDataNoType : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\" } }";
+            }
+        };
+
+        class BinDataInvalidType : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$binary\" : \"AAAA\", \"$type\" : \"100\" } }";
+            }
+        };
+
         class Date : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendDate( "a", 0 );
+                b.appendDate( "a", Date_t() );
                 return b.obj();
             }
             virtual string json() const {
@@ -860,19 +1544,355 @@ namespace JsonTests {
         class DateNonzero : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendDate( "a", 100 );
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(1000000000) );
                 return b.obj();
             }
             virtual string json() const {
-                return "{ \"a\" : { \"$date\" : 100 } }";
+                return "{ \"a\" : { \"$date\" : 1000000000 } }";
+            }
+        };
+
+        class DateStrictTooLong : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$date\" : " << ~(0ULL) << "1" << " } }";
+                return ss.str();
             }
         };
 
         class DateTooLong : public Bad {
             virtual string json() const {
                 stringstream ss;
-                ss << "{ \"a\" : { \"$date\" : " << ~(0LL) << "0" << " } }";
+                ss << "{ \"a\" : Date( " << ~(0ULL) << "1" << " ) }";
                 return ss.str();
+            }
+        };
+
+        class DateIsString : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$date\" : \"100\" } }";
+                return ss.str();
+            }
+        };
+
+        class DateIsString1 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : Date(\"a\") }";
+                return ss.str();
+            }
+        };
+
+        class DateIsString2 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : new Date(\"a\") }";
+                return ss.str();
+            }
+        };
+
+        class DateIsFloat : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$date\" : 1.1 } }";
+                return ss.str();
+            }
+        };
+        
+        class DateIsFloat1 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : Date(1.1) }";
+                return ss.str();
+            }
+        };
+
+        class DateIsFloat2 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : new Date(1.1) }";
+                return ss.str();
+            }
+        };
+
+        class DateIsExponent : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$date\" : 10e3 } }";
+                return ss.str();
+            }
+        };
+
+        class DateIsExponent1 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : Date(10e3) }";
+                return ss.str();
+            }
+        };
+
+        class DateIsExponent2 : public Bad {
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : new Date(10e3) }";
+                return ss.str();
+            }
+        };
+        /* Need to handle this because jsonString outputs the value of Date_t as unsigned.
+         * See SERVER-8330 and SERVER-8573 */
+        class DateStrictMaxUnsigned : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
+                return b.obj();
+            }
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$date\" : "
+                   << std::numeric_limits<unsigned long long>::max() << " } }";
+                return ss.str();
+            }
+        };
+
+        class DateMaxUnsigned : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
+                return b.obj();
+            }
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : Date( "
+                   << std::numeric_limits<unsigned long long>::max() << " ) }";
+                return ss.str();
+            }
+        };
+
+        class DateStrictNegative : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$date\" : -1 } }";
+            }
+        };
+
+        class DateNegative : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Date( -1 ) }";
+            }
+        };
+
+        class NumberLongTest : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", 20000LL);
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : NumberLong( 20000 ) }";
+            }
+        };
+
+        class NumberLongMin : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", std::numeric_limits<long long>::min());
+                return b.obj();
+            }
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{'a': NumberLong(";
+                ss << std::numeric_limits<long long>::min() ;
+                ss << ") }";
+                return ss.str();
+            }
+        };
+
+        class NumberIntTest : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", 20000);
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : NumberInt( 20000 ) }";
+            }
+        };
+
+        class NumberLongNeg : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", -20000LL);
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : NumberLong( -20000 ) }";
+            }
+        };
+
+        class NumberIntNeg : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", -20000);
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : NumberInt( -20000 ) }";
+            }
+        };
+
+        class NumberLongBad : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : NumberLong( 'sdf' ) }";
+            }
+        };
+
+        class NumberIntBad : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : NumberInt( 'sdf' ) }";
+            }
+        };
+
+        class JSTimestamp : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", Timestamp(20, 5) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20, 5 ) }";
+            }
+        };
+
+        class TimestampNoIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20 ) }";
+            }
+        };
+
+        class TimestampZero : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", Timestamp() );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 0, 0 ) }";
+            }
+        };
+
+        class TimestampNoArgs : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp() }";
+            }
+        };
+
+        class TimestampFloatSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20.0, 1 ) }";
+            }
+        };
+
+        class TimestampFloatIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20, 1.0 ) }";
+            }
+        };
+
+        class TimestampNegativeSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( -20, 5 ) }";
+            }
+        };
+
+        class TimestampNegativeIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20, -5 ) }";
+            }
+        };
+
+        class TimestampInvalidSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( q, 5 ) }";
+            }
+        };
+
+        class TimestampObject : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", Timestamp(20, 5) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 20 , \"i\" : 5 } } }";
+            }
+        };
+
+        class TimestampObjectInvalidFieldName : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"time\" : 20 , \"increment\" : 5 } } }";
+            }
+        };
+
+        class TimestampObjectNoIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 20 } } }";
+            }
+        };
+
+        class TimestampObjectNegativeSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : -20 , \"i\" : 5 } } }";
+            }
+        };
+
+        class TimestampObjectNegativeIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 20 , \"i\" : -5 } } }";
+            }
+        };
+
+        class TimestampObjectInvalidSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : q , \"i\" : 5 } } }";
+            }
+        };
+
+        class TimestampObjectZero : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", Timestamp() );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 0, \"i\" : 0} } }";
+            }
+        };
+
+        class TimestampObjectNoArgs : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { } } }";
+            }
+        };
+
+        class TimestampObjectFloatSeconds : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 1.0, \"i\" : 0} } }";
+            }
+        };
+
+        class TimestampObjectFloatIncrement : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$timestamp\" : { \"t\" : 20, \"i\" : 1.0} } }";
             }
         };
 
@@ -884,6 +1904,17 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ \"a\" : { \"$regex\" : \"b\", \"$options\" : \"i\" } }";
+            }
+        };
+
+        class RegexNoOptionField : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex( "a", "b", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : \"b\" } }";
             }
         };
 
@@ -908,6 +1939,23 @@ namespace JsonTests {
                 return "{ \"a\" : /\"/ }";
             }
         };
+        
+        class RegexWithQuotes1 : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex( "a", "\"", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { $regex : \"\\\"\" }}";
+            }
+        };
+
+        class RegexInvalidField : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : \"b\", \"field\" : \"i\" } }";
+            }
+        };
 
         class RegexInvalidOption : public Bad {
             virtual string json() const {
@@ -921,9 +1969,180 @@ namespace JsonTests {
             }
         };
 
+        class RegexInvalidOption3 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : /b/ic }";
+            }
+        };
+
+        class RegexInvalidOption4 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : \"b\", \"$options\" : \"a\" } }";
+            }
+        };
+
+        class RegexInvalidOption5 : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : /b/a }";
+            }
+        };
+
+        class RegexEmptyOption : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex( "a", "b", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : \"b\", \"$options\" : \"\" } }";
+            }
+        };
+
+        class RegexEmpty : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex("a", "", "");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : \"\", \"$options\" : \"\"} }";
+            }
+        };
+
+        class RegexEmpty1 : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex("a", "", "");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" :  //  }";
+            }
+        };
+
+        class RegexOverlap : public Bad {
+            virtual string json() const {
+                return "{ \"a\" : { \"$regex\" : // } }";
+            }
+        };
+
         class Malformed : public Bad {
             string json() const {
                 return "{";
+            }
+        };
+
+        class Malformed1 : public Bad {
+            string json() const {
+                return "}";
+            }
+        };
+
+        class Malformed2 : public Bad {
+            string json() const {
+                return "{test}";
+            }
+        };
+
+        class Malformed3 : public Bad {
+            string json() const {
+                return "{test";
+            }
+        };
+
+        class Malformed4 : public Bad {
+            string json() const {
+                return "{ test : 1";
+            }
+        };
+        
+        class Malformed5 : public Bad {
+            string json() const {
+                return "{ test : 1 , }";
+            }
+        };
+
+        class Malformed6 : public Bad {
+            string json() const {
+                return "{ test : 1 , tst}";
+            }
+        };
+        
+        class Malformed7 : public Bad {
+            string json() const {
+                return "{ a : []";
+            }
+        };
+
+        class Malformed8 : public Bad {
+            string json() const {
+                return "{ a : { test : 1 }";
+            }
+        };
+        
+        class Malformed9 : public Bad {
+            string json() const {
+                return "{ a : [ { test : 1]}";
+            }
+        };
+
+        class Malformed10 : public Bad {
+            string json() const {
+                return "{ a : [ { test : 1], b : 2}";
+            }
+        };
+
+        class Malformed11 : public Bad {
+            string json() const {
+                return "{ a : \"test\"string }";
+            }
+        };
+
+        class Malformed12 : public Bad {
+            string json() const {
+                return "{ a : test\"string\" }";
+            }
+        };
+
+        class Malformed13 : public Bad {
+            string json() const {
+                return "{ a\"bad\" : \"teststring\" }";
+            }
+        };
+
+        class Malformed14 : public Bad {
+            string json() const {
+                return "{ \"a\"test : \"teststring\" }";
+            }
+        };
+
+        class Malformed15 : public Bad {
+            string json() const {
+                return "{ \"atest : \"teststring\" }";
+            }
+        };
+
+        class Malformed16 : public Bad {
+            string json() const {
+                return "{ atest\" : \"teststring\" }";
+            }
+        };
+
+        class Malformed17 : public Bad {
+            string json() const {
+                return "{ atest\" : 1 }";
+            }
+        };
+
+        class Malformed18 : public Bad {
+            string json() const {
+                return "{ atest : \"teststring }";
+            }
+        };
+
+        class Malformed19 : public Bad {
+            string json() const {
+                return "{ atest : teststring\" }";
             }
         };
 
@@ -935,6 +2154,146 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ a_b : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad : public Bad {
+            string json() const {
+                return "{ 123 : 1 }";
+            }
+        };
+         
+        class UnquotedFieldNameBad1 : public Bad {
+            string json() const {
+                return "{ -123 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad2 : public Bad {
+            string json() const {
+                return "{ .123 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad3 : public Bad {
+            string json() const {
+                return "{ -.123 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad4 : public Bad {
+            string json() const {
+                return "{ -1.23 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad5 : public Bad {
+            string json() const {
+                return "{ 1e23 : 1 }";
+            }
+        };
+        
+        class UnquotedFieldNameBad6 : public Bad {
+            string json() const {
+                return "{ -1e23 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad7 : public Bad {
+            string json() const {
+                return "{ -1e-23 : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad8 : public Bad {
+            string json() const {
+                return "{ -hello : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad9 : public Bad {
+            string json() const {
+                return "{ il.legal : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad10 : public Bad {
+            string json() const {
+                return "{ 10gen : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad11 : public Bad {
+            string json() const {
+                return "{ _123. : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad12 : public Bad {
+            string json() const {
+                return "{ he-llo : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad13 : public Bad {
+            string json() const {
+                return "{ bad\nchar : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad14 : public Bad {
+            string json() const {
+                return "{ thiswill\fail : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad15 : public Bad {
+            string json() const {
+                return "{ failu\re : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad16 : public Bad {
+            string json() const {
+                return "{ t\test : 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad17 : public Bad {
+            string json() const {
+                return "{ \break: 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad18 : public Bad {
+            string json() const {
+                //here we fill the memory directly to test unicode values 
+                //In this case we set \u0700 and \uFF00
+                //Setting it directly in memory avoids MSVC error c4566
+                unsigned char u[ 6 ];
+                u[ 0 ] = 0xdc;
+                u[ 1 ] = 0x80;
+
+                u[ 2 ] = 0xef;
+                u[ 3 ] = 0xbc;
+                u[ 4 ] = 0x80;
+
+                u[ 5 ] = 0;
+                std::stringstream ss;
+                ss << "{ " << u << " : 1 }";
+                return ss.str();
+            }
+        };
+
+        class UnquotedFieldNameBad19 : public Bad {
+            string json() const {
+                return "{ bl\\u3333p: 1 }";
+            }
+        };
+
+        class UnquotedFieldNameBad20 : public Bad {
+            string json() const {
+                return "{ bl-33p: 1 }";
             }
         };
 
@@ -958,6 +2317,83 @@ namespace JsonTests {
             virtual string json() const {
                 return "{ 'ab\\'c\"' : 'bb\\b \\'\"' }";
             }
+        };
+
+        class QuoteTest : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("\"", "test");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ '\"' : \"test\" }";
+            }       
+        };
+
+        class QuoteTest1 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("'", "test");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ \"'\" : \"test\" }";
+            }       
+        };
+
+        class QuoteTest2 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("\"", "test");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ '\"' : \"test\" }";
+            }       
+        };
+
+        class QuoteTest3 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("\"'\"", "test");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ '\"\\\'\"' : \"test\" }";
+            }       
+        };
+
+        class QuoteTest4 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("'\"'", "test");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ \"'\\\"'\" : \"test\" }";
+            }       
+        };
+
+        class QuoteTest5 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("test", "'");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ \"test\" : \"'\" }";
+            }       
+        };
+
+        class QuoteTest6 : public Base { 
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append("test", "\"");
+                return b.obj();
+            }
+            virtual string json() const { 
+                return "{ \"test\" : '\"' }";
+            }       
         };
 
         class ObjectId : public Base {
@@ -1011,6 +2447,108 @@ namespace JsonTests {
             }
         };
 
+        class NumericTypesJS : public Base {
+        public:
+            void run() {
+                Base::run();
+
+                BSONObj o = fromjson(json());
+
+                ASSERT(o["int"].type() == NumberInt);
+                ASSERT(o["long"].type() == NumberLong);
+                ASSERT(o["double"].type() == NumberDouble);
+
+                ASSERT(o["long"].numberLong() == 9223372036854775807ll);
+            }
+
+            virtual BSONObj bson() const {
+                return BSON( "int" << 123
+                             << "long" << 9223372036854775807ll // 2**63 - 1
+                             << "double" << 3.14
+                           );
+            }
+            virtual string json() const {
+                return "{ 'int': NumberInt(123), "
+                         "'long': NumberLong(9223372036854775807), "
+                         "'double': 3.14 }";
+            }
+        };
+
+        class NumericLongMin : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", std::numeric_limits<long long>::min());
+                return b.obj();
+            }
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{'a': ";
+                ss << std::numeric_limits<long long>::min() ;
+                ss << " }";
+                return ss.str();
+            }
+        };
+
+        class NumericIntMin : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNumber("a", std::numeric_limits<int>::min());
+                return b.obj();
+            }
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{'a': ";
+                ss << std::numeric_limits<int>::min() ;
+                ss << " }";
+                return ss.str();
+            }
+        };
+
+
+        class NumericLimits : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder builder;
+                BSONArrayBuilder numArray(builder.subarrayStart(""));
+                numArray.append(std::numeric_limits<long long>::max());
+                numArray.append(std::numeric_limits<long long>::min());
+                numArray.append(std::numeric_limits<int>::max());
+                numArray.append(std::numeric_limits<int>::min());
+                numArray.done();
+                return builder.obj();
+            }
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{'': [";
+                ss << std::numeric_limits<long long>::max() << ",";
+                ss << std::numeric_limits<long long>::min() << ",";
+                ss << std::numeric_limits<int>::max() << ",";
+                ss << std::numeric_limits<int>::min();
+                ss << "] }";
+                return ss.str();
+            }
+        };
+
+        //Overflows double by giving it an exponent that is too large
+        class NumericLimitsBad : public Bad {
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{ test : ";
+                ss << std::numeric_limits<double>::max()  << "1111111111";
+                ss << "}";
+                return ss.str();
+            }
+        };
+
+        class NumericLimitsBad1 : public Bad {
+            virtual string json() const {
+                std::stringstream ss;
+                ss << "{ test : ";
+                ss << std::numeric_limits<double>::min() << "11111111111";
+                ss << "}";
+                return ss.str();
+            }
+        };
+
         class NegativeNumericTypes : public Base {
         public:
             void run() {
@@ -1050,8 +2588,8 @@ namespace JsonTests {
 
             BSONObj bson() const {
                 BSONObjBuilder e;
-                e.appendDate( "$gt" , 1257829200000LL );
-                e.appendDate( "$lt" , 1257829200100LL );
+                e.appendDate( "$gt" , Date_t::fromMillisSinceEpoch(1257829200000LL) );
+                e.appendDate( "$lt" , Date_t::fromMillisSinceEpoch(1257829200100LL) );
 
                 BSONObjBuilder b;
                 b.append( "time.valid" , e.obj() );
@@ -1087,6 +2625,46 @@ namespace JsonTests {
             }
         };
 
+        class NullFieldUnquoted : public Bad {
+            virtual string json() const {
+                return "{ x\\u0000y : \"a\" }";
+            }
+        };
+
+        class MinKeyAlone : public Bad {
+            virtual string json() const {
+                return "{ \"$minKey\" : 1 }";
+            }
+        };
+
+        class MaxKeyAlone : public Bad {
+            virtual string json() const {
+                return "{ \"$maxKey\" : 1 }";
+            }
+        };
+
+        class MinKey : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendMinKey("a");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$minKey\" : 1 } }";
+            }
+        };
+
+        class MaxKey : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendMaxKey("a");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$maxKey\" : 1 } }";
+            }
+        };
+
     } // namespace FromJsonTests
 
     class All : public Suite {
@@ -1106,8 +2684,15 @@ namespace JsonTests {
             add< JsonStringTests::InvalidNumbers >();
             add< JsonStringTests::NumberPrecision >();
             add< JsonStringTests::NegativeNumber >();
+            add< JsonStringTests::NumberLongStrict >();
+            add< JsonStringTests::NumberLongStrictLarge >();
+            add< JsonStringTests::NumberLongStrictNegative >();
+            add< JsonStringTests::NumberDoubleNaN >();
+            add< JsonStringTests::NumberDoubleInfinity >();
+            add< JsonStringTests::NumberDoubleNegativeInfinity >();
             add< JsonStringTests::SingleBoolMember >();
             add< JsonStringTests::SingleNullMember >();
+            add< JsonStringTests::SingleUndefinedMember >();
             add< JsonStringTests::SingleObjectMember >();
             add< JsonStringTests::TwoMembers >();
             add< JsonStringTests::EmptyArray >();
@@ -1118,10 +2703,12 @@ namespace JsonTests {
             add< JsonStringTests::BinData >();
             add< JsonStringTests::Symbol >();
             add< JsonStringTests::Date >();
+            add< JsonStringTests::DateNegative >();
             add< JsonStringTests::Regex >();
             add< JsonStringTests::RegexEscape >();
             add< JsonStringTests::RegexManyOptions >();
             add< JsonStringTests::CodeTests >();
+            add< JsonStringTests::CodeWScopeTests >();
             add< JsonStringTests::TimestampTests >();
             add< JsonStringTests::NullString >();
             add< JsonStringTests::AllTypes >();
@@ -1131,55 +2718,219 @@ namespace JsonTests {
             add< FromJsonTests::SingleString >();
             add< FromJsonTests::EmptyStrings >();
             add< FromJsonTests::ReservedFieldName >();
+            add< FromJsonTests::ReservedFieldName1 >();
+            add< FromJsonTests::NumberFieldName >();
+            add< FromJsonTests::InvalidFieldName >();
+            add< FromJsonTests::QuotedNullName >();
+            add< FromJsonTests::NoValue >();
+            add< FromJsonTests::InvalidValue >();
+            add< FromJsonTests::InvalidValue >();
             add< FromJsonTests::OkDollarFieldName >();
             add< FromJsonTests::SingleNumber >();
             add< FromJsonTests::RealNumber >();
             add< FromJsonTests::FancyNumber >();
             add< FromJsonTests::TwoElements >();
             add< FromJsonTests::Subobject >();
+            add< FromJsonTests::DeeplyNestedObject >();
             add< FromJsonTests::ArrayEmpty >();
+            add< FromJsonTests::TopLevelArrayEmpty >();
+            add< FromJsonTests::TopLevelArray >();
             add< FromJsonTests::Array >();
             add< FromJsonTests::True >();
             add< FromJsonTests::False >();
             add< FromJsonTests::Null >();
+            add< FromJsonTests::Undefined >();
+            add< FromJsonTests::UndefinedStrict >();
+            add< FromJsonTests::UndefinedStrictBad >();
             add< FromJsonTests::EscapedCharacters >();
             add< FromJsonTests::NonEscapedCharacters >();
             add< FromJsonTests::AllowedControlCharacter >();
+            add< FromJsonTests::InvalidControlCharacter >();
+            add< FromJsonTests::NumbersInFieldName >();
             add< FromJsonTests::EscapeFieldName >();
             add< FromJsonTests::EscapedUnicodeToUtf8 >();
             add< FromJsonTests::Utf8AllOnes >();
             add< FromJsonTests::Utf8FirstByteOnes >();
-            add< FromJsonTests::DBRef >();
-            add< FromJsonTests::NewDBRef >();
+            add< FromJsonTests::Utf8Invalid >();
+            add< FromJsonTests::Utf8TooShort >();
+            add< FromJsonTests::DBRefConstructor >();
+            add< FromJsonTests::DBRefConstructorCapitals >();
+            add< FromJsonTests::DBRefConstructorDbName >();
+            add< FromJsonTests::DBRefConstructorNumber >();
+            add< FromJsonTests::DBRefConstructorObject >();
+            add< FromJsonTests::DBRefNumberId >();
+            add< FromJsonTests::DBRefObjectAsId >();
+            add< FromJsonTests::DBRefStringId >();
+            add< FromJsonTests::DBRefObjectIDObject >();
+            add< FromJsonTests::DBRefObjectIDConstructor >();
+            add< FromJsonTests::DBRefDbName >();
             add< FromJsonTests::Oid >();
             add< FromJsonTests::Oid2 >();
+            add< FromJsonTests::OidTooLong >();
+            add< FromJsonTests::Oid2TooLong >();
+            add< FromJsonTests::OidTooShort >();
+            add< FromJsonTests::Oid2TooShort >();
+            add< FromJsonTests::OidInvalidChar >();
+            add< FromJsonTests::Oid2InvalidChar >();
             add< FromJsonTests::StringId >();
             add< FromJsonTests::BinData >();
+            add< FromJsonTests::BinData1 >();
+            add< FromJsonTests::BinData2 >();
+            add< FromJsonTests::BinData3 >();
+            add< FromJsonTests::BinData4 >();
+            add< FromJsonTests::BinData5 >();
+            add< FromJsonTests::BinData80 >();
             add< FromJsonTests::BinDataPaddedSingle >();
             add< FromJsonTests::BinDataPaddedDouble >();
             add< FromJsonTests::BinDataAllChars >();
-            add< FromJsonTests::Date >();
+            add< FromJsonTests::BinDataBadLength >();
+            add< FromJsonTests::BinDataBadLength1 >();
+            add< FromJsonTests::BinDataBadLength2 >();
+            add< FromJsonTests::BinDataBadLength3 >();
+            add< FromJsonTests::BinDataBadLength4 >();
+            add< FromJsonTests::BinDataBadLength5 >();
+            add< FromJsonTests::BinDataBadChars >();
+            add< FromJsonTests::BinDataTypeTooShort >();
+            add< FromJsonTests::BinDataTypeTooLong >();
+            add< FromJsonTests::BinDataTypeBadChars >();
+            add< FromJsonTests::BinDataEmptyType >();
+            add< FromJsonTests::BinDataNoType >();
+            add< FromJsonTests::BinDataInvalidType >();
+            // DOCS-2539:  We cannot parse dates generated with a Unix timestamp of zero in local
+            // time, since the body of the date may be before the Unix Epoch.  This causes parsing
+            // to fail even if the offset would properly adjust the time.  For example,
+            // "1969-12-31T19:00:00-05:00" actually represents the Unix timestamp of zero, but we
+            // cannot parse it because the body of the date is before 1970.
+            //add< FromJsonTests::Date >();
             add< FromJsonTests::DateNonzero >();
+            add< FromJsonTests::DateStrictTooLong >();
             add< FromJsonTests::DateTooLong >();
+            add< FromJsonTests::DateIsString >();
+            add< FromJsonTests::DateIsString1 >();
+            add< FromJsonTests::DateIsString2 >();
+            add< FromJsonTests::DateIsFloat >();
+            add< FromJsonTests::DateIsFloat1 >();
+            add< FromJsonTests::DateIsFloat2 >();
+            add< FromJsonTests::DateIsExponent >();
+            add< FromJsonTests::DateIsExponent1 >();
+            add< FromJsonTests::DateIsExponent2 >();
+            add< FromJsonTests::DateStrictMaxUnsigned >();
+            add< FromJsonTests::DateMaxUnsigned >();
+            add< FromJsonTests::DateStrictNegative >();
+            add< FromJsonTests::DateNegative >();
+            add< FromJsonTests::NumberLongTest >();
+            add< FromJsonTests::NumberLongMin >();
+            add< FromJsonTests::NumberIntTest >();
+            add< FromJsonTests::NumberLongNeg >();
+            add< FromJsonTests::NumberIntNeg >();
+            add< FromJsonTests::NumberLongBad >();
+            add< FromJsonTests::NumberIntBad >();
+            add< FromJsonTests::JSTimestamp >();
+            add< FromJsonTests::TimestampNoIncrement >();
+            add< FromJsonTests::TimestampZero >();
+            add< FromJsonTests::TimestampNoArgs >();
+            add< FromJsonTests::TimestampFloatSeconds >();
+            add< FromJsonTests::TimestampFloatIncrement >();
+            add< FromJsonTests::TimestampNegativeSeconds >();
+            add< FromJsonTests::TimestampNegativeIncrement >();
+            add< FromJsonTests::TimestampInvalidSeconds >();
+            add< FromJsonTests::TimestampObject >();
+            add< FromJsonTests::TimestampObjectInvalidFieldName >();
+            add< FromJsonTests::TimestampObjectNoIncrement >();
+            add< FromJsonTests::TimestampObjectNegativeSeconds >();
+            add< FromJsonTests::TimestampObjectNegativeIncrement >();
+            add< FromJsonTests::TimestampObjectInvalidSeconds >();
+            add< FromJsonTests::TimestampObjectZero >();
+            add< FromJsonTests::TimestampObjectNoArgs >();
+            add< FromJsonTests::TimestampObjectFloatSeconds >();
+            add< FromJsonTests::TimestampObjectFloatIncrement >();
             add< FromJsonTests::Regex >();
+            add< FromJsonTests::RegexNoOptionField >();
             add< FromJsonTests::RegexEscape >();
             add< FromJsonTests::RegexWithQuotes >();
+            add< FromJsonTests::RegexWithQuotes1 >();
+            add< FromJsonTests::RegexInvalidField >();
             add< FromJsonTests::RegexInvalidOption >();
             add< FromJsonTests::RegexInvalidOption2 >();
+            add< FromJsonTests::RegexInvalidOption3 >();
+            add< FromJsonTests::RegexInvalidOption4 >();
+            add< FromJsonTests::RegexInvalidOption5 >();
+            add< FromJsonTests::RegexEmptyOption >();
+            add< FromJsonTests::RegexEmpty >();
+            add< FromJsonTests::RegexEmpty1 >();
+            add< FromJsonTests::RegexOverlap >();
             add< FromJsonTests::Malformed >();
+            add< FromJsonTests::Malformed1 >();
+            add< FromJsonTests::Malformed2 >();
+            add< FromJsonTests::Malformed3 >();
+            add< FromJsonTests::Malformed4 >();
+            add< FromJsonTests::Malformed5 >();
+            add< FromJsonTests::Malformed6 >();
+            add< FromJsonTests::Malformed7 >();
+            add< FromJsonTests::Malformed8 >();
+            add< FromJsonTests::Malformed9 >();
+            add< FromJsonTests::Malformed10 >();
+            add< FromJsonTests::Malformed11 >();
+            add< FromJsonTests::Malformed12 >();
+            add< FromJsonTests::Malformed13 >();
+            add< FromJsonTests::Malformed14 >();
+            add< FromJsonTests::Malformed15 >();
+            add< FromJsonTests::Malformed16 >();
+            add< FromJsonTests::Malformed17 >();
+            add< FromJsonTests::Malformed18 >();
+            add< FromJsonTests::Malformed19 >();
             add< FromJsonTests::UnquotedFieldName >();
+            add< FromJsonTests::UnquotedFieldNameBad >();
+            add< FromJsonTests::UnquotedFieldNameBad1 >();
+            add< FromJsonTests::UnquotedFieldNameBad2 >();
+            add< FromJsonTests::UnquotedFieldNameBad3 >();
+            add< FromJsonTests::UnquotedFieldNameBad4 >();
+            add< FromJsonTests::UnquotedFieldNameBad5 >();
+            add< FromJsonTests::UnquotedFieldNameBad6 >();
+            add< FromJsonTests::UnquotedFieldNameBad7 >();
+            add< FromJsonTests::UnquotedFieldNameBad8 >();
+            add< FromJsonTests::UnquotedFieldNameBad9 >();
+            add< FromJsonTests::UnquotedFieldNameBad10 >();
+            add< FromJsonTests::UnquotedFieldNameBad11 >();
+            add< FromJsonTests::UnquotedFieldNameBad12 >();
+            add< FromJsonTests::UnquotedFieldNameBad13 >();
+            add< FromJsonTests::UnquotedFieldNameBad14 >();
+            add< FromJsonTests::UnquotedFieldNameBad15 >();
+            add< FromJsonTests::UnquotedFieldNameBad16 >();
+            add< FromJsonTests::UnquotedFieldNameBad17 >();
+            add< FromJsonTests::UnquotedFieldNameBad18 >();
+            add< FromJsonTests::UnquotedFieldNameBad19 >();
+            add< FromJsonTests::UnquotedFieldNameBad20 >();
             add< FromJsonTests::UnquotedFieldNameDollar >();
             add< FromJsonTests::SingleQuotes >();
+            add< FromJsonTests::QuoteTest >();
+            add< FromJsonTests::QuoteTest1 >();
+            add< FromJsonTests::QuoteTest2 >();
+            add< FromJsonTests::QuoteTest3 >();
+            add< FromJsonTests::QuoteTest4 >();
+            add< FromJsonTests::QuoteTest5 >();
+            add< FromJsonTests::QuoteTest6 >();
             add< FromJsonTests::ObjectId >();
             add< FromJsonTests::ObjectId2 >();
+            add< FromJsonTests::NumericIntMin >();
+            add< FromJsonTests::NumericLongMin >();
             add< FromJsonTests::NumericTypes >();
+            add< FromJsonTests::NumericTypesJS >();
+            add< FromJsonTests::NumericLimits >();
+            add< FromJsonTests::NumericLimitsBad >();
+            add< FromJsonTests::NumericLimitsBad1 >();
             add< FromJsonTests::NegativeNumericTypes >();
             add< FromJsonTests::EmbeddedDatesFormat1 >();
             add< FromJsonTests::EmbeddedDatesFormat2 >();
             add< FromJsonTests::EmbeddedDatesFormat3 >();
             add< FromJsonTests::NullString >();
+            add< FromJsonTests::NullFieldUnquoted >();
+            add< FromJsonTests::MinKey >();
+            add< FromJsonTests::MaxKey >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JsonTests
 

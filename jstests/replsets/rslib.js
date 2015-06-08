@@ -1,8 +1,10 @@
-
+var wait, occasionally, reconnect, getLatestOp, waitForAllMembers, reconfig, awaitOpTime;
+(function () {
+"use strict";
 var count = 0;
 var w = 0;
 
-var wait = function(f,msg) {
+wait = function(f,msg) {
     w++;
     var n = 0;
     while (!f()) {
@@ -25,16 +27,17 @@ var wait = function(f,msg) {
  * }
  * </pre>
  */
-var occasionally = function(f, n) {
+occasionally = function(f, n) {
   var interval = n || 4;
   if (count % interval == 0) {
     f();
   }
   count++;
 };
-  
-var reconnect = function(a) {
-  wait(function() { 
+
+reconnect = function(a) {
+  wait(function() {
+      var db;
       try {
         // make this work with either dbs or connections
         if (typeof(a.getDB) == "function") {
@@ -45,7 +48,7 @@ var reconnect = function(a) {
         }
         db.bar.stats();
         if (jsTest.options().keyFile) { // SERVER-4241: Shell connections don't re-authenticate on reconnect
-          jsTest.authenticate(db.getMongo());
+          return jsTest.authenticate(db.getMongo());
         }
         return true;
       } catch(e) {
@@ -56,7 +59,7 @@ var reconnect = function(a) {
 };
 
 
-var getLatestOp = function(server) {
+getLatestOp = function(server) {
     server.getDB("admin").getMongo().setSlaveOk();
     var log = server.getDB("local")['oplog.rs'];
     var cursor = log.find({}).sort({'$natural': -1}).limit(1);
@@ -67,41 +70,80 @@ var getLatestOp = function(server) {
 };
 
 
-var waitForAllMembers = function(master) {
-  var ready = false;
-  var count = 0;
-  
-  outer:
-  while (count < 60) {
-    count++;
-    var state = master.getSisterDB("admin").runCommand({replSetGetStatus:1});
-    occasionally(function() { printjson(state); }, 10);
+waitForAllMembers = function(master, timeout) {
+    var failCount = 0;
 
-    for (var m in state.members) {
-      if (state.members[m].state != 2 && state.members[m].state != 1) {
-        sleep(1000);
-        continue outer;
-      }
-    }
-    return;
-  }
+    assert.soon( function() {
+        var state = null
+        try {
+            state = master.getSisterDB("admin").runCommand({replSetGetStatus:1});
+            failCount = 0;
+        } catch ( e ) {
+            // Connection can get reset on replica set failover causing a socket exception
+            print( "Calling replSetGetStatus failed" );
+            print( e );
+            return false;
+        }
+        occasionally(function() { printjson(state); }, 10);
 
-  assert(false, "all members not ready");
+        for (var m in state.members) {
+            if (state.members[m].state != 1 && // PRIMARY
+                state.members[m].state != 2 && // SECONDARY
+                state.members[m].state != 7) { // ARBITER
+                return false;
+            }
+        }
+        printjson( state );
+        return true;
+    }, "not all members ready", timeout || 60000);
+
+    print( "All members are now in state PRIMARY, SECONDARY, or ARBITER" );
 };
 
-var reconfig = function(rs, config) {
+reconfig = function(rs, config, force) {
+    "use strict";
     var admin = rs.getMaster().getDB("admin");
-    
+    var e;
+    var master;
     try {
-        var ok = admin.runCommand({replSetReconfig : config});
-        assert.eq(ok.ok,1);
+        assert.commandWorked(admin.runCommand({replSetReconfig: config, force: force}));
     }
-    catch(e) {
-        print(e);
+    catch (e) {
+        if (tojson(e).indexOf( "error doing query: failed" ) < 0) {
+            throw e;
+        }
     }
 
-    master = rs.getMaster().getDB("admin");
+    var master = rs.getMaster().getDB("admin");
     waitForAllMembers(master);
 
     return master;
 };
+
+awaitOpTime = function (node, opTime) {
+    var ts, ex;
+    assert.soon(function () {
+        try {
+            // The following statement extracts the timestamp field from the most recent element of
+            // the oplog, and stores it in "ts".
+            ts = node.getDB("local")['oplog.rs'].find({}).sort({'$natural': -1}).limit(1).next().ts;
+            if ((ts.t == opTime.t) && (ts.i == opTime.i)) {
+                return true;
+            }
+            ex = null;
+            return false;
+        }
+        catch (ex) {
+            return false;
+        }
+    }, function () {
+        var message = "Node " + node + " only reached optime " + tojson(ts) + " not " +
+            tojson(opTime);
+        if (ex) {
+            message += "; last attempt failed with exception " + tojson(ex);
+        }
+        return message;
+    });
+};
+
+}());

@@ -1,0 +1,77 @@
+# -*- mode: python; -*-
+
+Import('env')
+
+env.Library(
+    target='hostandport',
+    source=[
+        'hostandport.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/foundation',
+    ],
+)
+
+env.CppUnitTest(
+    target='hostandport_test',
+    source=[
+        'hostandport_test.cpp'
+    ],
+    LIBDEPS=[
+        'hostandport',
+    ],
+)
+
+env.Library(
+    target='network',
+    source=[
+        "httpclient.cpp",
+        "listen.cpp",
+        "message.cpp",
+        "message_port.cpp",
+        "sock.cpp",
+        "socket_poll.cpp",
+        "ssl_expiration.cpp",
+        "ssl_manager.cpp",
+        "ssl_options.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/background_job',
+        '$BUILD_DIR/mongo/util/fail_point',
+        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/util/concurrency/ticketholder',
+        '$BUILD_DIR/mongo/util/foundation',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
+        'hostandport',
+    ],
+)
+
+env.CppUnitTest(
+    target='sock_test',
+    source=[
+        'sock_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/concurrency/synchronization',
+        'network',
+    ],
+)
+
+env.Library(
+    target="message_server_port",
+    source=[
+        "message_server_port.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/stats/counters',
+    ],
+)
+
+env.Library(
+    target='miniwebserver',
+    source=[
+        'miniwebserver.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)

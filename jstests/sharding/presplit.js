@@ -3,6 +3,9 @@
 // Starts a new sharding environment limiting the chunksize to 1MB. 
 s = new ShardingTest( "presplit" , 2 , 2 , 1 , { chunksize : 1 } );
 
+s.adminCommand( { enablesharding : "test" } );
+s.ensurePrimaryShard('test', 'shard0001');
+
 // Insert enough data in 'test.foo' to fill several chunks, if it was sharded.
 bigString = "";
 while ( bigString.length < 10000 ){
@@ -12,11 +15,12 @@ while ( bigString.length < 10000 ){
 db = s.getDB( "test" );
 inserted = 0;
 num = 0;
+var bulk = db.foo.initializeUnorderedBulkOp();
 while ( inserted < ( 20 * 1024 * 1024 ) ){
-    db.foo.insert( { _id : num++ , s : bigString } );
+    bulk.insert({ _id: num++, s: bigString });
     inserted += bigString.length;
 }
-db.getLastError();
+assert.writeOK(bulk.execute());
 
 // Make sure that there's only one chunk holding all the data.
 s.printChunks();
@@ -24,8 +28,6 @@ primary = s.getServer( "test" ).getDB( "test" );
 assert.eq( 0 , s.config.chunks.count()  , "single chunk assertion" );
 assert.eq( num , primary.foo.count() );
 
-// Turn on sharding on the 'test.foo' collection
-s.adminCommand( { enablesharding : "test" } );
 s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } );
 
 // Make sure the collection's original chunk got split 

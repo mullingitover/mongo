@@ -13,25 +13,40 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
 #pragma once
 
-#include "../pch.h"
+#include <boost/shared_ptr.hpp>
+#include <string>
 
-#include "../db/jsobj.h"
-#include "../db/dbmessage.h"
-#include "../client/parallel.h"
-
-#include "request.h"
+#include "mongo/base/disallow_copying.h"
+#include "mongo/client/parallel.h"
+#include "mongo/platform/random.h"
 
 namespace mongo {
 
-    class ShardedClientCursor : boost::noncopyable {
+    class QueryMessage;
+
+
+    class ShardedClientCursor {
+        MONGO_DISALLOW_COPYING(ShardedClientCursor);
     public:
-        ShardedClientCursor( QueryMessage& q , ClusteredCursor * cursor );
-        virtual ~ShardedClientCursor();
+        ShardedClientCursor( QueryMessage& q , ParallelSortClusteredCursor * cursor );
+        ~ShardedClientCursor();
 
         long long getId();
 
@@ -39,14 +54,6 @@ namespace mongo {
          * @return the cumulative number of documents seen by this cursor.
          */
         int getTotalSent() const;
-
-        /**
-         * Sends queries to the shards, gather the result for this batch and sends the response
-         * to the socket.
-         *
-         * @return whether there is more data left
-         */
-        bool sendNextBatchAndReply( Request& r );
 
         /**
          * Sends queries to the shards and gather the result for this batch.
@@ -59,18 +66,20 @@ namespace mongo {
          *
          * @return true if this is not the final batch.
          */
-        bool sendNextBatch( Request& r, int ntoreturn, BufBuilder& buffer, int& docCount );
+        bool sendNextBatch(int ntoreturn, BufBuilder& buffer, int& docCount);
 
         void accessed();
         /** @return idle time in ms */
         long long idleTime( long long now );
+
+        std::string getNS() { return _cursor->getNS(); }
 
         // The default initial buffer size for sending responses.
         static const int INIT_REPLY_BUFFER_SIZE;
 
     protected:
 
-        ClusteredCursor * _cursor;
+        ParallelSortClusteredCursor * _cursor;
 
         int _skip;
         int _ntoreturn;
@@ -90,20 +99,26 @@ namespace mongo {
 
         static long long TIMEOUT;
 
-        typedef map<long long,ShardedClientCursorPtr> MapSharded;
-        typedef map<long long,string> MapNormal;
+        typedef std::map<long long,ShardedClientCursorPtr> MapSharded;
+        typedef std::map<long long,int> MapShardedInt;
+        typedef std::map<long long,std::string> MapNormal;
 
         CursorCache();
         ~CursorCache();
 
         ShardedClientCursorPtr get( long long id ) const;
-        void store( ShardedClientCursorPtr cursor );
+        int getMaxTimeMS( long long id ) const;
+        void store( ShardedClientCursorPtr cursor, int maxTimeMS );
+        void updateMaxTimeMS( long long id, int maxTimeMS );
         void remove( long long id );
 
-        void storeRef( const string& server , long long id );
+        void storeRef(const std::string& server, long long id, const std::string& ns);
+        void removeRef( long long id );
 
         /** @return the server for id or "" */
-        string getRef( long long id ) const ;
+        std::string getRef( long long id ) const ;
+        /** @return the ns for id or "" */
+        std::string getRefNS(long long id) const ;
         
         void gotKillCursors(Message& m );
 
@@ -116,9 +131,23 @@ namespace mongo {
     private:
         mutable mongo::mutex _mutex;
 
+        PseudoRandom _random;
+
+        // Maps sharded cursor ID to ShardedClientCursorPtr.
         MapSharded _cursors;
+
+        // Maps sharded cursor ID to remaining max time.  Value can be any of:
+        // - the constant "kMaxTimeCursorNoTimeLimit", or
+        // - the constant "kMaxTimeCursorTimeLimitExpired", or
+        // - a positive integer representing milliseconds of remaining time
+        MapShardedInt _cursorsMaxTimeMS;
+
+        // Maps passthrough cursor ID to shard name.
         MapNormal _refs;
 
+        // Maps passthrough cursor ID to namespace.
+        MapNormal _refsNS;
+        
         long long _shardedTotal;
 
         static const int _myLogLevel;

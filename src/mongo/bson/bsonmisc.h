@@ -2,20 +2,35 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
@@ -48,10 +63,6 @@ namespace mongo {
         RIGHT_SUBFIELD = 2
     };
 
-    class LexNumCmp;
-    FieldCompareResult compareDottedFieldNames( const std::string& l , const std::string& r ,
-                                               const LexNumCmp& cmp );
-
     /** Use BSON macro to build a BSONObj from a stream
 
         e.g.,
@@ -65,45 +76,57 @@ namespace mongo {
         BSON( "a" << GT << 23.4 << NE << 30 << "b" << 2 ) produces the object
         { a: { \$gt: 23.4, \$ne: 30 }, b: 2 }.
     */
-#define BSON(x) (( mongo::BSONObjBuilder(64) << x ).obj())
+#define BSON(x) (( ::mongo::BSONObjBuilder(64) << x ).obj())
 
     /** Use BSON_ARRAY macro like BSON macro, but without keys
 
         BSONArray arr = BSON_ARRAY( "hello" << 1 << BSON( "foo" << BSON_ARRAY( "bar" << "baz" << "qux" ) ) );
 
      */
-#define BSON_ARRAY(x) (( mongo::BSONArrayBuilder() << x ).arr())
+#define BSON_ARRAY(x) (( ::mongo::BSONArrayBuilder() << x ).arr())
 
     /* Utility class to auto assign object IDs.
        Example:
          std::cout << BSON( GENOID << "z" << 3 ); // { _id : ..., z : 3 }
     */
-    extern struct GENOIDLabeler { } GENOID;
+    struct GENOIDLabeler { };
+    extern GENOIDLabeler GENOID;
 
     /* Utility class to add a Date element with the current time
        Example:
          std::cout << BSON( "created" << DATENOW ); // { created : "2009-10-09 11:41:42" }
     */
-    extern struct DateNowLabeler { } DATENOW;
+    struct DateNowLabeler { };
+    extern DateNowLabeler DATENOW;
 
     /* Utility class to assign a NULL value to a given attribute
        Example:
          std::cout << BSON( "a" << BSONNULL ); // { a : null }
     */
-    extern struct NullLabeler { } BSONNULL;
+    struct NullLabeler { };
+    extern NullLabeler BSONNULL;
+
+    /* Utility class to assign an Undefined value to a given attribute
+       Example:
+         std::cout << BSON( "a" << BSONUndefined ); // { a : undefined }
+    */
+    struct UndefinedLabeler { };
+    extern UndefinedLabeler BSONUndefined;
 
     /* Utility class to add the minKey (minus infinity) to a given attribute
        Example:
          std::cout << BSON( "a" << MINKEY ); // { "a" : { "$minKey" : 1 } }
     */
-    extern struct MinKeyLabeler { } MINKEY;
-    extern struct MaxKeyLabeler { } MAXKEY;
+    struct MinKeyLabeler { };
+    extern MinKeyLabeler MINKEY;
+    struct MaxKeyLabeler { };
+    extern MaxKeyLabeler MAXKEY;
 
     // Utility class to implement GT, GTE, etc as described above.
     class Labeler {
     public:
         struct Label {
-            Label( const char *l ) : l_( l ) {}
+            explicit Label( const char *l ) : l_( l ) {}
             const char *l_;
         };
         Labeler( const Label &l, BSONObjBuilderValueStream *s ) : l_( l ), s_( s ) {}
@@ -119,6 +142,47 @@ namespace mongo {
     private:
         const Label &l_;
         BSONObjBuilderValueStream *s_;
+    };
+
+    // Utility class to allow adding a std::string to BSON as a Symbol
+    struct BSONSymbol {
+        explicit BSONSymbol(StringData sym) :symbol(sym) {}
+        StringData symbol;
+    };
+
+    // Utility class to allow adding a std::string to BSON as Code
+    struct BSONCode {
+        explicit BSONCode(StringData str) :code(str) {}
+        StringData code;
+    };
+
+    // Utility class to allow adding CodeWScope to BSON
+    struct BSONCodeWScope {
+        explicit BSONCodeWScope(StringData str, const BSONObj& obj) :code(str), scope(obj) {}
+        StringData code;
+        BSONObj scope;
+    };
+
+    // Utility class to allow adding a RegEx to BSON
+    struct BSONRegEx {
+        explicit BSONRegEx(StringData pat, StringData f="") :pattern(pat), flags(f) {}
+        StringData pattern;
+        StringData flags;
+    };
+
+    // Utility class to allow adding binary data to BSON
+    struct BSONBinData {
+        BSONBinData(const void* d, int l, BinDataType t) :data(d), length(l), type(t) {}
+        const void* data;
+        int length;
+        BinDataType type;
+    };
+
+    // Utility class to allow adding deprecated DBRef type to BSON
+    struct BSONDBRef {
+        BSONDBRef(StringData nameSpace, const OID& o) :ns(nameSpace), oid(o) {}
+        StringData ns;
+        OID oid;
     };
 
     extern Labeler::Label GT;
@@ -150,20 +214,29 @@ namespace mongo {
         template<class T>
         BSONObjBuilder& operator<<( T value );
 
-        BSONObjBuilder& operator<<(DateNowLabeler& id);
+        BSONObjBuilder& operator<<(const DateNowLabeler& id);
 
-        BSONObjBuilder& operator<<(NullLabeler& id);
+        BSONObjBuilder& operator<<(const NullLabeler& id);
+        BSONObjBuilder& operator<<(const UndefinedLabeler& id);
 
-        BSONObjBuilder& operator<<(MinKeyLabeler& id);
-        BSONObjBuilder& operator<<(MaxKeyLabeler& id);
+        BSONObjBuilder& operator<<(const MinKeyLabeler& id);
+        BSONObjBuilder& operator<<(const MaxKeyLabeler& id);
 
         Labeler operator<<( const Labeler::Label &l );
 
-        void endField( const char *nextFieldName = 0 );
+        void endField( StringData nextFieldName = StringData() );
         bool subobjStarted() const { return _fieldName != 0; }
 
+        // The following methods provide API compatibility with BSONArrayBuilder
+        BufBuilder& subobjStart();
+        BufBuilder& subarrayStart();
+
+        // This method should only be called from inside of implementations of
+        // BSONObjBuilder& operator<<(BSONObjBuilderValueStream&, SOME_TYPE)
+        // to provide the return value.
+        BSONObjBuilder& builder() { return *_builder; }
     private:
-        const char * _fieldName;
+        StringData _fieldName;
         BSONObjBuilder * _builder;
 
         bool haveSubobj() const { return _subobj.get() != 0; }
@@ -186,9 +259,8 @@ namespace mongo {
         }
 
         void got( int size ) {
-            _sizes[_pos++] = size;
-            if ( _pos >= SIZE )
-                _pos = 0;
+            _sizes[_pos] = size;
+            _pos = (_pos + 1) % SIZE; // thread safe at least on certain compilers
         }
 
         /**

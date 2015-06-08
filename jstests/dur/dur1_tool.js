@@ -63,13 +63,6 @@ function work() {
 
     // try building an index.  however, be careful as object id's in system.indexes would vary, so we do it manually:
     d.system.indexes.insert({ _id: 99, ns: "test.a", key: { x: 1 }, name: "x_1", v: 0 });
-
-//    d.a.update({ _id: 4 }, { $inc: { x: 1} });
-//    d.a.reIndex();
-
-    // assure writes applied in case we kill -9 on return from this function
-    d.getLastError();
-
     log("endwork");
     return d;
 }
@@ -95,18 +88,19 @@ if( debugging ) {
 log();
 
 // directories
-var path1 = "/data/db/" + testname+"nodur";
-var path2 = "/data/db/" + testname+"dur";
+var path1 = MongoRunner.dataPath + testname+"nodur";
+var path2 = MongoRunner.dataPath + testname+"dur";
 
 // non-durable version
 log("run mongod without journaling");
-conn = startMongodEmpty("--port", 30000, "--dbpath", path1, "--nodur", "--smallfiles");
+
+conn = MongoRunner.runMongod({dbpath: path1, nodur: "", smallfiles: ""});
 work();
-stopMongod(30000);
+MongoRunner.stopMongod(conn);
 
 // durable version
 log("run mongod with --journal");
-conn = startMongodEmpty("--port", 30001, "--dbpath", path2, "--journal", "--smallfiles", "--journalOptions", 8);
+conn = MongoRunner.runMongod({dbpath: path2, journal: "", smallfiles: "", journalOptions: 8});
 work();
 
 // wait for group commit.
@@ -114,17 +108,22 @@ printjson(conn.getDB('admin').runCommand({getlasterror:1, fsync:1}));
 
 // kill the process hard
 log("kill 9");
-stopMongod(30001, /*signal*/9);
+MongoRunner.stopMongod(conn, /*signal*/9);
 
 // journal file should be present, and non-empty as we killed hard
 
-// mongorestore with --dbpath and --journal options should do a recovery pass
+// mongod with --dbpath and --journal options should do a recovery pass
 // empty.bson is an empty file so it won't actually insert anything
-log("use mongorestore to recover");
-runMongoProgram("mongorestore", "--dbpath", path2, "--journal", "-d", "test", "-c", "empty", "jstests/dur/data/empty.bson");
-
-// stopMongod seems to be asynchronous (hmmm) so we sleep here.
-// sleep(5000);
+log("use mongod to recover");
+conn = MongoRunner.runMongod({restart: true,
+                              cleanData: false,
+                              dbpath: path2,
+                              journal: "",
+                              smallfiles: "",
+                              noprealloc: "",
+                              bind_ip: "127.0.0.1"});
+verify();
+MongoRunner.stopMongod(conn);
 
 // at this point, after clean shutdown, there should be no journal files
 log("check no journal files (after presumably clean shutdown)");

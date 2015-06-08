@@ -7,6 +7,7 @@ s = new ShardingTest( "features2" , 2 , 1 , 1 );
 s.stopBalancer()
 
 s.adminCommand( { enablesharding : "test" } );
+s.ensurePrimaryShard('test', 'shard0001');
 
 a = s._connections[0].getDB( "test" );
 b = s._connections[1].getDB( "test" );
@@ -26,7 +27,7 @@ assert( a.foo.distinct("x").length == 0 || b.foo.distinct("x").length == 0 , "di
 
 assert.eq( 1 , s.onNumShards( "foo" ) , "A1" );
 
-s.shardGo( "foo" , { x : 1 } , { x : 2 } , { x : 3 } );
+s.shardGo( "foo" , { x : 1 } , { x : 2 } , { x : 3 }, null, true /* waitForDelete */ );
 
 assert.eq( 2 , s.onNumShards( "foo" ) , "A2" );
 
@@ -60,11 +61,10 @@ assert.eq( 0 , db.foo.count() , "D7" );
 db.foo2.save( { _id : new ObjectId() } );
 db.foo2.save( { _id : new ObjectId() } );
 db.foo2.save( { _id : new ObjectId() } );
-db.getLastError();
 
 assert.eq( 1 , s.onNumShards( "foo2" ) , "F1" );
 
-printjson( db.system.indexes.find( { ns : "test.foo2" } ).toArray() );
+printjson( db.foo2.getIndexes() );
 s.adminCommand( { shardcollection : "test.foo2" , key : { _id : 1 } } );
 
 assert.eq( 3 , db.foo2.count() , "F2" )
@@ -135,7 +135,7 @@ doMR = function( n ){
 doMR( "before" );
 
 assert.eq( 1 , s.onNumShards( "mr" ) , "E1" );
-s.shardGo( "mr" , { x : 1 } , { x : 2 } , { x : 3 } );
+s.shardGo( "mr" , { x : 1 } , { x : 2 } , { x : 3 }, null, true /* waitForDelete */ );
 assert.eq( 2 , s.onNumShards( "mr" ) , "E1" );
 
 doMR( "after" );
@@ -176,13 +176,29 @@ catch ( e ){
     y = e;
 }
 
-assert.eq( x , y , "assert format" )
+// As the forceerror command is written, it doesnt set a code in the reply.
+// OP_COMMAND changes will add a code of 121 (CommandFailed) if a failing command
+// does not set one, so this comparison fails as "undefined" != 121.
+//
+// TODO: Uncomment this line when OP_COMMAND is implemented in mongos (SERVER-18292)
+// as then MongoS should set code 121 as well.
+//
+// assert.eq( x.code , y.code , "assert format" )
+assert.eq( x.errmsg , y.errmsg , "assert format" )
+assert.eq( x.ok , y.ok , "assert format" )
 
 // isMaster and query-wrapped-command
 isMaster = db.runCommand({isMaster:1});
 assert( isMaster.ismaster );
 assert.eq( 'isdbgrid', isMaster.msg );
-assert.eq( isMaster, db.runCommand({query: {isMaster:1}}) );
-assert.eq( isMaster, db.runCommand({$query: {isMaster:1}}) );
+delete isMaster.localTime;
+
+im2 = db.runCommand({query: {isMaster:1}});
+delete im2.localTime;
+assert.eq( isMaster, im2 );
+
+im2 = db.runCommand({$query: {isMaster:1}});
+delete im2.localTime;
+assert.eq( isMaster, im2 );
 
 s.stop();

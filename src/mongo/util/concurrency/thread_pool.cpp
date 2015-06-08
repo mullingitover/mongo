@@ -1,35 +1,53 @@
-/* threadpool.cpp
-*/
-
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "thread_pool.h"
-#include "mvar.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+
+#include "mongo/platform/basic.h"
+
+#include "mongo/util/concurrency/thread_pool.h"
+
+#include <boost/thread/thread.hpp>
+
+#include "mongo/util/concurrency/mvar.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
     namespace threadpool {
 
         // Worker thread
-        class Worker : boost::noncopyable {
+        class Worker {
         public:
-            explicit Worker(ThreadPool& owner)
+            explicit Worker(ThreadPool& owner, const std::string& threadName)
                 : _owner(owner)
                 , _is_done(true)
-                , _thread(boost::bind(&Worker::loop, this))
+                , _thread(stdx::bind(&Worker::loop, this, threadName))
             {}
 
             // destructor will block until current operation is completed
@@ -40,8 +58,8 @@ namespace mongo {
             }
 
             void set_task(Task& func) {
-                verify(!func.empty());
-                verify(_is_done);
+                invariant(func);
+                invariant(_is_done);
                 _is_done = false;
 
                 _task.put(func);
@@ -53,20 +71,24 @@ namespace mongo {
             bool _is_done; // only used for error detection
             boost::thread _thread;
 
-            void loop() {
+            void loop(const std::string& threadName) {
+                setThreadName(threadName);
                 while (true) {
                     Task task = _task.take();
-                    if (task.empty())
+                    if (!task)
                         break; // ends the thread
 
                     try {
                         task();
                     }
-                    catch (std::exception e) {
-                        log() << "Unhandled exception in worker thread: " << e.what() << endl;;
+                    catch (DBException& e) {
+                        log() << "Unhandled DBException: " << e.toString();
+                    }
+                    catch (std::exception& e) {
+                        log() << "Unhandled std::exception in worker thread: " << e.what();
                     }
                     catch (...) {
-                        log() << "Unhandled non-exception in worker thread" << endl;
+                        log() << "Unhandled non-exception in worker thread";
                     }
                     _is_done = true;
                     _owner.task_done(this);
@@ -74,23 +96,40 @@ namespace mongo {
             }
         };
 
-        ThreadPool::ThreadPool(int nThreads)
-            : _mutex("ThreadPool"), _tasksRemaining(0)
-            , _nThreads(nThreads) {
-            scoped_lock lock(_mutex);
-            while (nThreads-- > 0) {
-                Worker* worker = new Worker(*this);
-                _freeWorkers.push_front(worker);
+        ThreadPool::ThreadPool(int nThreads, const std::string& threadNamePrefix)
+            : ThreadPool(DoNotStartThreadsTag(), nThreads, threadNamePrefix) {
+            startThreads();
+        }
+
+        ThreadPool::ThreadPool(const DoNotStartThreadsTag&,
+                               int nThreads,
+                               const std::string& threadNamePrefix)
+            : _tasksRemaining(0)
+            , _nThreads(nThreads)
+            , _threadNamePrefix(threadNamePrefix) {
+        }
+
+        void ThreadPool::startThreads() {
+            boost::lock_guard<boost::mutex> lock(_mutex);
+            for (int i = 0; i < _nThreads; ++i) {
+                const std::string threadName(_threadNamePrefix.empty() ?
+                                                        _threadNamePrefix :
+                                                        str::stream() << _threadNamePrefix << i);
+                Worker* worker = new Worker(*this, threadName);
+                if (_tasks.empty()) {
+                    _freeWorkers.push_front(worker);
+                }
+                else {
+                    worker->set_task(_tasks.front());
+                    _tasks.pop_front();
+                }
             }
         }
 
         ThreadPool::~ThreadPool() {
             join();
 
-            verify(_tasks.empty());
-
-            // O(n) but n should be small
-            verify(_freeWorkers.size() == (unsigned)_nThreads);
+            invariant(_tasksRemaining == 0);
 
             while(!_freeWorkers.empty()) {
                 delete _freeWorkers.front();
@@ -99,14 +138,14 @@ namespace mongo {
         }
 
         void ThreadPool::join() {
-            scoped_lock lock(_mutex);
+            boost::unique_lock<boost::mutex> lock(_mutex);
             while(_tasksRemaining) {
-                _condition.wait(lock.boost());
+                _condition.wait(lock);
             }
         }
 
         void ThreadPool::schedule(Task task) {
-            scoped_lock lock(_mutex);
+            boost::lock_guard<boost::mutex> lock(_mutex);
 
             _tasksRemaining++;
 
@@ -121,7 +160,7 @@ namespace mongo {
 
         // should only be called by a worker from the worker thread
         void ThreadPool::task_done(Worker* worker) {
-            scoped_lock lock(_mutex);
+            boost::lock_guard<boost::mutex> lock(_mutex);
 
             if (!_tasks.empty()) {
                 worker->set_task(_tasks.front());

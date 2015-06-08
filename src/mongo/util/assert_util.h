@@ -2,39 +2,58 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
-#include <iostream>
 #include <typeinfo>
+#include <string>
 
-#include "mongo/bson/inline_decls.h"
+#include "mongo/base/status.h" // NOTE: This is safe as utils depend on base
+#include "mongo/platform/compiler.h"
+#include "mongo/logger/log_severity.h"
+#include "mongo/logger/logger.h"
+#include "mongo/logger/logstream_builder.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/debug_util.h"
 
-// MONGO_NORETURN undefed at end of file
-#ifdef __GNUC__
-# define MONGO_NORETURN __attribute__((__noreturn__))
-#else
-# define MONGO_NORETURN 
-#endif
+#define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
+#include "mongo/util/invariant.h"
+#undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
 
 namespace mongo {
 
     enum CommonErrorCodes {
-        DatabaseDifferCaseCode = 13297 ,
-        SendStaleConfigCode = 13388 ,
-        RecvStaleConfigCode = 9996
+        OkCode = 0,
+        SendStaleConfigCode = 13388 ,     // uassert( 13388 )
+        RecvStaleConfigCode = 9996,       // uassert( 9996 )
+        PrepareConfigsFailedCode = 13104, // uassert( 13104 )
+        NotMasterOrSecondaryCode = 13436, // uassert( 13436 )
+        NotMasterNoSlaveOkCode = 13435,   // uassert( 13435 )
+        NotMaster = 10107,                // uassert( 10107 )
     };
 
     class AssertionCount {
@@ -64,7 +83,7 @@ namespace mongo {
         }
         void append( BSONObjBuilder& b , const char * m = "$err" , const char * c = "code" ) const ;
         std::string toString() const;
-        bool empty() const { return msg.empty(); }        
+        bool empty() const { return msg.empty(); }
         void reset(){ msg = ""; code=-1; }
         std::string msg;
         int code;
@@ -73,10 +92,10 @@ namespace mongo {
     /** helper class that builds error strings.  lighter weight than a StringBuilder, albeit less flexible.
         NOINLINE_DECL used in the constructor implementations as we are assuming this is a cold code path when used.
 
-        example: 
+        example:
           throw UserException(123, ErrorMsg("blah", num_val));
     */
-    class ErrorMsg { 
+    class ErrorMsg {
     public:
         ErrorMsg(const char *msg, char ch);
         ErrorMsg(const char *msg, unsigned val);
@@ -88,7 +107,6 @@ namespace mongo {
     class DBException;
     std::string causedBy( const DBException& e );
     std::string causedBy( const std::string& e );
-    bool inShutdown();
 
     /** Most mongo exceptions inherit from this; this is commonly caught in most threads */
     class DBException : public std::exception {
@@ -100,11 +118,23 @@ namespace mongo {
 
         virtual const char* what() const throw() { return _ei.msg.c_str(); }
         virtual int getCode() const { return _ei.code; }
-
         virtual void appendPrefix( std::stringstream& ss ) const { }
         virtual void addContext( const std::string& str ) {
             _ei.msg = str + causedBy( _ei.msg );
         }
+
+        // Utilities for the migration to Status objects
+        static ErrorCodes::Error convertExceptionCode(int exCode);
+
+        Status toStatus(const std::string& context) const {
+            return Status(convertExceptionCode(getCode()), context + causedBy(*this));
+        }
+        Status toStatus() const {
+            return Status(convertExceptionCode(getCode()), this->what());
+        }
+
+        // context when applicable. otherwise ""
+        std::string _shard;
 
         virtual std::string toString() const;
 
@@ -127,21 +157,16 @@ namespace mongo {
 
         virtual ~AssertionException() throw() { }
 
-        virtual bool severe() { return true; }
-        virtual bool isUserAssertion() { return false; }
-
-        /* true if an interrupted exception - see KillCurrentOp */
-        bool interrupted() {
-            return _ei.code == 11600 || _ei.code == 11601;
-        }
+        virtual bool severe() const { return true; }
+        virtual bool isUserAssertion() const { return false; }
     };
 
     /* UserExceptions are valid errors that a user can cause, like out of disk space or duplicate key */
     class UserException : public AssertionException {
     public:
         UserException(int c , const std::string& m) : AssertionException( m , c ) {}
-        virtual bool severe() { return false; }
-        virtual bool isUserAssertion() { return true; }
+        virtual bool severe() const { return false; }
+        virtual bool isUserAssertion() const { return true; }
         virtual void appendPrefix( std::stringstream& ss ) const;
     };
 
@@ -149,73 +174,144 @@ namespace mongo {
     public:
         MsgAssertionException( const ExceptionInfo& ei ) : AssertionException( ei ) {}
         MsgAssertionException(int c, const std::string& m) : AssertionException( m , c ) {}
-        virtual bool severe() { return false; }
+        virtual bool severe() const { return false; }
         virtual void appendPrefix( std::stringstream& ss ) const;
     };
 
-    void asserted(const char *msg, const char *file, unsigned line) MONGO_NORETURN;
-    void wasserted(const char *msg, const char *file, unsigned line);
-    void fassertFailed( int msgid );
-    
+    MONGO_COMPILER_NORETURN void verifyFailed(const char* expr, const char* file, unsigned line);
+    MONGO_COMPILER_NORETURN void invariantOKFailed(const char* expr, const Status& status, const char *file, unsigned line);
+    void wasserted(const char* expr, const char* file, unsigned line);
+    MONGO_COMPILER_NORETURN void fassertFailed( int msgid );
+    MONGO_COMPILER_NORETURN void fassertFailedNoTrace( int msgid );
+    MONGO_COMPILER_NORETURN void fassertFailedWithStatus(
+            int msgid, const Status& status);
+    MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTrace(
+            int msgid, const Status& status);
+
     /** a "user assertion".  throws UserAssertion.  logs.  typically used for errors that a user
         could cause, such as duplicate key, disk full, etc.
     */
-    void uasserted(int msgid, const char *msg) MONGO_NORETURN;
-    void uasserted(int msgid , const std::string &msg);
+    MONGO_COMPILER_NORETURN void uasserted(int msgid, const char *msg);
+    MONGO_COMPILER_NORETURN void uasserted(int msgid , const std::string &msg);
 
-    /** reported via lasterror, but don't throw exception */
-    void uassert_nothrow(const char *msg);
-
-    /** msgassert and massert are for errors that are internal but have a well defined error text std::string.
-        a stack trace is logged.
+    /** msgassert and massert are for errors that are internal but have a well defined error text
+        std::string.  a stack trace is logged.
     */
-    void msgassertedNoTrace(int msgid, const char *msg) MONGO_NORETURN;
-    inline void msgassertedNoTrace(int msgid, const std::string& msg) { msgassertedNoTrace( msgid , msg.c_str() ); }
-    void msgasserted(int msgid, const char *msg) MONGO_NORETURN;
-    void msgasserted(int msgid, const std::string &msg);
+    MONGO_COMPILER_NORETURN void msgassertedNoTrace(int msgid, const char *msg);
+    MONGO_COMPILER_NORETURN void msgassertedNoTrace(int msgid, const std::string &msg);
+    MONGO_COMPILER_NORETURN void msgasserted(int msgid, const char *msg);
+    MONGO_COMPILER_NORETURN void msgasserted(int msgid, const std::string &msg);
 
     /* convert various types of exceptions to strings */
-    inline std::string causedBy( const char* e ){ return (std::string)" :: caused by :: " + e; }
-    inline std::string causedBy( const DBException& e ){ return causedBy( e.toString().c_str() ); }
-    inline std::string causedBy( const std::exception& e ){ return causedBy( e.what() ); }
-    inline std::string causedBy( const std::string& e ){ return causedBy( e.c_str() ); }
+    std::string causedBy( const char* e );
+    std::string causedBy( const DBException& e );
+    std::string causedBy( const std::exception& e );
+    std::string causedBy( const std::string& e );
+    std::string causedBy( const std::string* e );
+    std::string causedBy( const Status& e );
 
-    /** abends on condition failure */
-    inline void fassert( int msgid , bool testOK ) { if ( ! testOK ) fassertFailed( msgid ); }
+    /** aborts on condition failure */
+    inline void fassert(int msgid, bool testOK) {
+        if (MONGO_unlikely(!testOK)) fassertFailed(msgid);
+    }
+
+    inline void fassert(int msgid, const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            fassertFailedWithStatus(msgid, status);
+        }
+    }
+
+    inline void fassertNoTrace(int msgid, const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            fassertFailedWithStatusNoTrace(msgid, status);
+        }
+    }
 
 
     /* "user assert".  if asserts, user did something wrong, not our code */
-#define MONGO_uassert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (mongo::uasserted(msgid, msg), 0) )
+#define MONGO_uassert(msgid, msg, expr) do {                            \
+        if (MONGO_unlikely(!(expr))) {                                      \
+            ::mongo::uasserted(msgid, msg);                             \
+        }                                                               \
+    } while (false)
+
+    inline void uassertStatusOK(const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            uasserted((status.location() != 0 ? status.location() : status.code()),
+                      status.reason());
+        }
+    }
+
+    template<typename T>
+    inline T uassertStatusOK(StatusWith<T> sw) {
+        if (MONGO_unlikely(!sw.isOK())) {
+            const auto& status = sw.getStatus();
+            uasserted((status.location() != 0 ? status.location() : status.code()),
+                      status.reason());
+        }
+        return std::move(sw.getValue());
+    }
+
+    template<typename T>
+    inline T fassertStatusOK(int msgid, StatusWith<T> sw) {
+        if (MONGO_unlikely(!sw.isOK())) {
+            fassertFailedWithStatus(msgid, sw.getStatus());
+        }
+        return std::move(sw.getValue());
+    }
 
     /* warning only - keeps going */
-#define MONGO_wassert(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::wasserted(#_Expression, __FILE__, __LINE__), 0) )
+#define MONGO_wassert(_Expression) do {                                 \
+        if (MONGO_unlikely(!(_Expression))) {                               \
+            ::mongo::wasserted(#_Expression, __FILE__, __LINE__);       \
+        }                                                               \
+    } while (false)
 
     /* display a message, no context, and throw assertionexception
 
        easy way to throw an exception and log something without our stack trace
        display happening.
     */
-#define MONGO_massert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (mongo::msgasserted(msgid, msg), 0) )
+#define MONGO_massert(msgid, msg, expr) do {    \
+        if (MONGO_unlikely(!(expr))) {              \
+            ::mongo::msgasserted(msgid, msg);   \
+        }                                       \
+    } while (false)
+
+    inline void massertStatusOK(const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            msgasserted((status.location() != 0 ? status.location() : status.code()),
+                        status.reason());
+        }
+    }
+
+    inline void massertNoTraceStatusOK(const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            msgassertedNoTrace((status.location() != 0 ? status.location() : status.code()),
+                        status.reason());
+        }
+    }
+
     /* same as massert except no msgid */
-#define MONGO_verify(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::asserted(#_Expression, __FILE__, __LINE__), 0) )
-
-    /* dassert is 'debug assert' -- might want to turn off for production as these
-       could be slow.
-    */
-#if defined(_DEBUG)
-# define MONGO_dassert verify
-#else
-# define MONGO_dassert(x)
-#endif
+#define MONGO_verify(_Expression) do {                                  \
+        if (MONGO_unlikely(!(_Expression))) {                           \
+            ::mongo::verifyFailed(#_Expression, __FILE__, __LINE__);    \
+        }                                                               \
+    } while (false)
 
 
-#ifdef MONGO_EXPOSE_MACROS
-# define dassert MONGO_dassert
-# define verify MONGO_verify
-# define uassert MONGO_uassert
-# define wassert MONGO_wassert
-# define massert MONGO_massert
-#endif
+#define MONGO_invariantOK(expression) do {                                                    \
+    const ::mongo::Status _invariantOK_status = expression;                                   \
+        if (MONGO_unlikely(!_invariantOK_status.isOK())) {                                    \
+            ::mongo::invariantOKFailed(#expression, _invariantOK_status, __FILE__, __LINE__); \
+        }                                                                                     \
+    } while (false)
+
+#define verify(expression) MONGO_verify(expression)
+#define invariantOK MONGO_invariantOK
+#define uassert MONGO_uassert
+#define wassert MONGO_wassert
+#define massert MONGO_massert
 
     // some special ids that we want to duplicate
 
@@ -224,14 +320,27 @@ namespace mongo {
 
     enum { ASSERT_ID_DUPKEY = 11000 };
 
-    /* throws a uassertion with an appropriate msg */
-    void streamNotGood( int code , std::string msg , std::ios& myios ) MONGO_NORETURN;
-
-    inline void assertStreamGood(unsigned msgid, std::string msg, std::ios& myios) {
-        if( !myios.good() ) streamNotGood(msgid, msg, myios);
-    }
-
     std::string demangleName( const std::type_info& typeinfo );
+
+    /**
+     * A utility function that converts an exception to a Status.
+     * Only call this function when there is an active exception
+     * (e.g. in a catch block).
+     *
+     * Note: this technique was created by Lisa Lippincott.
+     *
+     * Example usage:
+     *
+     *   Status myFunc() {
+     *       try {
+     *           funcThatThrows();
+     *           return Status::OK();
+     *       } catch (...) {
+     *           return exceptionToStatus();
+     *       }
+     *   }
+     */
+    Status exceptionToStatus();
 
 } // namespace mongo
 
@@ -239,7 +348,7 @@ namespace mongo {
     try { \
         expression; \
     } catch ( const std::exception &e ) { \
-        stringstream ss; \
+        std::stringstream ss; \
         ss << "caught exception: " << e.what() << ' ' << __FILE__ << ' ' << __LINE__; \
         msgasserted( 13294 , ss.str() ); \
     } catch ( ... ) { \
@@ -250,7 +359,7 @@ namespace mongo {
     try { \
         expression; \
     } catch ( const std::exception &e ) { \
-        stringstream ss; \
+        std::stringstream ss; \
         ss << msg << " caught exception exception: " << e.what();   \
         msgasserted( 14043 , ss.str() );        \
     } catch ( ... ) { \
@@ -262,9 +371,29 @@ namespace mongo {
     try { \
         expression; \
     } catch ( const std::exception &e ) { \
-        problem() << "caught exception (" << e.what() << ") in destructor (" << __FUNCTION__ << ")" << endl; \
+        ::mongo::logger::LogstreamBuilder(::mongo::logger::globalLogDomain(), \
+                                          ::mongo::getThreadName(), \
+                                          ::mongo::logger::LogSeverity::Log()) \
+            << "caught exception (" << e.what() << ") in destructor (" << __FUNCTION__ \
+            << ")" << std::endl; \
     } catch ( ... ) { \
-        problem() << "caught unknown exception in destructor (" << __FUNCTION__ << ")" << endl; \
+        ::mongo::logger::LogstreamBuilder(::mongo::logger::globalLogDomain(), \
+                                          ::mongo::getThreadName(), \
+                                          ::mongo::logger::LogSeverity::Log()) \
+            << "caught unknown exception in destructor (" << __FUNCTION__ << ")" \
+            << std::endl; \
     }
 
-#undef MONGO_NORETURN
+/**
+ * The purpose of this macro is to instruct the compiler that a line of code will never be reached.
+ *
+ * Example:
+ *     // code above checks that expr can only be FOO or BAR
+ *     switch (expr) {
+ *     case FOO: { ... }
+ *     case BAR: { ... }
+ *     default:
+ *         MONGO_UNREACHABLE;
+ */
+
+#define MONGO_UNREACHABLE ::mongo::invariantFailed("Hit a MONGO_UNREACHABLE!", __FILE__, __LINE__);

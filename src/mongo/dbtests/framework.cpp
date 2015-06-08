@@ -14,41 +14,60 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/dbtests/framework.h"
 
-#ifndef _WIN32
-#include <cxxabi.h>
-#include <sys/file.h>
-#endif
+#include <string>
+#include <vector>
 
-#include <boost/program_options.hpp>
-#include <boost/filesystem/operations.hpp>
-
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/db/client.h"
-#include "mongo/db/cmdline.h"
-#include "mongo/db/dur.h"
-#include "mongo/db/instance.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/ops/update.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/framework_options.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/d_state.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
-#include "mongo/util/file_allocator.h"
+#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/version.h"
 
-namespace po = boost::program_options;
+namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
-    CmdLine cmdLine;
+    using std::endl;
+    using std::string;
 
     namespace dbtests {
 
-        void show_help_text(const char* name, po::options_description options) {
-            cout << "usage: " << name << " [options] [suite]..." << endl
-                 << options << "suite: run the specified test suite(s) only" << endl;
-        }
+        mutex globalCurrentTestNameMutex;
+        std::string globalCurrentTestName;
 
         class TestWatchDog : public BackgroundJob {
         public:
@@ -56,13 +75,21 @@ namespace mongo {
             virtual void run(){
 
                 int minutesRunning = 0;
-                std::string lastRunningTestName = ::mongo::unittest::getExecutingTestName();
+                std::string lastRunningTestName, currentTestName;
+
+                {
+                    boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
+                    lastRunningTestName = globalCurrentTestName;
+                }
 
                 while (true) {
                     sleepsecs(60);
                     minutesRunning++;
 
-                    std::string currentTestName = ::mongo::unittest::getExecutingTestName();
+                    {
+                        boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
+                        currentTestName = globalCurrentTestName;
+                    }
 
                     if (currentTestName != lastRunningTestName) {
                         minutesRunning = 0;
@@ -75,182 +102,61 @@ namespace mongo {
                     }
                     else if (minutesRunning > 1){
                         warning() << currentTestName << " has been running for more than " << minutesRunning-1 << " minutes." << endl;
+
+                        // See what is stuck
+                        getGlobalLockManager()->dump();
                     }
                 }
             }
         };
 
-        unsigned perfHist = 1;
+        int runDbTests(int argc, char** argv) {
+            frameworkGlobalParams.perfHist = 1;
+            frameworkGlobalParams.seed = time( 0 );
+            frameworkGlobalParams.runsPerTest = 1;
 
-        int runDbTests( int argc , char** argv , string default_dbpath ) {
-            unsigned long long seed = time( 0 );
-            string dbpathSpec;
-
-            po::options_description shell_options("options");
-            po::options_description hidden_options("Hidden options");
-            po::options_description cmdline_options("Command line options");
-            po::positional_options_description positional_options;
-
-            shell_options.add_options()
-            ("help,h", "show this usage information")
-            ("dbpath", po::value<string>(&dbpathSpec)->default_value(default_dbpath),
-             "db data path for this test run. NOTE: the contents of this "
-             "directory will be overwritten if it already exists")
-            ("debug", "run tests with verbose output")
-            ("list,l", "list available test suites")
-            ("bigfiles", "use big datafiles instead of smallfiles which is the default")
-            ("filter,f" , po::value<string>() , "string substring filter on test name" )
-            ("verbose,v", "verbose")
-            ("dur", "enable journaling")
-            ("nodur", "disable journaling (currently the default)")
-            ("seed", po::value<unsigned long long>(&seed), "random number seed")
-            ("perfHist", po::value<unsigned>(&perfHist), "number of back runs of perf stats to display")
-            ;
-
-            hidden_options.add_options()
-            ("suites", po::value< vector<string> >(), "test suites to run")
-            ("nopreallocj", "disable journal prealloc")
-            ;
-
-            positional_options.add("suites", -1);
-
-            cmdline_options.add(shell_options).add(hidden_options);
-
-            po::variables_map params;
-            int command_line_style = (((po::command_line_style::unix_style ^
-                                        po::command_line_style::allow_guessing) |
-                                       po::command_line_style::allow_long_disguise) ^
-                                      po::command_line_style::allow_sticky);
-
-            try {
-                po::store(po::command_line_parser(argc, argv).options(cmdline_options).
-                          positional(positional_options).
-                          style(command_line_style).run(), params);
-                po::notify(params);
-            }
-            catch (po::error &e) {
-                cout << "ERROR: " << e.what() << endl << endl;
-                show_help_text(argv[0], shell_options);
-                return EXIT_BADOPTIONS;
-            }
-
-            if (params.count("help")) {
-                show_help_text(argv[0], shell_options);
-                return EXIT_CLEAN;
-            }
-
-            bool nodur = false;
-            if( params.count("nodur") ) {
-                nodur = true;
-                cmdLine.dur = false;
-            }
-            if( params.count("dur") || cmdLine.dur ) {
-                cmdLine.dur = true;
-            }
-
-            if( params.count("nopreallocj") ) {
-                cmdLine.preallocj = false;
-            }
-
-            if (params.count("debug") || params.count("verbose") ) {
-                logLevel = 1;
-            }
-
-            if (params.count("list")) {
-                std::vector<std::string> suiteNames = mongo::unittest::getAllSuiteNames();
-                for ( std::vector<std::string>::const_iterator i = suiteNames.begin();
-                      i != suiteNames.end(); ++i ) {
-
-                    std::cout << *i << std::endl;
-                }
-                return 0;
-            }
-
-            boost::filesystem::path p(dbpathSpec);
-
-            /* remove the contents of the test directory if it exists. */
-            if (boost::filesystem::exists(p)) {
-                if (!boost::filesystem::is_directory(p)) {
-                    cout << "ERROR: path \"" << p.string() << "\" is not a directory" << endl << endl;
-                    show_help_text(argv[0], shell_options);
-                    return EXIT_BADOPTIONS;
-                }
-                boost::filesystem::directory_iterator end_iter;
-                for (boost::filesystem::directory_iterator dir_iter(p);
-                        dir_iter != end_iter; ++dir_iter) {
-                    boost::filesystem::remove_all(*dir_iter);
-                }
-            }
-            else {
-                boost::filesystem::create_directory(p);
-            }
-
-            string dbpathString = p.native_directory_string();
-            dbpath = dbpathString.c_str();
-
-            cmdLine.prealloc = false;
-
-            // dbtest defaults to smallfiles
-            cmdLine.smallfiles = true;
-            if( params.count("bigfiles") ) {
-                cmdLine.dur = true;
-            }
-
-            cmdLine.oplogSize = 10 * 1024 * 1024;
             Client::initThread("testsuite");
-            acquirePathLock();
 
-            srand( (unsigned) seed );
+            srand( (unsigned) frameworkGlobalParams.seed );
             printGitVersion();
-            printSysInfo();
-            DEV log() << "_DEBUG build" << endl;
-            if( sizeof(void*)==4 )
-                log() << "32bit" << endl;
-            log() << "random seed: " << seed << endl;
+            printOpenSSLVersion();
 
-            if( time(0) % 3 == 0 && !nodur ) {
-                cmdLine.dur = true;
-                log() << "****************" << endl;
-                log() << "running with journaling enabled to test that. dbtests will do this occasionally even if --dur is not specified." << endl;
-                log() << "****************" << endl;
-            }
+            getGlobalServiceContext()->initializeGlobalStorageEngine();
 
-            FileAllocator::get()->start();
+            // Initialize the sharding state so we can run starding tests in isolation
+            shardingState.initialize("$dummy:10000");
 
-            vector<string> suites;
-            if (params.count("suites")) {
-                suites = params["suites"].as< vector<string> >();
-            }
-
-            string filter = "";
-            if ( params.count( "filter" ) ) {
-                filter = params["filter"].as<string>();
-            }
-
-            dur::startup();
-
-            if( debug && cmdLine.dur ) {
-                log() << "_DEBUG: automatically enabling cmdLine.durOptions=8 (DurParanoid)" << endl;
-                // this was commented out.  why too slow or something? : 
-                cmdLine.durOptions |= 8;
+            // Note: ShardingState::initialize also initializes the distLockMgr.
+            auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
+                    grid.catalogManager()->getDistLockManager());
+            if (distLockMgr) {
+                distLockMgr->enablePinger(false);
             }
 
             TestWatchDog twd;
             twd.go();
 
-            int ret = ::mongo::unittest::Suite::run(suites,filter);
+            int ret = ::mongo::unittest::Suite::run(frameworkGlobalParams.suites,
+                                                    frameworkGlobalParams.filter,
+                                                    frameworkGlobalParams.runsPerTest);
 
-#if !defined(_WIN32) && !defined(__sunos__)
-            flock( lockFile, LOCK_UN );
-#endif
 
-            cc().shutdown();
-            dbexit( (ExitCode)ret ); // so everything shuts down cleanly
+            exitCleanly( (ExitCode)ret ); // so everything shuts down cleanly
             return ret;
         }
     }  // namespace dbtests
 
-    void setupSignals( bool inFork ) {}
+#ifdef _WIN32
+namespace ntservice {
+    bool shouldStartService() {
+        return false;
+    }
+}
+#endif
 
 }  // namespace mongo
 
+void mongo::unittest::onCurrentTestNameChange( const std::string &testName ) {
+    boost::lock_guard<boost::mutex> lk( mongo::dbtests::globalCurrentTestNameMutex );
+    mongo::dbtests::globalCurrentTestName = testName;
+}

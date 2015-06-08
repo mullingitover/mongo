@@ -14,42 +14,61 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "../s/chunk.h"
 #include "mongo/db/json.h"
-
-#include "dbtests.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/s/chunk_manager.h"
 
 namespace mongo {
 
+    using std::set;
+    using std::string;
+    using std::vector;
+
     class TestableChunkManager : public ChunkManager {
     public:
-        void setShardKey( const BSONObj &keyPattern ) {
-            const_cast<ShardKeyPattern&>(_key) = ShardKeyPattern( keyPattern );
+
+        TestableChunkManager(const string& ns, const ShardKeyPattern& keyPattern, bool unique)
+            : ChunkManager(ns, keyPattern, unique) {
         }
+
         void setSingleChunkForShards( const vector<BSONObj> &splitPoints ) {
-            ChunkMap &chunkMap = const_cast<ChunkMap&>( _chunkMap );
-            ChunkRangeManager &chunkRanges = const_cast<ChunkRangeManager&>( _chunkRanges );
-            set<Shard> &shards = const_cast<set<Shard>&>( _shards );
-            
             vector<BSONObj> mySplitPoints( splitPoints );
-            mySplitPoints.insert( mySplitPoints.begin(), _key.globalMin() );
-            mySplitPoints.push_back( _key.globalMax() );
+            mySplitPoints.insert( mySplitPoints.begin(), _keyPattern.getKeyPattern().globalMin() );
+            mySplitPoints.push_back( _keyPattern.getKeyPattern().globalMax() );
             
-            for( unsigned i = 1; i < mySplitPoints.size(); ++i ) {
-                string name = str::stream() << (i-1);
-                Shard shard( name, name );
-                shards.insert( shard );
-                
-                ChunkPtr chunk( new Chunk( this, mySplitPoints[ i-1 ], mySplitPoints[ i ],
-                                          shard ) );
-                chunkMap[ mySplitPoints[ i ] ] = chunk;
+            for (unsigned i = 1; i < mySplitPoints.size(); ++i) {
+                const string name = str::stream() << (i - 1);
+
+                Shard shard(name,
+                            ConnectionString(HostAndPort(name)),
+                            0 /* maxSize */,
+                            false /* draining */);
+                _shards.insert(shard);
+
+                boost::shared_ptr<Chunk> chunk(new Chunk(this,
+                                                         mySplitPoints[i - 1],
+                                                         mySplitPoints[i],
+                                                         shard));
+                _chunkMap[mySplitPoints[i]] = chunk;
             }
             
-            chunkRanges.reloadAll( chunkMap );
+            _chunkRanges.reloadAll(_chunkMap);
         }
     };
     
@@ -60,20 +79,13 @@ namespace ChunkTests {
     namespace ChunkManagerTests {
         
         typedef mongo::TestableChunkManager ChunkManager;
-        
-        class Create {
-        public:
-            void run() {
-                ChunkManager chunkManager;
-            }
-        };
-        
+
         class Base {
         public:
             virtual ~Base() {}
             void run() {
-                ChunkManager chunkManager;
-                chunkManager.setShardKey( shardKey() );
+                ShardKeyPattern shardKeyPattern(shardKey());
+                ChunkManager chunkManager("", shardKeyPattern, false);
                 chunkManager.setSingleChunkForShards( splitPointsVector() );
                 
                 set<Shard> shards;
@@ -244,7 +256,6 @@ namespace ChunkTests {
         }
         
         void setupTests() {
-            add<ChunkManagerTests::Create>();
             add<ChunkManagerTests::EmptyQuerySingleShard>();
             add<ChunkManagerTests::EmptyQueryMultiShard>();
             add<ChunkManagerTests::UniversalRangeMultiShard>();
@@ -265,6 +276,8 @@ namespace ChunkTests {
             add<ChunkManagerTests::OrEqualityUnsatisfiableInequality>();
             add<ChunkManagerTests::InMultiShard>();
         }
-    } myall;
-    
+    };
+
+    SuiteInstance<All> myAll;
+
 } // namespace ChunkTests

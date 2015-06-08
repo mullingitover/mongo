@@ -1,8 +1,8 @@
-// javajstests.cpp
+// jstests.cpp
 //
 
 /**
- *    Copyright (C) 2009 10gen Inc.
+ *    Copyright (C) 2009-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -15,32 +15,52 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "../db/instance.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
+#include <boost/scoped_ptr.hpp>
+#include <iostream>
+#include <limits>
+
+#include "mongo/base/parse_number.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/log.h"
+#include "mongo/util/timer.h"
 
-#include "../pch.h"
-#include "../scripting/engine.h"
-#include "../util/timer.h"
-
-#include "dbtests.h"
-
-namespace mongo {
-    bool dbEval(const string& dbName , BSONObj& cmd, BSONObjBuilder& result, string& errmsg);
-} // namespace mongo
+using boost::scoped_ptr;
+using std::auto_ptr;
+using std::cout;
+using std::endl;
+using std::string;
+using std::stringstream;
+using std::vector;
 
 namespace JSTests {
 
-    class Fundamental {
+    class BuiltinTests {
     public:
         void run() {
-            // By calling JavaJSImpl() inside run(), we ensure the unit test framework's
-            // signal handlers are pre-installed from JNI's perspective.  This allows
-            // JNI to catch signals generated within the JVM and forward other signals
-            // as appropriate.
-            ScriptEngine::setup();
+            // Run any tests included with the scripting engine
             globalScriptEngine->runTest();
         }
     };
@@ -48,7 +68,7 @@ namespace JSTests {
     class BasicScope {
     public:
         void run() {
-            auto_ptr<Scope> s;
+            scoped_ptr<Scope> s;
             s.reset( globalScriptEngine->newScope() );
 
             s->setNumber( "x" , 5 );
@@ -63,18 +83,15 @@ namespace JSTests {
             s->setBoolean( "b" , true );
             ASSERT( s->getBoolean( "b" ) );
 
-            if ( 0 ) {
-                s->setBoolean( "b" , false );
-                ASSERT( ! s->getBoolean( "b" ) );
-            }
+            s->setBoolean( "b" , false );
+            ASSERT( ! s->getBoolean( "b" ) );
         }
     };
 
     class ResetScope {
     public:
         void run() {
-            // Not worrying about this for now SERVER-446.
-            /*
+            /* Currently reset does not clear data in v8 or spidermonkey scopes.  See SECURITY-10
             auto_ptr<Scope> s;
             s.reset( globalScriptEngine->newScope() );
 
@@ -90,15 +107,23 @@ namespace JSTests {
     class FalseTests {
     public:
         void run() {
-            Scope * s = globalScriptEngine->newScope();
+            // Test falsy javascript values
+            scoped_ptr<Scope> s;
+            s.reset( globalScriptEngine->newScope() );
 
-            ASSERT( ! s->getBoolean( "x" ) );
+            ASSERT( ! s->getBoolean( "notSet" ) );
 
-            s->setString( "z" , "" );
-            ASSERT( ! s->getBoolean( "z" ) );
+            s->setString( "emptyString" , "" );
+            ASSERT( ! s->getBoolean( "emptyString" ) );
 
+            s->setNumber( "notANumberVal" , std::numeric_limits<double>::quiet_NaN());
+            ASSERT( ! s->getBoolean( "notANumberVal" ) );
 
-            delete s ;
+            s->setElement( "nullVal" , BSONObjBuilder().appendNull("null").obj().getField("null") );
+            ASSERT( ! s->getBoolean( "nullVal" ) );
+
+            s->setNumber( "zeroVal" , 0 );
+            ASSERT( ! s->getBoolean( "zeroVal" ) );
         }
     };
 
@@ -111,25 +136,104 @@ namespace JSTests {
             ASSERT( 5 == s->getNumber( "x" ) );
 
             s->invoke( "return 17;" , 0, 0 );
-            ASSERT( 17 == s->getNumber( "return" ) );
+            ASSERT( 17 == s->getNumber( "__returnValue" ) );
 
             s->invoke( "function(){ return 17; }" , 0, 0 );
-            ASSERT( 17 == s->getNumber( "return" ) );
+            ASSERT( 17 == s->getNumber( "__returnValue" ) );
 
             s->setNumber( "x" , 1.76 );
             s->invoke( "return x == 1.76; " , 0, 0 );
-            ASSERT( s->getBoolean( "return" ) );
+            ASSERT( s->getBoolean( "__returnValue" ) );
 
             s->setNumber( "x" , 1.76 );
             s->invoke( "return x == 1.79; " , 0, 0 );
-            ASSERT( ! s->getBoolean( "return" ) );
+            ASSERT( ! s->getBoolean( "__returnValue" ) );
 
             BSONObj obj = BSON( "" << 11.0 );
             s->invoke( "function( z ){ return 5 + z; }" , &obj, 0 );
-            ASSERT_EQUALS( 16 , s->getNumber( "return" ) );
+            ASSERT_EQUALS( 16 , s->getNumber( "__returnValue" ) );
 
             delete s;
         }
+    };
+
+    /** Installs a tee for auditing log messages in the same thread. */
+    class LogRecordingScope {
+    public:
+        LogRecordingScope() :
+            _logged(false),
+            _threadName(mongo::getThreadName()),
+            _handle(mongo::logger::globalLogDomain()->attachAppender(
+                            mongo::logger::MessageLogDomain::AppenderAutoPtr(new Tee(this)))) {
+        }
+        ~LogRecordingScope() {
+            mongo::logger::globalLogDomain()->detachAppender(_handle);
+        }
+        /** @return most recent log entry. */
+        bool logged() const { return _logged; }
+    private:
+        class Tee : public mongo::logger::MessageLogDomain::EventAppender {
+        public:
+            Tee(LogRecordingScope* scope) : _scope(scope) {}
+            virtual ~Tee() {}
+            virtual Status append(const logger::MessageEventEphemeral& event) {
+                // Don't want to consider logging by background threads.
+                if (mongo::getThreadName() == _scope->_threadName) {
+                    _scope->_logged = true;
+                }
+                return Status::OK();
+            }
+        private:
+            LogRecordingScope* _scope;
+        };
+        bool _logged;
+        const string _threadName;
+        mongo::logger::MessageLogDomain::AppenderHandle _handle;
+    };
+
+    /** Error logging in Scope::exec(). */
+    class ExecLogError {
+    public:
+        void run() {
+            Scope *scope = globalScriptEngine->newScope();
+
+            // No error is logged when reportError == false.
+            ASSERT( !scope->exec( "notAFunction()", "foo", false, false, false ) );
+            ASSERT( !_logger.logged() );
+            
+            // No error is logged for a valid statement.
+            ASSERT( scope->exec( "validStatement = true", "foo", false, true, false ) );
+            ASSERT( !_logger.logged() );
+
+            // An error is logged for an invalid statement when reportError == true.
+            ASSERT( !scope->exec( "notAFunction()", "foo", false, true, false ) );
+            ASSERT( _logger.logged() );
+        }
+    private:
+        LogRecordingScope _logger;
+    };
+    
+    /** Error logging in Scope::invoke(). */
+    class InvokeLogError {
+    public:
+        void run() {
+            Scope *scope = globalScriptEngine->newScope();
+
+            // No error is logged for a valid statement.
+            ASSERT_EQUALS( 0, scope->invoke( "validStatement = true", 0, 0 ) );
+            ASSERT( !_logger.logged() );
+
+            // An error is logged for an invalid statement.
+            try {
+                scope->invoke( "notAFunction()", 0, 0 );
+            }
+            catch(const DBException&) {
+                // ignore the exception; just test that we logged something
+            }
+            ASSERT( _logger.logged() );
+        }
+    private:
+        LogRecordingScope _logger;
     };
 
     class ObjectMapping {
@@ -141,45 +245,45 @@ namespace JSTests {
             s->setObject( "blah" , o );
 
             s->invoke( "return blah.x;" , 0, 0 );
-            ASSERT_EQUALS( 17 , s->getNumber( "return" ) );
+            ASSERT_EQUALS( 17 , s->getNumber( "__returnValue" ) );
             s->invoke( "return blah.y;" , 0, 0 );
-            ASSERT_EQUALS( "eliot" , s->getString( "return" ) );
+            ASSERT_EQUALS( "eliot" , s->getString( "__returnValue" ) );
 
             s->invoke( "return this.z;" , 0, &o );
-            ASSERT_EQUALS( "sara" , s->getString( "return" ) );
+            ASSERT_EQUALS( "sara" , s->getString( "__returnValue" ) );
 
             s->invoke( "return this.z == 'sara';" , 0, &o );
-            ASSERT_EQUALS( true , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( true , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "this.z == 'sara';" , 0, &o );
-            ASSERT_EQUALS( true , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( true , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "this.z == 'asara';" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "return this.x == 17;" , 0, &o );
-            ASSERT_EQUALS( true , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( true , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "return this.x == 18;" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function(){ return this.x == 17; }" , 0, &o );
-            ASSERT_EQUALS( true , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( true , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function(){ return this.x == 18; }" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function (){ return this.x == 17; }" , 0, &o );
-            ASSERT_EQUALS( true , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( true , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function z(){ return this.x == 18; }" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function (){ this.x == 17; }" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "function z(){ this.x == 18; }" , 0, &o );
-            ASSERT_EQUALS( false , s->getBoolean( "return" ) );
+            ASSERT_EQUALS( false , s->getBoolean( "__returnValue" ) );
 
             s->invoke( "x = 5; for( ; x <10; x++){ a = 1; }" , 0, &o );
             ASSERT_EQUALS( 10 , s->getNumber( "x" ) );
@@ -324,13 +428,13 @@ namespace JSTests {
                 BSONObj o;
                 {
                     BSONObjBuilder b;
-                    b.appendDate( "d" , 123456789 );
+                    b.appendDate( "d" , Date_t::fromMillisSinceEpoch(123456789) );
                     o = b.obj();
                 }
                 s->setObject( "x" , o );
 
                 s->invoke( "return x.d.getTime() != 12;" , 0, 0 );
-                ASSERT_EQUALS( true, s->getBoolean( "return" ) );
+                ASSERT_EQUALS( true, s->getBoolean( "__returnValue" ) );
 
                 s->invoke( "z = x.d.getTime();" , 0, 0 );
                 ASSERT_EQUALS( 123456789 , s->getNumber( "z" ) );
@@ -365,6 +469,19 @@ namespace JSTests {
                 ASSERT_EQUALS( (string)"^a" , out["a"].regex() );
                 ASSERT_EQUALS( (string)"i" , out["a"].regexFlags() );
 
+                // This regex used to cause a segfault because x isn't a valid flag for a js RegExp.
+                // Now it throws a JS exception.
+                BSONObj invalidRegex = BSON_ARRAY(BSON("regex" << BSONRegEx("asdf", "x")));
+                const char* code = "function (obj) {"
+                                   "    var threw = false;"
+                                   "    try {"
+                                   "        obj.regex;" // should throw
+                                   "    } catch(e) {"
+                                   "         threw = true;"
+                                   "    }"
+                                   "    assert(threw);"
+                                   "}";
+                ASSERT_EQUALS(s->invoke(code, &invalidRegex, NULL), 0);
             }
 
             // array
@@ -377,6 +494,22 @@ namespace JSTests {
                 s->setObject( "x", o, true );
                 out = s->getObject( "x" );
                 ASSERT_EQUALS( Array, out.firstElement().type() );
+            }
+
+            // symbol
+            {
+                // test mutable object with symbol type
+                BSONObjBuilder builder;
+                builder.appendSymbol("sym", "value");
+                BSONObj in = builder.done();
+                s->setObject( "x", in, false );
+                BSONObj out = s->getObject( "x" );
+                ASSERT_EQUALS( Symbol, out.firstElement().type() );
+
+                // readonly
+                s->setObject( "x", in, true );
+                out = s->getObject( "x" );
+                ASSERT_EQUALS( Symbol, out.firstElement().type() );
             }
 
             delete s;
@@ -392,12 +525,12 @@ namespace JSTests {
             b.appendTimestamp( "a" , 123456789 );
             b.appendMinKey( "b" );
             b.appendMaxKey( "c" );
-            b.appendTimestamp( "d" , 1234000 , 9876 );
+            b.append( "d" , Timestamp(1234, 9876) );
 
 
             {
                 BSONObj t = b.done();
-                ASSERT_EQUALS( 1234000U , t["d"].timestampTime() );
+                ASSERT_EQUALS( Date_t::fromMillisSinceEpoch(1234000) , t["d"].timestampTime() );
                 ASSERT_EQUALS( 9876U , t["d"].timestampInc() );
             }
 
@@ -406,14 +539,14 @@ namespace JSTests {
             ASSERT( s->invoke( "y = { a : z.a , b : z.b , c : z.c , d: z.d }" , 0, 0 ) == 0 );
 
             BSONObj out = s->getObject( "y" );
-            ASSERT_EQUALS( Timestamp , out["a"].type() );
+            ASSERT_EQUALS( bsonTimestamp , out["a"].type() );
             ASSERT_EQUALS( MinKey , out["b"].type() );
             ASSERT_EQUALS( MaxKey , out["c"].type() );
-            ASSERT_EQUALS( Timestamp , out["d"].type() );
+            ASSERT_EQUALS( bsonTimestamp , out["d"].type() );
 
             ASSERT_EQUALS( 9876U , out["d"].timestampInc() );
-            ASSERT_EQUALS( 1234000U , out["d"].timestampTime() );
-            ASSERT_EQUALS( 123456789U , out["a"].date() );
+            ASSERT_EQUALS( Date_t::fromMillisSinceEpoch(1234000) , out["d"].timestampTime() );
+            ASSERT_EQUALS( Date_t::fromMillisSinceEpoch(123456789) , out["a"].date() );
 
             delete s;
         }
@@ -438,7 +571,7 @@ namespace JSTests {
 
             s->setObject( "z" , o );
             s->invoke( "return z" , 0, 0 );
-            BSONObj out = s->getObject( "return" );
+            BSONObj out = s->getObject( "__returnValue" );
             ASSERT_EQUALS( 5 , out["a"].number() );
             ASSERT_EQUALS( 5.6 , out["b"].number() );
 
@@ -456,7 +589,7 @@ namespace JSTests {
 
             s->setObject( "z" , o , false );
             s->invoke( "return z" , 0, 0 );
-            out = s->getObject( "return" );
+            out = s->getObject( "__returnValue" );
             ASSERT_EQUALS( 5 , out["a"].number() );
             ASSERT_EQUALS( 5.6 , out["b"].number() );
 
@@ -506,7 +639,7 @@ namespace JSTests {
 //
 //            s->setObject( "z" , o , false );
 //            s->invoke( "return z" , BSONObj() );
-//            out = s->getObject( "return" );
+//            out = s->getObject( "__returnValue" );
 //            ASSERT_EQUALS( 3 , out["a"].number() );
 //            ASSERT_EQUALS( 4.5 , out["b"].number() );
 //
@@ -523,7 +656,6 @@ namespace JSTests {
     public:
         void run() {
             auto_ptr<Scope> s( globalScriptEngine->newScope() );
-            s->localConnect( "blah" );
             BSONObjBuilder b;
             long long val = (long long)( 0xbabadeadbeefbaddULL );
             b.append( "a", val );
@@ -584,7 +716,6 @@ namespace JSTests {
     public:
         void run() {
             auto_ptr<Scope> s( globalScriptEngine->newScope() );
-            s->localConnect( "blah" );
 
             BSONObj in;
             {
@@ -612,7 +743,7 @@ namespace JSTests {
     public:
         void run() {
             auto_ptr<Scope> s( globalScriptEngine->newScope() );
-            s->localConnect( "blah" );
+
             BSONObjBuilder b;
             // limit is 2^53
             long long val = (long long)( 9007199254740991ULL );
@@ -654,6 +785,27 @@ namespace JSTests {
         }
     };
 
+    class InvalidTimestamp {
+    public:
+        void run() {
+            auto_ptr<Scope> s( globalScriptEngine->newScope() );
+
+            // Timestamp 't' component cannot exceed max for int32_t.
+            BSONObj in;
+            {
+                BSONObjBuilder b;
+                b.bb().appendNum( static_cast<char>(bsonTimestamp) );
+                b.bb().appendStr( "a" );
+                b.bb().appendNum( std::numeric_limits<unsigned long long>::max() );
+
+                in = b.obj();
+            }
+            s->setObject( "a" , in );
+
+            ASSERT_FALSE( s->exec( "x = tojson( a ); " ,"foo" , false , true , false ) );
+        }
+    };
+
     class WeirdObjects {
     public:
 
@@ -668,8 +820,6 @@ namespace JSTests {
         void run() {
             Scope * s = globalScriptEngine->newScope();
 
-            s->localConnect( "blah" );
-
             for ( int i=5; i<100 ; i += 10 ) {
                 s->setObject( "a" , build(i) , false );
                 s->invokeSafe( "tojson( a )" , 0, 0 );
@@ -682,16 +832,72 @@ namespace JSTests {
         }
     };
 
+    /**
+     * Test exec() timeout value terminates execution (SERVER-8053)
+     */
+    class ExecTimeout {
+    public:
+        void run() {
+            scoped_ptr<Scope> scope(globalScriptEngine->newScope());
 
-    void dummy_function_to_force_dbeval_cpp_linking() {
-        BSONObj cmd;
-        BSONObjBuilder result;
-        string errmsg;
-        dbEval( "test", cmd, result, errmsg);
-        verify(0);
-    }
+            // assert timeout occurred
+            ASSERT(!scope->exec("var a = 1; while (true) { ; }",
+                                "ExecTimeout", false, true, false, 1));
+        }
+    };
 
-    DBDirectClient client;
+    /**
+     * Test exec() timeout value terminates execution (SERVER-8053)
+     */
+    class ExecNoTimeout {
+    public:
+        void run() {
+            scoped_ptr<Scope> scope(globalScriptEngine->newScope());
+
+            // assert no timeout occurred
+            ASSERT(scope->exec("var a = function() { return 1; }",
+                               "ExecNoTimeout", false, true, false, 5 * 60 * 1000));
+        }
+    };
+
+    /**
+     * Test invoke() timeout value terminates execution (SERVER-8053)
+     */
+    class InvokeTimeout {
+    public:
+        void run() {
+            scoped_ptr<Scope> scope(globalScriptEngine->newScope());
+
+            // scope timeout after 500ms
+            bool caught = false;
+            try {
+                scope->invokeSafe("function() {         "
+                                  "    while (true) { } "
+                                  "}                    ",
+                                  0, 0, 1);
+            } catch (const DBException&) {
+                caught = true;
+            }
+            ASSERT(caught);
+        }
+    };
+
+    /**
+     * Test invoke() timeout value does not terminate execution (SERVER-8053)
+     */
+    class InvokeNoTimeout {
+    public:
+        void run() {
+            scoped_ptr<Scope> scope(globalScriptEngine->newScope());
+
+            // invoke completes before timeout
+            scope->invokeSafe("function() { "
+                              "  for (var i=0; i<1; i++) { ; } "
+                              "} ",
+                              0, 0, 5 * 60 * 1000);
+        }
+    };
+
 
     class Utf8Check {
     public:
@@ -699,11 +905,15 @@ namespace JSTests {
         ~Utf8Check() { reset(); }
         void run() {
             if( !globalScriptEngine->utf8Ok() ) {
-                log() << "warning: utf8 not supported" << endl;
+                mongo::unittest::log() << "warning: utf8 not supported" << endl;
                 return;
             }
             string utf8ObjSpec = "{'_id':'\\u0001\\u007f\\u07ff\\uffff'}";
             BSONObj utf8Obj = fromjson( utf8ObjSpec );
+
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.insert( ns(), utf8Obj );
             client.eval( "unittest", "v = db.jstests.utf8check.findOne(); db.jstests.utf8check.remove( {} ); db.jstests.utf8check.insert( v );" );
             check( utf8Obj, client.findOne( ns(), BSONObj() ) );
@@ -715,9 +925,14 @@ namespace JSTests {
                 FAIL( fail.c_str() );
             }
         }
+
         void reset() {
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.dropCollection( ns() );
         }
+
         static const char *ns() { return "unittest.jstests.utf8check"; }
     };
 
@@ -728,12 +943,20 @@ namespace JSTests {
         void run() {
             if( !globalScriptEngine->utf8Ok() )
                 return;
+
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.eval( "unittest", "db.jstests.longutf8string.save( {_id:'\\uffff\\uffff\\uffff\\uffff'} )" );
         }
     private:
         void reset() {
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.dropCollection( ns() );
         }
+
         static const char *ns() { return "unittest.jstests.longutf8string"; }
     };
 
@@ -798,70 +1021,830 @@ namespace JSTests {
         }
     };
 
-    class DBRefTest {
-    public:
-        DBRefTest() {
-            _a = "unittest.dbref.a";
-            _b = "unittest.dbref.b";
-            reset();
-        }
-        ~DBRefTest() {
-            //reset();
-        }
+    namespace RoundTripTests {
 
-        void run() {
+        // Inherit from this class to test round tripping of JSON objects
+        class TestRoundTrip {
+        public:
+            virtual ~TestRoundTrip() {}
+            void run() {
+                // Insert in Javascript -> Find using DBDirectClient
 
-            client.insert( _a , BSON( "a" << "17" ) );
+                // Drop the collection
+                OperationContextImpl txn;
+                DBDirectClient client(&txn);
 
-            {
-                BSONObj fromA = client.findOne( _a , BSONObj() );
-                verify( fromA.valid() );
-                //cout << "Froma : " << fromA << endl;
-                BSONObjBuilder b;
-                b.append( "b" , 18 );
-                b.appendDBRef( "c" , "dbref.a" , fromA["_id"].__oid() );
-                client.insert( _b , b.obj() );
+                client.dropCollection( "unittest.testroundtrip" );
+
+                // Insert in Javascript
+                stringstream jsInsert;
+                jsInsert << "db.testroundtrip.insert(" << jsonIn() << ")";
+                ASSERT_TRUE( client.eval( "unittest" , jsInsert.str() ) );
+
+                // Find using DBDirectClient
+                BSONObj excludeIdProjection = BSON( "_id" << 0 );
+                BSONObj directFind = client.findOne( "unittest.testroundtrip",
+                                                                "",
+                                                                &excludeIdProjection);
+                bsonEquals( bson(), directFind );
+
+
+                // Insert using DBDirectClient -> Find in Javascript
+
+                // Drop the collection
+                client.dropCollection( "unittest.testroundtrip" );
+
+                // Insert using DBDirectClient
+                client.insert( "unittest.testroundtrip" , bson() );
+
+                // Find in Javascript
+                stringstream jsFind;
+                jsFind << "dbref = db.testroundtrip.findOne( { } , { _id : 0 } )\n"
+                                << "assert.eq(dbref, " << jsonOut() << ")";
+                ASSERT_TRUE( client.eval( "unittest" , jsFind.str() ) );
+            }
+        protected:
+
+            // Methods that must be defined by child classes
+            virtual BSONObj bson() const = 0;
+            virtual string json() const = 0;
+
+            // This can be overriden if a different meaning of equality besides woCompare is needed
+            virtual void bsonEquals( const BSONObj &expected, const BSONObj &actual ) {
+                if ( expected.woCompare( actual ) ) {
+                    ::mongo::log() << "want:" << expected.jsonString()
+                                   << " size: " << expected.objsize() << endl;
+                    ::mongo::log() << "got :" << actual.jsonString()
+                                   << " size: " << actual.objsize() << endl;
+                    ::mongo::log() << expected.hexDump() << endl;
+                    ::mongo::log() << actual.hexDump() << endl;
+                }
+                ASSERT( !expected.woCompare( actual ) );
             }
 
-            ASSERT( client.eval( "unittest" , "x = db.dbref.b.findOne(); assert.eq( 17 , x.c.fetch().a , 'ref working' );" ) );
+            // This can be overriden if the JSON representation is altered on the round trip
+            virtual string jsonIn() const {
+                return json();
+            }
+            virtual string jsonOut() const {
+                return json();
+            }
+        };
 
-            // BSON DBRef <=> JS DBPointer
-            ASSERT( client.eval( "unittest", "x = db.dbref.b.findOne(); db.dbref.b.drop(); x.c = new DBPointer( x.c.ns, x.c.id ); db.dbref.b.insert( x );" ) );
-            ASSERT_EQUALS( DBRef, client.findOne( "unittest.dbref.b", "" )[ "c" ].type() );
+        class DBRefTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                OID o;
+                memset( &o, 0, 12 );
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", o);
+                subBuilder.done();
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : DBRef( \"ns\", ObjectId( \"000000000000000000000000\" ) ) }";
+            }
 
-            // BSON Object <=> JS DBRef
-            ASSERT( client.eval( "unittest", "x = db.dbref.b.findOne(); db.dbref.b.drop(); x.c = new DBRef( x.c.ns, x.c.id ); db.dbref.b.insert( x );" ) );
-            ASSERT_EQUALS( Object, client.findOne( "unittest.dbref.b", "" )[ "c" ].type() );
-            ASSERT_EQUALS( string( "dbref.a" ), client.findOne( "unittest.dbref.b", "" )[ "c" ].embeddedObject().getStringField( "$ref" ) );
-        }
+            // A "fetch" function is added to the DBRef object when it is inserted using the
+            // constructor, so we need to compare the fields individually
+            virtual void bsonEquals( const BSONObj &expected, const BSONObj &actual ) {
+                ASSERT_EQUALS( expected["a"].type() , actual["a"].type() );
+                ASSERT_EQUALS( expected["a"]["$id"].OID() , actual["a"]["$id"].OID() );
+                ASSERT_EQUALS( expected["a"]["$ref"].String() , actual["a"]["$ref"].String() );
+            }
+        };
 
-        void reset() {
-            client.dropCollection( _a );
-            client.dropCollection( _b );
-        }
+        class DBPointerTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                OID o;
+                memset( &o, 0, 12 );
+                b.appendDBRef( "a" , "ns" , o );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : DBPointer( \"ns\", ObjectId( \"000000000000000000000000\" ) ) }";
+            }
+        };
 
-        const char * _a;
-        const char * _b;
-    };
+        class InformalDBRefTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.done();
+                return b.obj();
+            }
 
-    class InformalDBRef {
-    public:
-        void run() {
-            client.insert( ns(), BSON( "i" << 1 ) );
-            BSONObj obj = client.findOne( ns(), BSONObj() );
-            client.remove( ns(), BSONObj() );
-            client.insert( ns(), BSON( "r" << BSON( "$ref" << "jstests.informaldbref" << "$id" << obj["_id"].__oid() << "foo" << "bar" ) ) );
-            obj = client.findOne( ns(), BSONObj() );
-            ASSERT_EQUALS( "bar", obj[ "r" ].embeddedObject()[ "foo" ].str() );
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
 
-            ASSERT( client.eval( "unittest", "x = db.jstests.informaldbref.findOne(); y = { r:x.r }; db.jstests.informaldbref.drop(); y.r[ \"a\" ] = \"b\"; db.jstests.informaldbref.save( y );" ) );
-            obj = client.findOne( ns(), BSONObj() );
-            ASSERT_EQUALS( "bar", obj[ "r" ].embeddedObject()[ "foo" ].str() );
-            ASSERT_EQUALS( "b", obj[ "r" ].embeddedObject()[ "a" ].str() );
-        }
-    private:
-        static const char *ns() { return "unittest.jstests.informaldbref"; }
-    };
+            // Need to override these because the JSON doesn't actually round trip.
+            // An object with "$ref" and "$id" fields is handled specially and different on the way out.
+            virtual string jsonOut() const {
+                return "{ \"a\" : DBRef( \"ns\", \"000000000000000000000000\" ) }";
+            }
+            virtual string jsonIn() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$ref\" : \"ns\" , " <<
+                                "\"$id\" : \"000000000000000000000000\" } }";
+                return ss.str();
+            }
+        };
+
+        class InformalDBRefOIDTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                OID o;
+                memset( &o, 0, 12 );
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", o);
+                subBuilder.done();
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // Need to override these because the JSON doesn't actually round trip.
+            // An object with "$ref" and "$id" fields is handled specially and different on the way out.
+            virtual string jsonOut() const {
+                return "{ \"a\" : DBRef( \"ns\", ObjectId( \"000000000000000000000000\" ) ) }";
+            }
+            virtual string jsonIn() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$ref\" : \"ns\" , " <<
+                                "\"$id\" : ObjectId( \"000000000000000000000000\" ) } }";
+                return ss.str();
+            }
+        };
+
+        class InformalDBRefExtraFieldTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                OID o;
+                memset( &o, 0, 12 );
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", o);
+                subBuilder.append("otherfield", "value");
+                subBuilder.done();
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // Need to override these because the JSON doesn't actually round trip.
+            // An object with "$ref" and "$id" fields is handled specially and different on the way out.
+            virtual string jsonOut() const {
+                return "{ \"a\" : DBRef( \"ns\", ObjectId( \"000000000000000000000000\" ) ) }";
+            }
+            virtual string jsonIn() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$ref\" : \"ns\" , " <<
+                                "\"$id\" : ObjectId( \"000000000000000000000000\" ) , " <<
+                                "\"otherfield\" : \"value\" } }";
+                return ss.str();
+            }
+        };
+
+        class Empty : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{}";
+            }
+        };
+
+        class EmptyWithSpace : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ }";
+            }
+        };
+
+        class SingleString : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", "b" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"b\" }";
+            }
+        };
+
+        class EmptyStrings : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"\" : \"\" }";
+            }
+        };
+
+        class SingleNumber : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", 1 );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : 1 }";
+            }
+        };
+
+        class RealNumber : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                double d;
+                ASSERT_OK(parseNumberFromString( "0.7", &d ));
+                b.append( "a", d );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : 0.7 }";
+            }
+        };
+
+        class FancyNumber : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                double d;
+                ASSERT_OK(parseNumberFromString( "-4.4433e-2", &d ));
+                b.append( "a", d );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : -4.4433e-2 }";
+            }
+        };
+
+        class TwoElements : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", 1 );
+                b.append( "b", "foo" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : 1, \"b\" : \"foo\" }";
+            }
+        };
+
+        class Subobject : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", 1 );
+                BSONObjBuilder c;
+                c.append( "z", b.done() );
+                return c.obj();
+            }
+            virtual string json() const {
+                return "{ \"z\" : { \"a\" : 1 } }";
+            }
+        };
+
+        class DeeplyNestedObject : public TestRoundTrip {
+            virtual string buildJson(int depth) const {
+                if (depth == 0) {
+                    return "{\"0\":true}";
+                }
+                else {
+                    std::stringstream ss;
+                    ss << "{\"" << depth << "\":" << buildJson(depth - 1) << "}";
+                    depth--;
+                    return ss.str();
+                }
+            }
+            virtual BSONObj buildBson(int depth) const {
+                BSONObjBuilder builder;
+                if (depth == 0) {
+                    builder.append( "0", true );
+                    return builder.obj();
+                }
+                else {
+                    std::stringstream ss;
+                    ss << depth;
+                    depth--;
+                    builder.append(ss.str(), buildBson(depth));
+                    return builder.obj();
+                }
+            }
+            virtual BSONObj bson() const {
+                return buildBson(35);
+            }
+            virtual string json() const {
+                return buildJson(35);
+            }
+        };
+
+        class ArrayEmpty : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                vector< int > arr;
+                BSONObjBuilder b;
+                b.append( "a", arr );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : [] }";
+            }
+        };
+
+        class Array : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                vector< int > arr;
+                arr.push_back( 1 );
+                arr.push_back( 2 );
+                arr.push_back( 3 );
+                BSONObjBuilder b;
+                b.append( "a", arr );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : [ 1, 2, 3 ] }";
+            }
+        };
+
+        class True : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendBool( "a", true );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : true }";
+            }
+        };
+
+        class False : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendBool( "a", false );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : false }";
+            }
+        };
+
+        class Null : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendNull( "a" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : null }";
+            }
+        };
+
+        class Undefined : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendUndefined( "a" );
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // undefined values come out as null in the shell.  See SERVER-6102.
+            virtual string jsonIn() const {
+                return "{ \"a\" : undefined }";
+            }
+            virtual string jsonOut() const {
+                return "{ \"a\" : null }";
+            }
+        };
+
+        class EscapedCharacters : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", "\" \\ / \b \f \n \r \t \v" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\\\" \\\\ \\/ \\b \\f \\n \\r \\t \\v\" }";
+            }
+        };
+
+        class NonEscapedCharacters : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", "% { a z $ # '  " );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\\% \\{ \\a \\z \\$ \\# \\' \\ \" }";
+            }
+        };
+
+        class AllowedControlCharacter : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", "\x7f" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\x7f\" }";
+            }
+        };
+
+        class NumbersInFieldName : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "b1", "b" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ b1 : \"b\" }";
+            }
+        };
+
+        class EscapeFieldName : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "\n", "b" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"\\n\" : \"b\" }";
+            }
+        };
+
+        class EscapedUnicodeToUtf8 : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char u[ 7 ];
+                u[ 0 ] = 0xe0 | 0x0a;
+                u[ 1 ] = 0x80;
+                u[ 2 ] = 0x80;
+                u[ 3 ] = 0xe0 | 0x0a;
+                u[ 4 ] = 0x80;
+                u[ 5 ] = 0x80;
+                u[ 6 ] = 0;
+                b.append( "a", (char *) u );
+                BSONObj built = b.obj();
+                ASSERT_EQUALS( string( (char *) u ), built.firstElement().valuestr() );
+                return built;
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\\ua000\\uA000\" }";
+            }
+        };
+
+        class Utf8AllOnes : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char u[ 8 ];
+                u[ 0 ] = 0x01;
+
+                u[ 1 ] = 0x7f;
+
+                u[ 2 ] = 0xdf;
+                u[ 3 ] = 0xbf;
+
+                u[ 4 ] = 0xef;
+                u[ 5 ] = 0xbf;
+                u[ 6 ] = 0xbf;
+
+                u[ 7 ] = 0;
+
+                b.append( "a", (char *) u );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\\u0001\\u007f\\u07ff\\uffff\" }";
+            }
+        };
+
+        class Utf8FirstByteOnes : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char u[ 6 ];
+                u[ 0 ] = 0xdc;
+                u[ 1 ] = 0x80;
+
+                u[ 2 ] = 0xef;
+                u[ 3 ] = 0xbc;
+                u[ 4 ] = 0x80;
+
+                u[ 5 ] = 0;
+
+                b.append( "a", (char *) u );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : \"\\u0700\\uff00\" }";
+            }
+        };
+
+        class BinData : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                char z[ 3 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                z[ 2 ] = 'c';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 3, BinDataGeneral, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : BinData( 0 , \"YWJj\" ) }";
+            }
+        };
+
+        class BinDataPaddedSingle : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                char z[ 2 ];
+                z[ 0 ] = 'a';
+                z[ 1 ] = 'b';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 2, BinDataGeneral, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : BinData( 0 , \"YWI=\" ) }";
+            }
+        };
+
+        class BinDataPaddedDouble : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                char z[ 1 ];
+                z[ 0 ] = 'a';
+                BSONObjBuilder b;
+                b.appendBinData( "a", 1, BinDataGeneral, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : BinData( 0 , \"YQ==\" ) }";
+            }
+        };
+
+        class BinDataAllChars : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                unsigned char z[] = {
+                    0x00, 0x10, 0x83, 0x10, 0x51, 0x87, 0x20, 0x92, 0x8B, 0x30,
+                    0xD3, 0x8F, 0x41, 0x14, 0x93, 0x51, 0x55, 0x97, 0x61, 0x96,
+                    0x9B, 0x71, 0xD7, 0x9F, 0x82, 0x18, 0xA3, 0x92, 0x59, 0xA7,
+                    0xA2, 0x9A, 0xAB, 0xB2, 0xDB, 0xAF, 0xC3, 0x1C, 0xB3, 0xD3,
+                    0x5D, 0xB7, 0xE3, 0x9E, 0xBB, 0xF3, 0xDF, 0xBF
+                };
+                BSONObjBuilder b;
+                b.appendBinData( "a", 48, BinDataGeneral, z );
+                return b.obj();
+            }
+            virtual string json() const {
+                stringstream ss;
+                ss << "{ \"a\" : BinData( 0 , \"ABCDEFGHIJKLMNOPQRSTUVWXYZ" <<
+                                               "abcdefghijklmnopqrstuvwxyz0123456789+/\" ) }";
+                return ss.str();
+            }
+        };
+
+        class Date : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t() );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : new Date( 0 ) }";
+            }
+        };
+
+        class DateNonzero : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(100) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : new Date( 100 ) }";
+            }
+        };
+
+        class DateNegative : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendDate( "a", Date_t::fromMillisSinceEpoch(-1) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : new Date( -1 ) }";
+            }
+        };
+
+        class JSTimestamp : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a", Timestamp(20, 5) );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20, 5 ) }";
+            }
+        };
+
+        class TimestampMax : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendMaxForType( "a", mongo::bsonTimestamp );
+                BSONObj o = b.obj();
+                return o;
+            }
+            virtual string json() const {
+                Timestamp opTime = Timestamp::max();
+                stringstream ss;
+                ss << "{ \"a\" : Timestamp( " << opTime.getSecs() << ", " << opTime.getInc()
+                   << " ) }";
+                return ss.str();
+            }
+        };
+
+        class Regex : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex( "a", "b", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : /b/ }";
+            }
+        };
+
+        class RegexWithQuotes : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendRegex( "a", "\"", "" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : /\"/ }";
+            }
+        };
+
+        class UnquotedFieldName : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "a_b", 1 );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ a_b : 1 }";
+            }
+        };
+
+        class SingleQuotes : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "ab'c\"", "bb\b '\"" );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ 'ab\\'c\"' : 'bb\\b \\'\"' }";
+            }
+        };
+
+        class ObjectId : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                OID id;
+                id.init( "deadbeeff00ddeadbeeff00d" );
+                BSONObjBuilder b;
+                b.appendOID( "foo", &id );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"foo\": ObjectId( \"deadbeeff00ddeadbeeff00d\" ) }";
+            }
+        };
+
+        class NumberLong : public TestRoundTrip {
+        public:
+            virtual BSONObj bson() const {
+                return BSON( "long" << 4611686018427387904ll ); // 2**62
+            }
+            virtual string json() const {
+                return "{ \"long\": NumberLong(4611686018427387904) }";
+            }
+        };
+
+        class NumberInt : public TestRoundTrip {
+        public:
+            virtual BSONObj bson() const {
+                return BSON( "int" << static_cast<int>(100) );
+            }
+            virtual string json() const {
+                return "{ \"int\": NumberInt(100) }";
+            }
+        };
+
+        class Number : public TestRoundTrip {
+        public:
+            virtual BSONObj bson() const {
+                return BSON( "double" << 3.14 );
+            }
+            virtual string json() const {
+                return "{ \"double\": Number(3.14) }";
+            }
+        };
+
+        class UUID : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char z[] = {
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0x00, 0x00, 0x00, 0x00
+                };
+                b.appendBinData( "a" , 16 , bdtUUID , z );
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // The UUID constructor corresponds to a special BinData type
+            virtual string jsonIn() const {
+                return "{ \"a\" : UUID(\"abcdefabcdefabcdefabcdef00000000\") }";
+            }
+            virtual string jsonOut() const {
+                return "{ \"a\" : BinData(3,\"q83vq83vq83vq83vAAAAAA==\") }";
+            }
+        };
+
+        class HexData : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char z[] = {
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0x00, 0x00, 0x00, 0x00
+                };
+                b.appendBinData( "a" , 16 , BinDataGeneral , z );
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // The HexData constructor creates a BinData type from a hex string
+            virtual string jsonIn() const {
+                return "{ \"a\" : HexData(0,\"abcdefabcdefabcdefabcdef00000000\") }";
+            }
+            virtual string jsonOut() const {
+                return "{ \"a\" : BinData(0,\"q83vq83vq83vq83vAAAAAA==\") }";
+            }
+        };
+
+        class MD5 : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                unsigned char z[] = {
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF,
+                    0x00, 0x00, 0x00, 0x00
+                };
+                b.appendBinData( "a" , 16 , MD5Type , z );
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // The HexData constructor creates a BinData type from a hex string
+            virtual string jsonIn() const {
+                return "{ \"a\" : MD5(\"abcdefabcdefabcdefabcdef00000000\") }";
+            }
+            virtual string jsonOut() const {
+                return "{ \"a\" : BinData(5,\"q83vq83vq83vq83vAAAAAA==\") }";
+            }
+        };
+
+        class NullString : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.append( "x" , "a\0b" , 4 );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"x\" : \"a\\u0000b\" }";
+            }
+        };
+
+    } // namespace RoundTripTests
 
     class BinDataType {
     public:
@@ -878,7 +1861,7 @@ namespace JSTests {
 
         void run() {
             Scope * s = globalScriptEngine->newScope();
-            s->localConnect( "asd" );
+
             const char * foo = "asdas\0asdasd";
             const char * base64 = "YXNkYXMAYXNkYXNk";
 
@@ -952,9 +1935,9 @@ namespace JSTests {
 
             Timer t;
             double n = 0;
-            for ( ; n < 100000; n++ ) {
+            for ( ; n < 10000 ; n++ ) {
                 s->invoke( f , &empty, &start );
-                ASSERT_EQUALS( 11 , s->getNumber( "return" ) );
+                ASSERT_EQUALS( 11 , s->getNumber( "__returnValue" ) );
             }
             //cout << "speed1: " << ( n / t.millis() ) << " ops/ms" << endl;
         }
@@ -1007,17 +1990,103 @@ namespace JSTests {
     };
 
 
+    class InvalidStoredJS {
+    public:
+        void run() {
+            BSONObjBuilder query;
+            query.append( "_id" , "invalidstoredjs1" );
+            
+            BSONObjBuilder update;
+            update.append( "_id" , "invalidstoredjs1" );
+            update.appendCode( "value" , "function () { db.test.find().forEach(function(obj) { continue; }); }" );
+
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+            client.update( "test.system.js" , query.obj() , update.obj() , true /* upsert */ );
+
+            scoped_ptr<Scope> s( globalScriptEngine->newScope() );
+            client.eval( "test" , "invalidstoredjs1()" );
+            
+            BSONObj info;
+            BSONElement ret;
+            ASSERT( client.eval( "test" , "return 5 + 12" , info , ret ) );
+            ASSERT_EQUALS( 17 , ret.number() );
+        }
+    };
+    class NoReturnSpecified {
+        public:
+            void run() {
+                Scope * s = globalScriptEngine->newScope();
+
+                s->invoke("x=5;" , 0, 0 );
+                ASSERT_EQUALS(5, s->getNumber("__returnValue"));
+
+                s->invoke("x='test'", 0, 0);
+                ASSERT_EQUALS("test", s->getString("__returnValue"));
+
+                s->invoke("x='return'", 0, 0);
+                ASSERT_EQUALS("return", s->getString("__returnValue"));
+
+                s->invoke("return 'return'", 0, 0);
+                ASSERT_EQUALS("return", s->getString("__returnValue"));
+
+                s->invoke("x = ' return '", 0, 0);
+                ASSERT_EQUALS(" return ", s->getString("__returnValue"));
+
+                s->invoke("x = \" return \"", 0, 0);
+                ASSERT_EQUALS(" return ", s->getString("__returnValue"));
+
+                s->invoke("x = \"' return '\"", 0, 0);
+                ASSERT_EQUALS("' return '", s->getString("__returnValue"));
+
+                s->invoke("x = '\" return \"'", 0, 0);
+                ASSERT_EQUALS("\" return \"", s->getString("__returnValue"));
+
+                s->invoke(";return 5", 0, 0);
+                ASSERT_EQUALS(5, s->getNumber("__returnValue"));
+
+                s->invoke("String('return')", 0, 0);
+                ASSERT_EQUALS("return", s->getString("__returnValue"));
+
+                s->invoke("String(' return ')", 0, 0);
+                ASSERT_EQUALS(" return ", s->getString("__returnValue"));
+
+                // This should fail so we set the expected __returnValue to undefined
+                s->invoke(";x = 5", 0, 0);
+                ASSERT_EQUALS("undefined", s->getString("__returnValue"));
+
+                s->invoke("String(\"'return\")", 0, 0);
+                ASSERT_EQUALS("'return", s->getString("__returnValue"));
+
+                s->invoke("String('\"return')", 0, 0);
+                ASSERT_EQUALS("\"return", s->getString("__returnValue"));
+
+                // A fail case
+                s->invoke("return$ = 0", 0, 0);
+                // Checks to confirm that the result is NaN
+                ASSERT(s->getNumber("__returnValue") != s->getNumber("__returnValue"));
+            }
+    };
+
     class All : public Suite {
     public:
         All() : Suite( "js" ) {
+            // Initialize the Javascript interpreter
+            ScriptEngine::setup();
         }
 
         void setupTests() {
-            add< Fundamental >();
+            add< BuiltinTests >();
             add< BasicScope >();
             add< ResetScope >();
             add< FalseTests >();
             add< SimpleFunctions >();
+            add< ExecLogError >();
+            add< InvokeLogError >();
+            add< ExecTimeout >();
+            add< ExecNoTimeout >();
+            add< InvokeTimeout >();
+            add< InvokeNoTimeout >();
 
             add< ObjectMapping >();
             add< ObjectDecoding >();
@@ -1029,12 +2098,11 @@ namespace JSTests {
             add< TypeConservation >();
             add< NumberLong >();
             add< NumberLong2 >();
+            add< InvalidTimestamp >();
             add< RenameTest >();
 
             add< WeirdObjects >();
             add< CodeTests >();
-            add< DBRefTest >();
-            add< InformalDBRef >();
             add< BinDataType >();
 
             add< VarTests >();
@@ -1046,8 +2114,64 @@ namespace JSTests {
             add< LongUtf8String >();
 
             add< ScopeOut >();
+            add< InvalidStoredJS >();
+
+            add< NoReturnSpecified >();
+
+            add< RoundTripTests::DBRefTest >();
+            add< RoundTripTests::DBPointerTest >();
+            add< RoundTripTests::InformalDBRefTest >();
+            add< RoundTripTests::InformalDBRefOIDTest >();
+            add< RoundTripTests::InformalDBRefExtraFieldTest >();
+            add< RoundTripTests::Empty >();
+            add< RoundTripTests::EmptyWithSpace >();
+            add< RoundTripTests::SingleString >();
+            add< RoundTripTests::EmptyStrings >();
+            add< RoundTripTests::SingleNumber >();
+            add< RoundTripTests::RealNumber >();
+            add< RoundTripTests::FancyNumber >();
+            add< RoundTripTests::TwoElements >();
+            add< RoundTripTests::Subobject >();
+            add< RoundTripTests::DeeplyNestedObject >();
+            add< RoundTripTests::ArrayEmpty >();
+            add< RoundTripTests::Array >();
+            add< RoundTripTests::True >();
+            add< RoundTripTests::False >();
+            add< RoundTripTests::Null >();
+            add< RoundTripTests::Undefined >();
+            add< RoundTripTests::EscapedCharacters >();
+            add< RoundTripTests::NonEscapedCharacters >();
+            add< RoundTripTests::AllowedControlCharacter >();
+            add< RoundTripTests::NumbersInFieldName >();
+            add< RoundTripTests::EscapeFieldName >();
+            add< RoundTripTests::EscapedUnicodeToUtf8 >();
+            add< RoundTripTests::Utf8AllOnes >();
+            add< RoundTripTests::Utf8FirstByteOnes >();
+            add< RoundTripTests::BinData >();
+            add< RoundTripTests::BinDataPaddedSingle >();
+            add< RoundTripTests::BinDataPaddedDouble >();
+            add< RoundTripTests::BinDataAllChars >();
+            add< RoundTripTests::Date >();
+            add< RoundTripTests::DateNonzero >();
+            add< RoundTripTests::DateNegative >();
+            add< RoundTripTests::JSTimestamp >();
+            add< RoundTripTests::TimestampMax >();
+            add< RoundTripTests::Regex >();
+            add< RoundTripTests::RegexWithQuotes >();
+            add< RoundTripTests::UnquotedFieldName >();
+            add< RoundTripTests::SingleQuotes >();
+            add< RoundTripTests::ObjectId >();
+            add< RoundTripTests::NumberLong >();
+            add< RoundTripTests::NumberInt >();
+            add< RoundTripTests::Number >();
+            add< RoundTripTests::UUID >();
+            add< RoundTripTests::HexData >();
+            add< RoundTripTests::MD5 >();
+            add< RoundTripTests::NullString >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JavaJSTests
 

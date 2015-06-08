@@ -2,29 +2,51 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
-#include <boost/intrusive_ptr.hpp>
-#include <set>
+#include <boost/scoped_array.hpp>
 #include <list>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
-#include "util/atomic_int.h"
-#include "util/builder.h"
-#include "stringdata.h"
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/base/data_type.h"
+#include "mongo/base/disallow_copying.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo {
 
@@ -72,29 +94,58 @@ namespace mongo {
     class BSONObj {
     public:
 
-        /** Construct a BSONObj from data in the proper format.
-         *  Use this constructor when something else owns msgdata's buffer
-        */
-        explicit BSONObj(const char *msgdata) {
-            init(msgdata);
-        }
-
-        /** Construct a BSONObj from data in the proper format.
-         *  Use this constructor when you want BSONObj to free(holder) when it is no longer needed
-         *  BSONObj::Holder has an extra 4 bytes for a ref-count before the start of the object
-        */
-        class Holder;
-        explicit BSONObj(Holder* holder) {
-            init(holder);
-        }
-
-        explicit BSONObj(const Record *r);
+        static const char kMinBSONLength = 5;
 
         /** Construct an empty BSONObj -- that is, {}. */
-        BSONObj();
+        BSONObj() {
+            // Little endian ordering here, but that is ok regardless as BSON is spec'd to be
+            // little endian external to the system. (i.e. the rest of the implementation of
+            // bson, not this part, fails to support big endian)
+            static const char kEmptyObjectPrototype[] =
+                { /*size*/kMinBSONLength, 0, 0, 0, /*eoo*/0 };
 
-        ~BSONObj() { 
-            _objdata = 0; // defensive
+            _objdata = kEmptyObjectPrototype;
+        }
+
+        /** Construct a BSONObj from data in the proper format.
+         *  Use this constructor when something else owns bsonData's buffer
+        */
+        explicit BSONObj(const char *bsonData) {
+            init(bsonData);
+        }
+
+        explicit BSONObj(SharedBuffer ownedBuffer)
+            : _objdata(ownedBuffer.get() ? ownedBuffer.get() : BSONObj().objdata())
+            , _ownedBuffer(std::move(ownedBuffer)) {
+        }
+
+        /** Move construct a BSONObj */
+        BSONObj(BSONObj&& other)
+            : _objdata(std::move(other._objdata))
+            , _ownedBuffer(std::move(other._ownedBuffer)) {
+            other._objdata = BSONObj()._objdata; // To return to an empty state.
+            dassert(!other.isOwned());
+        }
+
+        // The explicit move constructor above will inhibit generation of the copy ctor, so
+        // explicitly request the default implementation.
+
+        /** Copy construct a BSONObj. */
+        BSONObj(const BSONObj&) = default;
+
+        /** Provide assignment semantics. We use the value taking form so that we can use copy
+         *  and swap, and consume both lvalue and rvalue references.
+         */
+        BSONObj& operator=(BSONObj otherCopy) {
+            this->swap(otherCopy);
+            return *this;
+        }
+
+        /** Swap this BSONObj with 'other' */
+        void swap(BSONObj& other) {
+            using std::swap;
+            swap(_objdata, other._objdata);
+            swap(_ownedBuffer, other._ownedBuffer);
         }
 
         /**
@@ -125,9 +176,9 @@ namespace mongo {
 
            @return true if this is in owned mode
         */
-        bool isOwned() const { return _holder.get() != 0; }
+        bool isOwned() const { return _ownedBuffer.get() != 0; }
 
-        /** assure the data buffer is under the control of this BSONObj and not a remote buffer 
+        /** assure the data buffer is under the control of this BSONObj and not a remote buffer
             @see isOwned()
         */
         BSONObj getOwned() const;
@@ -138,13 +189,19 @@ namespace mongo {
         /** Readable representation of a BSON object in an extended JSON-style notation.
             This is an abbreviated representation which might be used for logging.
         */
+        enum { maxToStringRecursionDepth = 100 };
+
         std::string toString( bool isArray = false, bool full=false ) const;
-        void toString(StringBuilder& s, bool isArray = false, bool full=false ) const;
+        void toString( StringBuilder& s, bool isArray = false, bool full=false, int depth=0 ) const;
 
         /** Properly formatted JSON string.
             @param pretty if true we try to add some lf's and indentation
         */
-        std::string jsonString( JsonStringFormat format = Strict, int pretty = 0 ) const;
+        std::string jsonString(
+            JsonStringFormat format = Strict,
+            int pretty = 0,
+            bool isArray = false
+        ) const;
 
         /** note: addFields always adds _id even if not specified */
         int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
@@ -152,7 +209,7 @@ namespace mongo {
         /** remove specified field and return a new object with the remaining fields.
             slowish as builds a full new object
          */
-        BSONObj removeField(const StringData& name) const;
+        BSONObj removeField(StringData name) const;
 
         /** returns # of top level fields in the object
            note: iterates to count the fields
@@ -166,21 +223,14 @@ namespace mongo {
             @param name field to find. supports dot (".") notation to reach into embedded objects.
              for example "x.y" means "in the nested object in field x, retrieve field y"
         */
-        BSONElement getFieldDotted(const char *name) const;
-        /** @return the specified element.  element.eoo() will be true if not found.
-            @param name field to find. supports dot (".") notation to reach into embedded objects.
-             for example "x.y" means "in the nested object in field x, retrieve field y"
-        */
-        BSONElement getFieldDotted(const std::string& name) const {
-            return getFieldDotted( name.c_str() );
-        }
+        BSONElement getFieldDotted(StringData name) const;
 
         /** Like getFieldDotted(), but expands arrays and returns all matching objects.
          *  Turning off expandLastArray allows you to retrieve nested array objects instead of
          *  their contents.
          */
-        void getFieldsDotted(const StringData& name, BSONElementSet &ret, bool expandLastArray = true ) const;
-        void getFieldsDotted(const StringData& name, BSONElementMSet &ret, bool expandLastArray = true ) const;
+        void getFieldsDotted(StringData name, BSONElementSet &ret, bool expandLastArray = true ) const;
+        void getFieldsDotted(StringData name, BSONElementMSet &ret, bool expandLastArray = true ) const;
 
         /** Like getFieldDotted(), but returns first array encountered while traversing the
             dotted fields of name.  The name variable is updated to represent field
@@ -190,9 +240,9 @@ namespace mongo {
         /** Get the field of the specified name. eoo() is true on the returned
             element if not found.
         */
-        BSONElement getField(const StringData& name) const;
+        BSONElement getField(StringData name) const;
 
-        /** Get several fields at once. This is faster than separate getField() calls as the size of 
+        /** Get several fields at once. This is faster than separate getField() calls as the size of
             elements iterated can then be calculated only once each.
             @param n number of fieldNames, and number of elements in the fields array
             @param fields if a field is found its element is stored in its corresponding position in this array.
@@ -203,11 +253,7 @@ namespace mongo {
         /** Get the field of the specified name. eoo() is true on the returned
             element if not found.
         */
-        BSONElement operator[] (const char *field) const {
-            return getField(field);
-        }
-
-        BSONElement operator[] (const std::string& field) const {
+        BSONElement operator[] (StringData field) const {
             return getField(field);
         }
 
@@ -219,30 +265,37 @@ namespace mongo {
         }
 
         /** @return true if field exists */
-        bool hasField( const char * name ) const { return !getField(name).eoo(); }
+        bool hasField( StringData name ) const { return !getField(name).eoo(); }
         /** @return true if field exists */
-        bool hasElement(const char *name) const { return hasField(name); }
+        bool hasElement(StringData name) const { return hasField(name); }
 
         /** @return "" if DNE or wrong type */
-        const char * getStringField(const char *name) const;
+        const char * getStringField(StringData name) const;
 
         /** @return subobject of the given name */
-        BSONObj getObjectField(const char *name) const;
+        BSONObj getObjectField(StringData name) const;
 
         /** @return INT_MIN if not present - does some type conversions */
-        int getIntField(const char *name) const;
+        int getIntField(StringData name) const;
 
-        /** @return false if not present 
+        /** @return false if not present
             @see BSONElement::trueValue()
          */
-        bool getBoolField(const char *name) const;
+        bool getBoolField(StringData name) const;
 
-        /**
-           sets element field names to empty string
-           If a field in pattern is missing, it is omitted from the returned
-           object.
+        /** @param pattern a BSON obj indicating a set of (un-dotted) field
+         *  names.  Element values are ignored.
+         *  @return a BSON obj constructed by taking the elements of this obj
+         *  that correspond to the fields in pattern. Field names of the
+         *  returned object are replaced with the empty string. If field in
+         *  pattern is missing, it is omitted from the returned object.
+         *
+         *  Example: if this = {a : 4 , b : 5 , c : 6})
+         *    this.extractFieldsUnDotted({a : 1 , c : 1}) -> {"" : 4 , "" : 6 }
+         *    this.extractFieldsUnDotted({b : "blah"}) -> {"" : 5}
+         *
         */
-        BSONObj extractFieldsUnDotted(BSONObj pattern) const;
+        BSONObj extractFieldsUnDotted(const BSONObj& pattern) const;
 
         /** extract items from object which match a pattern object.
             e.g., if pattern is { x : 1, y : 1 }, builds an object with
@@ -253,7 +306,8 @@ namespace mongo {
 
         BSONObj filterFieldsUndotted(const BSONObj &filter, bool inFilter) const;
 
-        BSONElement getFieldUsingIndexNames(const char *fieldName, const BSONObj &indexKey) const;
+        BSONElement getFieldUsingIndexNames(StringData fieldName,
+                                            const BSONObj &indexKey) const;
 
         /** arrays are bson objects with numeric and increasing field names
             @return true if field names are numeric and increasing
@@ -264,19 +318,64 @@ namespace mongo {
         const char *objdata() const {
             return _objdata;
         }
+
         /** @return total size of the BSON object in bytes */
-        int objsize() const { return *(reinterpret_cast<const int*>(objdata())); }
+        int objsize() const {
+            return ConstDataView(objdata()).read<LittleEndian<int>>();
+        }
 
         /** performs a cursory check on the object's size only. */
-        bool isValid() const;
+        bool isValid() const {
+            int x = objsize();
+            return x > 0 && x <= BSONObjMaxInternalSize;
+        }
 
-        /** @return if the user is a valid user doc
-            criter: isValid() no . or $ field names
+        /** @return ok if it can be stored as a valid embedded doc.
+         *  Not valid if any field name:
+         *      - contains a "."
+         *      - starts with "$"
+         *          -- unless it is a dbref ($ref/$id/[$db]/...)
          */
-        bool okForStorage() const;
+        inline bool okForStorage() const {
+            return _okForStorage(false, true).isOK();
+        }
+
+        /** Same as above with the following extra restrictions
+         *  Not valid if:
+         *      - "_id" field is a
+         *          -- Regex
+         *          -- Array
+         */
+        inline bool okForStorageAsRoot() const {
+            return _okForStorage(true, true).isOK();
+        }
+
+        /**
+         * Validates that this can be stored as an embedded document
+         * See details above in okForStorage
+         *
+         * If 'deep' is true then validation is done to children
+         *
+         * If not valid a user readable status message is returned.
+         */
+        inline Status storageValidEmbedded(const bool deep = true) const {
+            return _okForStorage(false, deep);
+        }
+
+        /**
+         * Validates that this can be stored as a document (in a collection)
+         * See details above in okForStorageAsRoot
+         *
+         * If 'deep' is true then validation is done to children
+         *
+         * If not valid a user readable status message is returned.
+         */
+        inline Status storageValid(const bool deep = true) const {
+            return _okForStorage(true, deep);
+        }
 
         /** @return true if object is empty -- i.e.,  {} */
-        bool isEmpty() const { return objsize() <= 5; }
+        bool isEmpty() const { return objsize() <= kMinBSONLength; }
 
         void dump() const;
 
@@ -311,6 +410,31 @@ namespace mongo {
 
         bool equal(const BSONObj& r) const;
 
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const BSONObj& obj) const;
+        };
+
+        /**
+         * @param otherObj
+         * @return true if 'this' is a prefix of otherObj- in other words if
+         * otherObj contains the same field names and field vals in the same
+         * order as 'this', plus optionally some additional elements.
+         */
+        bool isPrefixOf( const BSONObj& otherObj ) const;
+
+        /**
+         * @param otherObj
+         * @return returns true if the list of field names in 'this' is a prefix
+         * of the list of field names in otherObj.  Similar to 'isPrefixOf',
+         * but ignores the field values and only looks at field names.
+         */
+        bool isFieldNamePrefixOf( const BSONObj& otherObj ) const;
+
         /** This is "shallow equality" -- ints and doubles won't match.  for a
            deep equality test use woCompare (which is slower).
         */
@@ -325,15 +449,15 @@ namespace mongo {
         /** @return first field of the object */
         BSONElement firstElement() const { return BSONElement(objdata() + 4); }
 
-        /** faster than firstElement().fieldName() - for the first element we can easily find the fieldname without 
+        /** faster than firstElement().fieldName() - for the first element we can easily find the fieldname without
             computing the element size.
         */
-        const char * firstElementFieldName() const { 
+        const char * firstElementFieldName() const {
             const char *p = objdata() + 4;
             return *p == EOO ? "" : p+1;
         }
 
-        BSONType firstElementType() const { 
+        BSONType firstElementType() const {
             const char *p = objdata() + 4;
             return (BSONType) *p;
         }
@@ -345,18 +469,9 @@ namespace mongo {
         */
         bool getObjectID(BSONElement& e) const;
 
-        /** @return A hash code for the object */
-        int hash() const {
-            unsigned x = 0;
-            const char *p = objdata();
-            for ( int i = 0; i < objsize(); i++ )
-                x = x * 131 + p[i];
-            return (x & 0x7fffffff) | 0x8000000; // must be > 0
-        }
-
         // Return a version of this object where top level elements of types
         // that are not part of the bson wire protocol are replaced with
-        // string identifier equivalents.
+        // std::string identifier equivalents.
         // TODO Support conversion of element types other than min and max.
         BSONObj clientReadable() const;
 
@@ -366,9 +481,6 @@ namespace mongo {
 
         /** true unless corrupt */
         bool valid() const;
-
-        /** @return an md5 value for this object. */
-        std::string md5() const;
 
         bool operator==( const BSONObj& other ) const { return equal( other ); }
         bool operator!=(const BSONObj& other) const { return !operator==( other); }
@@ -392,7 +504,8 @@ namespace mongo {
             opELEM_MATCH = 0x12,
             opNEAR = 0x13,
             opWITHIN = 0x14,
-            opMAX_DISTANCE=0x15
+            opMAX_DISTANCE = 0x15,
+            opGEO_INTERSECTS = 0x16,
         };
 
         /** add all elements of the object to the specified vector */
@@ -400,98 +513,71 @@ namespace mongo {
         /** add all elements of the object to the specified list */
         void elems(std::list<BSONElement> &) const;
 
-        /** add all values of the object to the specified vector.  If type mismatches, exception.
-            this is most useful when the BSONObj is an array, but can be used with non-arrays too in theory.
-
-            example:
-              bo sub = y["subobj"].Obj();
-              std::vector<int> myints;
-              sub.Vals(myints);
-        */
-        template <class T>
-        void Vals(std::vector<T> &) const;
-        /** add all values of the object to the specified list.  If type mismatches, exception. */
-        template <class T>
-        void Vals(std::list<T> &) const;
-
-        /** add all values of the object to the specified vector.  If type mismatches, skip. */
-        template <class T>
-        void vals(std::vector<T> &) const;
-        /** add all values of the object to the specified list.  If type mismatches, skip. */
-        template <class T>
-        void vals(std::list<T> &) const;
-
         friend class BSONObjIterator;
         typedef BSONObjIterator iterator;
 
-        /** use something like this:
-            for( BSONObj::iterator i = myObj.begin(); i.more(); ) {
-                BSONElement e = i.next();
-                ...
-            }
-        */
+        /**
+         * These enable range-based for loops over BSONObjs:
+         *
+         *      for (BSONElement elem : BSON("a" << 1 << "b" << 2)) {
+         *          ... // Do something with elem
+         *      }
+         */
         BSONObjIterator begin() const;
+        BSONObjIterator end() const;
 
         void appendSelfToBufBuilder(BufBuilder& b) const {
             verify( objsize() );
-            b.appendBuf(reinterpret_cast<const void *>( objdata() ), objsize());
+            b.appendBuf(objdata(), objsize());
         }
 
-#pragma pack(1)
-        class Holder : boost::noncopyable {
-        private:
-            Holder(); // this class should never be explicitly created
-            AtomicUInt refCount;
-        public:
-            char data[4]; // start of object
+        template<typename T> bool coerceVector( std::vector<T>* out ) const;
 
-            void zero() { refCount.zero(); }
+        typedef SharedBuffer::Holder Holder;
 
-            // these are called automatically by boost::intrusive_ptr
-            friend void intrusive_ptr_add_ref(Holder* h) { h->refCount++; }
-            friend void intrusive_ptr_release(Holder* h) {
-#if defined(_DEBUG) // cant use dassert or DEV here
-                verify((int)h->refCount > 0); // make sure we haven't already freed the buffer
-#endif
-                if(--(h->refCount) == 0){
-#if defined(_DEBUG)
-                    unsigned sz = (unsigned&) *h->data;
-                    verify(sz < BSONObjMaxInternalSize * 3);
-                    memset(h->data, 0xdd, sz);
-#endif
-                    free(h);
-                }
-            }
-        };
-#pragma pack()
-
-    BSONObj(const BSONObj &rO):
-        _objdata(rO._objdata), _holder(rO._holder) {
+        /** Given a pointer to a region of un-owned memory containing BSON data, prefixed by
+         *  sufficient space for a BSONObj::Holder object, return a BSONObj that owns the
+         *  memory.
+         *
+         * This class will call free(holderPrefixedData), so it must have been allocated in a way
+         * that makes that valid.
+         */
+        static BSONObj takeOwnership(char* holderPrefixedData) {
+            return BSONObj(SharedBuffer::takeOwnership(holderPrefixedData));
         }
 
-    BSONObj &operator=(const BSONObj &rRHS) {
-        if (this != &rRHS) {
-            _objdata = rRHS._objdata;
-            _holder = rRHS._holder;
+        /// members for Sorter
+        struct SorterDeserializeSettings {}; // unused
+        void serializeForSorter(BufBuilder& buf) const { buf.appendBuf(objdata(), objsize()); }
+        static BSONObj deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
+            const int size = buf.peek<int>();
+            const void* ptr = buf.skip(size);
+            return BSONObj(static_cast<const char*>(ptr));
         }
-        return *this;
-    }
+        int memUsageForSorter() const {
+            // TODO consider ownedness?
+            return sizeof(BSONObj) + objsize();
+        }
 
     private:
-        const char *_objdata;
-        boost::intrusive_ptr< Holder > _holder;
-
         void _assertInvalid() const;
 
-        void init(Holder *holder) {
-            _holder = holder; // holder is now managed by intrusive_ptr
-            init(holder->data);
-        }
         void init(const char *data) {
             _objdata = data;
             if ( !isValid() )
                 _assertInvalid();
         }
+
+        /**
+         * Validate if the element is okay to be stored in a collection, maybe as the root element
+         *
+         * If 'root' is true then checks against _id are made.
+         * If 'deep' is false then do not traverse through children
+         */
+        Status _okForStorage(bool root, bool deep) const;
+
+        const char* _objdata;
+        SharedBuffer _ownedBuffer;
     };
 
     std::ostream& operator<<( std::ostream &s, const BSONObj &o );
@@ -500,6 +586,9 @@ namespace mongo {
     StringBuilder& operator<<( StringBuilder &s, const BSONObj &o );
     StringBuilder& operator<<( StringBuilder &s, const BSONElement &e );
 
+    inline void swap(BSONObj& l, BSONObj& r) {
+        l.swap(r);
+    }
 
     struct BSONArray : BSONObj {
         // Don't add anything other than forwarding constructors!!!
@@ -507,4 +596,171 @@ namespace mongo {
         explicit BSONArray(const BSONObj& obj): BSONObj(obj) {}
     };
 
+    /** iterator for a BSONObj
+
+       Note each BSONObj ends with an EOO element: so you will get more() on an empty
+       object, although next().eoo() will be true.
+
+       The BSONObj must stay in scope for the duration of the iterator's execution.
+
+       todo: Finish making this an STL-compatible iterator.
+                Need iterator_catagory et al (maybe inherit from std::iterator).
+                Need operator->
+                operator* should return a const reference not a value.
+    */
+    class BSONObjIterator {
+    public:
+        /** Create an iterator for a BSON object.
+        */
+        explicit BSONObjIterator(const BSONObj& jso) {
+            int sz = jso.objsize();
+            if ( MONGO_unlikely(sz == 0) ) {
+                _pos = _theend = 0;
+                return;
+            }
+            _pos = jso.objdata() + 4;
+            _theend = jso.objdata() + sz - 1;
+        }
+
+        BSONObjIterator( const char * start , const char * end ) {
+            _pos = start + 4;
+            _theend = end - 1;
+        }
+
+        static BSONObjIterator endOf(const BSONObj& obj) {
+            BSONObjIterator end(obj);
+            end._pos = end._theend;
+            return end;
+        }
+
+        /** @return true if more elements exist to be enumerated. */
+        bool more() { return _pos < _theend; }
+
+        /** @return true if more elements exist to be enumerated INCLUDING the EOO element which is always at the end. */
+        bool moreWithEOO() { return _pos <= _theend; }
+
+        /** @return the next element in the object. For the final element, element.eoo() will be true. */
+        BSONElement next( bool checkEnd ) {
+            verify( _pos <= _theend );
+
+            int maxLen = -1;
+            if ( checkEnd ) {
+                maxLen = _theend + 1 - _pos;
+                verify( maxLen > 0 );
+            }
+
+            BSONElement e( _pos, maxLen );
+            int esize = e.size( maxLen );
+            massert( 16446, "BSONElement has bad size", esize > 0 );
+            _pos += esize;
+
+            return e;
+        }
+
+        BSONElement next() {
+            verify( _pos <= _theend );
+            BSONElement e(_pos);
+            _pos += e.size();
+            return e;
+        }
+
+        /** pre-increment */
+        BSONObjIterator& operator++() {
+            next();
+            return *this;
+        }
+
+        /** post-increment */
+        BSONObjIterator operator++(int) {
+            BSONObjIterator oldPos = *this;
+            next();
+            return oldPos;
+        }
+
+        BSONElement operator*() {
+            verify( _pos <= _theend );
+            return BSONElement(_pos);
+        }
+
+        bool operator==(const BSONObjIterator& other) {
+            dassert(_theend == other._theend);
+            return _pos == other._pos;
+        }
+
+        bool operator!=(const BSONObjIterator& other) {
+            return !(*this == other);
+        }
+
+    private:
+        const char* _pos;
+        const char* _theend;
+    };
+
+    /** Base class implementing ordered iteration through BSONElements. */
+    class BSONIteratorSorted {
+        MONGO_DISALLOW_COPYING(BSONIteratorSorted);
+    public:
+        ~BSONIteratorSorted() {
+            verify( _fields );
+        }
+
+        bool more() {
+            return _cur < _nfields;
+        }
+
+        BSONElement next() {
+            verify( _fields );
+            if ( _cur < _nfields )
+                return BSONElement( _fields[_cur++] );
+            return BSONElement();
+        }
+
+    protected:
+        class ElementFieldCmp;
+        BSONIteratorSorted( const BSONObj &o, const ElementFieldCmp &cmp );
+
+    private:
+        const int _nfields;
+        const boost::scoped_array<const char *> _fields;
+        int _cur;
+    };
+
+    /** Provides iteration of a BSONObj's BSONElements in lexical field order. */
+    class BSONObjIteratorSorted : public BSONIteratorSorted {
+    public:
+        BSONObjIteratorSorted( const BSONObj &object );
+    };
+
+    /**
+     * Provides iteration of a BSONArray's BSONElements in numeric field order.
+     * The elements of a bson array should always be numerically ordered by field name, but this
+     * implementation re-sorts them anyway.
+     */
+    class BSONArrayIteratorSorted : public BSONIteratorSorted {
+    public:
+        BSONArrayIteratorSorted( const BSONArray &array );
+    };
+
+    inline BSONObjIterator BSONObj::begin() const { return BSONObjIterator(*this); }
+    inline BSONObjIterator BSONObj::end() const { return BSONObjIterator::endOf(*this); }
+
+    /**
+     * Similar to BOOST_FOREACH
+     *
+     * DEPRECATED: Use range-based for loops now.
+     */
+#define BSONForEach(elemName, obj) for (BSONElement elemName : (obj))
+
+    template <>
+    struct DataType::Handler<BSONObj> {
+        static Status load(BSONObj* bson, const char *ptr, size_t length, size_t *advanced,
+                           std::ptrdiff_t debug_offset);
+
+        static Status store(const BSONObj& bson, char *ptr, size_t length,
+                            size_t *advanced, std::ptrdiff_t debug_offset);
+
+        static BSONObj defaultConstruct() {
+            return BSONObj();
+        }
+    };
 }

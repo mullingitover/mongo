@@ -2,114 +2,100 @@
 
 /*    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
-#include "time_support.h"
 
 namespace mongo {
 
-#if !defined(_WIN32)
-
     /**
-     *  simple scoped timer
+     * Time tracking object.
+     *
+     * Should be of reasonably high performance, though the implementations are platform-specific.
+     * Each platform provides a distinct implementation of the now() method, and sets the
+     * _countsPerSecond static field to the constant number of ticks per second that now() counts
+     * in.  The maximum span measurable by the counter and convertible to microseconds is about 10
+     * trillion ticks.  As long as there are fewer than 100 ticks per nanosecond, timer durations of
+     * 2.5 years will be supported.  Since a typical tick duration will be under 10 per nanosecond,
+     * if not below 1 per nanosecond, this should not be an issue.
      */
     class Timer /*copyable*/ {
     public:
+        static const long long millisPerSecond = 1000;
+        static const long long microsPerSecond = 1000 * millisPerSecond;
+        static const long long nanosPerSecond = 1000 * microsPerSecond;
+
         Timer() { reset(); }
         int seconds() const { return (int)(micros() / 1000000); }
         int millis() const { return (int)(micros() / 1000); }
         int minutes() const { return seconds() / 60; }
-        
 
-        /** gets time interval and resets at the same time.  this way we can call curTimeMicros
-              once instead of twice if one wanted millis() and then reset().
-            @return time in millis
-        */
-        int millisReset() { 
-            unsigned long long now = curTimeMicros64();
-            int m = (int)((now-old)/1000);
-            old = now;
-            return m;
+
+        /** Get the time interval and reset at the same time.
+         *  @return time in milliseconds.
+         */
+        inline int millisReset() {
+            const long long nextNow = now();
+            const long long deltaMicros =
+                    static_cast<long long>((nextNow - _old) * _microsPerCount);
+
+            _old = nextNow;
+            return static_cast<int>(deltaMicros / 1000);
         }
 
-        // note: dubious that the resolution is as anywhere near as high as ethod name implies!
-        unsigned long long micros() const {
-            unsigned long long n = curTimeMicros64();
-            return n - old;
-        }
-        unsigned long long micros(unsigned long long & n) const { // returns cur time in addition to timer result
-            n = curTimeMicros64();
-            return n - old;
+        inline long long micros() const {
+            return static_cast<long long>((now() - _old) * _microsPerCount);
         }
 
-        void reset() { old = curTimeMicros64(); }
-    private:
-        unsigned long long old;
-    };
+        inline void reset() { _old = now(); }
 
-#else
-
-    class Timer /*copyable*/ {
-    public:
-        Timer() { reset(); }
-
-        int seconds() const { 
-            int s = static_cast<int>((now() - old) / countsPerSecond);
-            return s;
+        inline static void setCountsPerSecond(long long countsPerSecond) {
+            _countsPerSecond = countsPerSecond;
+            _microsPerCount = static_cast<double>(microsPerSecond) / _countsPerSecond;
         }
 
-        int millis() const { 
-            return (int)
-                    ((now() - old) * 1000.0 / countsPerSecond);
+        inline static long long getCountsPerSecond() {
+            return _countsPerSecond;
         }
-
-        int minutes() const { return seconds() / 60; }
-        
-        /** gets time interval and resets at the same time.  this way we can call curTimeMicros
-              once instead of twice if one wanted millis() and then reset().
-            @return time in millis
-        */
-        int millisReset() { 
-            unsigned long long nw = now();
-            int m = static_cast<int>((nw - old) * 1000.0 / countsPerSecond);
-            old = nw;
-            return m;
-       } 
-
-        void reset() { 
-            old = now();
-        }            
-
-        unsigned long long micros() const {
-            return (unsigned long long)
-                    ((now() - old) * 1000000.0 / countsPerSecond);
-        }
-
-        static unsigned long long countsPerSecond;
 
     private:
-        unsigned long long now() const {
-            LARGE_INTEGER i;
-            QueryPerformanceCounter(&i);
-            return i.QuadPart;
-        }
+        /**
+         * Internally, the timer counts platform-dependent ticks of some sort, and
+         * must then convert those ticks to microseconds and their ilk.  This field
+         * stores the frequency of the platform-dependent counter.
+         */
+        static long long _countsPerSecond;
 
-        unsigned long long old;
+        // Derived value from _countsPerSecond. This represents the conversion ratio
+        // from clock ticks to microseconds.
+        static double _microsPerCount;
+
+        long long now() const;
+
+        long long _old;
     };
-
-#endif
-
 }  // namespace mongo

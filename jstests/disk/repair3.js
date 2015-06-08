@@ -1,11 +1,11 @@
 // test --repairpath on another partition
 
 var baseName = "jstests_disk_repair3";
-var repairbase = "/data/db/repairpartitiontest"
+var repairbase = MongoRunner.dataDir + "/repairpartitiontest"
 var repairpath = repairbase + "/dir"
 
 doIt = false;
-files = listFiles( "/data/db" );
+files = listFiles( MongoRunner.dataDir );
 for ( i in files ) {
     if ( files[ i ].name == repairbase ) {
         doIt = true;
@@ -20,7 +20,7 @@ if ( !doIt ) {
 if ( doIt ) {
 
     port = allocatePorts( 1 )[ 0 ];
-    dbpath = "/data/db/" + baseName + "/";
+    dbpath = MongoRunner.dataPath + baseName + "/";
 
     resetDbpath( dbpath );
     resetDbpath( repairpath );
@@ -39,7 +39,7 @@ if ( doIt ) {
     }
 
     check();
-    stopMongod( port );
+    MongoRunner.stopMongod( port );
 
     resetDbpath( repairpath );
     rc = runMongoProgram( "mongod", "--nssize", "8", "--noprealloc", "--smallfiles", "--repair", "--port", port, "--dbpath", dbpath, "--repairpath", repairpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );
@@ -47,6 +47,6 @@ if ( doIt ) {
     m = startMongoProgram( "mongod", "--nssize", "8", "--noprealloc", "--smallfiles", "--port", port, "--dbpath", dbpath, "--repairpath", repairpath, "--nohttpinterface", "--bind_ip", "127.0.0.1" );
     db = m.getDB( baseName );
     check();
-    stopMongod( port );
+    MongoRunner.stopMongod( port );
 
 }

@@ -1,0 +1,32 @@
+# -*- mode: python -*-
+
+Import("env")
+
+env.Library(
+    target='top',
+    source=[
+        'top.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.CppUnitTest(
+    target='top_test',
+    source=[
+        'top_test.cpp',
+    ],
+    LIBDEPS=[
+        'top',
+    ],
+)
+
+env.Library(
+    target='counters',
+    source=[
+        'counters.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)

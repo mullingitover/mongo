@@ -15,29 +15,52 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
-#include "../util/net/miniwebserver.h"
-#include "../util/mongoutils/html.h"
-#include "../util/md5.hpp"
-#include "instance.h"
-#include "dbwebserver.h"
-#include "dbhelpers.h"
-#include "repl.h"
-#include "replutil.h"
-#include "clientcursor.h"
-#include "background.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "restapi.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/restapi.h"
+
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/background.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/dbwebserver.h"
+#include "mongo/db/repl/master_slave.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/util/log.h"
+#include "mongo/util/md5.hpp"
+#include "mongo/util/mongoutils/html.h"
+#include "mongo/util/net/miniwebserver.h"
 
 namespace mongo {
 
-    extern const char *replInfo;
     bool getInitialSyncCompleted();
 
-    using namespace bson;
-    using namespace mongoutils::html;
+    using std::auto_ptr;
+    using std::string;
+    using std::stringstream;
+    using std::endl;
+    using std::vector;
+
+    using namespace html;
 
     class RESTHandler : public DbWebHandler {
     public:
@@ -49,9 +72,12 @@ namespace mongo {
                 url.find_last_of( '/' ) > 0;
         }
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
+
+            DBDirectClient db( txn );
 
             string::size_type first = url.find( "/" , 1 );
             if ( first == string::npos ) {
@@ -89,17 +115,17 @@ namespace mongo {
 
             if ( method == "GET" ) {
                 responseCode = 200;
-                html = handleRESTQuery( fullns , action , params , responseCode , ss  );
+                html = handleRESTQuery(txn, fullns, action, params, responseCode, ss);
             }
             else if ( method == "POST" ) {
                 responseCode = 201;
-                handlePost( fullns , MiniWebServer::body( rq ) , params , responseCode , ss  );
+                handlePost(txn, fullns, MiniWebServer::body(rq), params, responseCode, ss);
             }
             else {
                 responseCode = 400;
                 headers.push_back( "X_err: bad request" );
                 ss << "don't know how to handle a [" << method << "]";
-                out() << "don't know how to handle a [" << method << "]" << endl;
+                log() << "don't know how to handle a [" << method << "]" << endl;
             }
 
             if( html )
@@ -110,7 +136,12 @@ namespace mongo {
             responseMsg = ss.str();
         }
 
-        bool handleRESTQuery( string ns , string action , BSONObj & params , int & responseCode , stringstream & out ) {
+        bool handleRESTQuery( OperationContext* txn,
+                              const std::string& ns,
+                              const std::string& action,
+                              BSONObj & params,
+                              int & responseCode,
+                              stringstream & out ) {
             Timer t;
 
             int html = _getOption( params["html"] , 0 );
@@ -129,7 +160,7 @@ namespace mongo {
             while ( i.more() ) {
                 BSONElement e = i.next();
                 string name = e.fieldName();
-                if ( ! name.find( "filter_" ) == 0 )
+                if ( name.find( "filter_" ) != 0 )
                     continue;
 
                 string field = name.substr(7);
@@ -146,6 +177,8 @@ namespace mongo {
             }
 
             BSONObj query = queryBuilder.obj();
+
+            DBDirectClient db(txn);
             auto_ptr<DBClientCursor> cursor = db.query( ns.c_str() , query, num , skip );
             uassert( 13085 , "query failed for dbwebserver" , cursor.get() );
 
@@ -208,9 +241,16 @@ namespace mongo {
         }
 
         // TODO Generate id and revision per couch POST spec
-        void handlePost( string ns, const char *body, BSONObj& params, int & responseCode, stringstream & out ) {
+        void handlePost( OperationContext* txn,
+                         const std::string& ns,
+                         const char *body,
+                         BSONObj& params,
+                         int & responseCode,
+                         stringstream & out ) {
             try {
                 BSONObj obj = fromjson( body );
+
+                DBDirectClient db(txn);
                 db.insert( ns.c_str(), obj );
             }
             catch ( ... ) {
@@ -230,39 +270,11 @@ namespace mongo {
                 return atoi( e.valuestr() );
             return def;
         }
-
-        DBDirectClient db;
-
     } restHandler;
 
-    void openAdminDb() { 
-        {
-            readlocktryassert rl(/*"admin.system.users", */10000);
-            if( dbHolder().get("admin.system.users",dbpath) )
-                return;
-        }
-
-        writelocktry wl(10000);
-        verify( wl.got() );
-        Client::Context cx( "admin.system.users", dbpath, false );
-    }
-
-    bool RestAdminAccess::haveAdminUsers() const {
-        openAdminDb();
-        readlocktryassert rl(/*"admin.system.users", */10000);
-        Client::Context cx( "admin.system.users", dbpath, false );
-        return ! Helpers::isEmpty("admin.system.users", false);
-    }
-
-    BSONObj RestAdminAccess::getAdminUser( const string& username ) const {
-        openAdminDb();
-        Client::GodScope gs;
-        readlocktryassert rl(/*"admin.system.users", */10000);
-        Client::Context cx( "admin.system.users" );
-        BSONObj user;
-        if ( Helpers::findOne( "admin.system.users" , BSON( "user" << username ) , user ) )
-            return user.copy();
-        return BSONObj();
+    bool RestAdminAccess::haveAdminUsers(OperationContext* txn) const {
+        AuthorizationSession* authzSession = AuthorizationSession::get(txn->getClient());
+        return authzSession->getAuthorizationManager().hasAnyPrivilegeDocuments(txn);
     }
 
     class LowLevelMongodStatus : public WebStatusPlugin {
@@ -272,18 +284,22 @@ namespace mongo {
         virtual void init() {}
 
         void _gotLock( int millis , stringstream& ss ) {
+            const repl::ReplSettings& replSettings =
+                    repl::getGlobalReplicationCoordinator()->getSettings();
             ss << "<pre>\n";
             ss << "time to get readlock: " << millis << "ms\n";
-            ss << "# databases: " << dbHolder().sizeInfo() << '\n';
-            ss << "# Cursors: " << ClientCursor::numCursors() << '\n';
+            ss << "# Cursors: " << ClientCursor::totalOpen() << '\n';
             ss << "replication: ";
-            if( *replInfo )
-                ss << "\nreplInfo:  " << replInfo << "\n\n";
-            if( replSet ) {
-                ss << a("", "see replSetGetStatus link top of page") << "--replSet </a>" << cmdLine._replSet;
+            if (*repl::replInfo)
+                ss << "\nreplInfo:  " << repl::replInfo << "\n\n";
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() == 
+                    repl::ReplicationCoordinator::modeReplSet) {
+                ss << a("", "see replSetGetStatus link top of page") << "--replSet </a>"
+                   << replSettings.replSet;
             }
-            if ( replAllDead )
-                ss << "\n<b>replication replAllDead=" << replAllDead << "</b>\n";
+            // TODO(dannenberg) replAllDead is bad and should be removed when masterslave is removed
+            if (repl::replAllDead)
+                ss << "\n<b>replication replAllDead=" << repl::replAllDead << "</b>\n";
             else {
                 ss << "\nmaster: " << replSettings.master << '\n';
                 ss << "slave:  " << replSettings.slave << '\n';
@@ -294,15 +310,16 @@ namespace mongo {
             ss << "</pre>\n";
         }
 
-        virtual void run( stringstream& ss ) {
+        virtual void run(OperationContext* txn, stringstream& ss ) {
             Timer t;
-            readlocktry lk( 300 );
-            if ( lk.got() ) {
-                _gotLock( t.millis() , ss );
+            Lock::GlobalLock globalSLock(txn->lockState(), MODE_S, 300);
+            if (globalSLock.isLocked()) {
+                _gotLock(t.millis(), ss);
             }
             else {
                 ss << "\n<b>timed out getting lock</b>\n";
             }
         }
+
     } lowLevelMongodStatus;
 }

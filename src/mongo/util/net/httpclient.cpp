@@ -2,38 +2,57 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "httpclient.h"
-#include "sock.h"
-#include "message.h"
-#include "message_port.h"
-#include "../mongoutils/str.h"
-#include "../../bson/util/builder.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/util/net/httpclient.h"
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
+#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/message.h"
+#include "mongo/util/net/message_port.h"
+#include "mongo/util/net/sock.h"
+#include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     //#define HD(x) cout << x << endl;
 #define HD(x)
 
 
-    int HttpClient::get( string url , Result * result ) {
+    int HttpClient::get( const std::string& url , Result * result ) {
         return _go( "GET" , url , 0 , result );
     }
 
-    int HttpClient::post( string url , string data , Result * result ) {
+    int HttpClient::post( const std::string& url , const std::string& data , Result * result ) {
         return _go( "POST" , url , data.c_str() , result );
     }
 
@@ -94,6 +113,7 @@ namespace mongo {
         }
 
         SockAddr addr( server.c_str() , port );
+        uassert( 15000 ,  "server socket addr is invalid" , addr.isValid() );
         HD( "addr: " << addr.toString() );
 
         Socket sock;
@@ -101,9 +121,11 @@ namespace mongo {
             return -1;
         
         if ( ssl ) {
-#ifdef MONGO_SSL
-            _checkSSLManager();
-            sock.secure( _sslManager.get() );
+#ifdef MONGO_CONFIG_SSL
+            // pointer to global singleton instance
+            SSLManagerInterface* mgr = getSSLManager();
+
+            sock.secure(mgr, "");
 #else
             uasserted( 15862 , "no ssl support" );
 #endif
@@ -128,11 +150,15 @@ namespace mongo {
         if ( result )
             sb << buf;
 
-        while ( ( got = sock.unsafe_recv( buf , 4096 ) ) > 0) {
-            buf[got] = 0;
-            if ( result )
-                sb << buf;
-        }
+        // SERVER-8864, unsafe_recv will throw when recv returns 0 indicating closed socket.
+        try {
+            while ( ( got = sock.unsafe_recv( buf , 4096 ) ) > 0) {
+                buf[got] = 0;
+                if ( result )
+                    sb << buf;
+            }
+        } catch (const SocketException&) {}
+
 
         if ( result ) {
             result->_init( rc , sb.str() );
@@ -168,11 +194,5 @@ namespace mongo {
 
         _body = entire;
     }
-
-#ifdef MONGO_SSL
-    void HttpClient::_checkSSLManager() {
-        _sslManager.reset( new SSLManager( true ) );
-    }
-#endif
 
 }

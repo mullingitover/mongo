@@ -1,51 +1,68 @@
-// grid.h
-
 /**
-*    Copyright (C) 2010 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ *    Copyright (C) 2010-2015 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/shared_ptr.hpp>
+#include <string>
+#include <vector>
 
-#include "../util/time_support.h"
-#include "../util/concurrency/mutex.h"
-
-#include "config.h"  // DBConfigPtr
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+    class BSONObj;
+    class CatalogCache;
+    class CatalogManager;
+    class DBConfig;
+    class SettingsType;
+    class ShardRegistry;
+    template<typename T> class StatusWith;
+
+
     /**
-     * stores meta-information about the grid
-     * TODO: used shard_ptr for DBConfig pointers
+     * Holds the global sharding context. Single instance exists for a running server. Exists on
+     * both MongoD and MongoS.
      */
     class Grid {
     public:
-        Grid() : _lock( "Grid" ) , _allowLocalShard( true ) { }
+        Grid();
 
         /**
-         * gets the config the db.
-         * will return an empty DBConfig if not in db already
+         * Called at startup time so the catalog manager can be set. Should be called only once
+         * for the lifetime of the grid object. Takes ownership of the passed in pointer.
          */
-        DBConfigPtr getDBConfig( string ns , bool create=true , const string& shardNameHint="" );
+        void setCatalogManager(std::unique_ptr<CatalogManager> catalogManager);
 
         /**
-         * removes db entry.
-         * on next getDBConfig call will fetch from db
+         * Implicitly creates the specified database as non-sharded.
          */
-        void removeDB( string db );
+        StatusWith<boost::shared_ptr<DBConfig>> implicitCreateDb(const std::string& dbName);
 
         /**
          * @return true if shards and config servers are allowed to use 'localhost' in address
@@ -58,76 +75,27 @@ namespace mongo {
         void setAllowLocalHost( bool allow );
 
         /**
-         *
-         * addShard will create a new shard in the grid. It expects a mongod process to be runing
-         * on the provided address. Adding a shard that is a replica set is supported.
-         *
-         * @param name is an optional string with the name of the shard. if ommited, grid will
-         *        generate one and update the parameter.
-         * @param servers is the connection string of the shard being added
-         * @param maxSize is the optional space quota in bytes. Zeros means there's no limitation to
-         *        space usage
-         * @param errMsg is the error description in case the operation failed.
-         * @return true if shard was successfully added.
+         * Returns true if the balancer should be running. Caller is responsible
+         * for making sure settings has the balancer key.
          */
-        bool addShard( string* name , const ConnectionString& servers , long long maxSize , string& errMsg );
+        bool shouldBalance(const SettingsType& balancerSettings) const;
 
         /**
-         * @return true if the config database knows about a host 'name'
+         * Returns true if the config server settings indicate that the balancer should be active.
          */
-        bool knowAboutShard( const string& name ) const;
+        bool getConfigShouldBalance() const;
 
-        /**
-         * @return true if the chunk balancing functionality is enabled
-         */
-        bool shouldBalance( const string& ns = "" ) const;
-
-        /**
-         * 
-         * Obtain grid configuration and settings data.
-         *
-         * @param name identifies a particular type of configuration data.
-         * @return a BSON object containing the requested data.
-         */
-        BSONObj getConfigSetting( string name ) const;
-
-        unsigned long long getNextOpTime() const;
-        
-        void flushConfig();
-
-        // exposed methods below are for testing only
-
-        /**
-         * @param balancerDoc bson that may contain a window of time for the balancer to work
-         *        format { ... , activeWindow: { start: "8:30" , stop: "19:00" } , ... }
-         * @return true if there is no window of time specified for the balancer or it we're currently in it
-         */
-        static bool _inBalancingWindow( const BSONObj& balancerDoc , const boost::posix_time::ptime& now );
+        CatalogManager* catalogManager() const { return _catalogManager.get(); }
+        CatalogCache* catalogCache() const { return _catalogCache.get(); }
+        ShardRegistry* shardRegistry() const { return _shardRegistry.get(); }
 
     private:
-        mongo::mutex              _lock;            // protects _databases; TODO: change to r/w lock ??
-        map<string, DBConfigPtr > _databases;       // maps ns to DBConfig's
-        bool                      _allowLocalShard; // can 'localhost' be used in shard addresses?
+        std::unique_ptr<CatalogManager> _catalogManager;
+        std::unique_ptr<CatalogCache> _catalogCache;
+        std::unique_ptr<ShardRegistry> _shardRegistry;
 
-        /**
-         * @param name is the chose name for the shard. Parameter is mandatory.
-         * @return true if it managed to generate a shard name. May return false if (currently)
-         * 10000 shard
-         */
-        bool _getNewShardName( string* name ) const;
-
-        /**
-         * @return whether a give dbname is used for shard "local" databases (e.g., admin or local)
-         */
-        static bool _isSpecialLocalDB( const string& dbName );
-
-        /**
-         * @param balancerDoc bson that may contain a marker to stop the balancer
-         *        format { ... , stopped: [ "true" | "false" ] , ... }
-         * @return true if the marker is present and is set to true
-         */
-        static bool _balancerStopped( const BSONObj& balancerDoc );
-
+        // can 'localhost' be used in shard addresses?
+        bool _allowLocalShard;
     };
 
     extern Grid grid;

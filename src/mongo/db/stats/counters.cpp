@@ -13,15 +13,70 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "pch.h"
-#include "../jsobj.h"
-#include "counters.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/stats/counters.h"
+
+#include "mongo/db/jsobj.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+
     OpCounters::OpCounters() {}
+
+    void OpCounters::incInsertInWriteLock(int n) {
+        RARELY _checkWrap();
+        _insert.fetchAndAdd(n);
+    }
+
+    void OpCounters::gotInsert() {
+        RARELY _checkWrap();
+        _insert.fetchAndAdd(1);
+    }
+
+    void OpCounters::gotQuery() {
+        RARELY _checkWrap();
+        _query.fetchAndAdd(1);
+    }
+
+    void OpCounters::gotUpdate() {
+        RARELY _checkWrap();
+        _update.fetchAndAdd(1);
+    }
+
+    void OpCounters::gotDelete() {
+        RARELY _checkWrap();
+        _delete.fetchAndAdd(1);
+    }
+
+    void OpCounters::gotGetMore() {
+        RARELY _checkWrap();
+        _getmore.fetchAndAdd(1);
+    }
+
+    void OpCounters::gotCommand() {
+        RARELY _checkWrap();
+        _command.fetchAndAdd(1);
+    }
 
     void OpCounters::gotOp( int op , bool isCommand ) {
         switch ( op ) {
@@ -44,117 +99,37 @@ namespace mongo {
         }
     }
 
-    BSONObj OpCounters::getObj() {
+    void OpCounters::_checkWrap() {
         const unsigned MAX = 1 << 30;
-        RARELY {
-            bool wrap =
-            _insert.get() > MAX ||
-            _query.get() > MAX ||
-            _update.get() > MAX ||
-            _delete.get() > MAX ||
-            _getmore.get() > MAX ||
-            _command.get() > MAX;
-
-            if ( wrap ) {
-                _insert.zero();
-                _query.zero();
-                _update.zero();
-                _delete.zero();
-                _getmore.zero();
-                _command.zero();
-            }
-
+        
+        bool wrap =
+            _insert.loadRelaxed() > MAX ||
+            _query.loadRelaxed() > MAX ||
+            _update.loadRelaxed() > MAX ||
+            _delete.loadRelaxed() > MAX ||
+            _getmore.loadRelaxed() > MAX ||
+            _command.loadRelaxed() > MAX;
+        
+        if ( wrap ) {
+            _insert.store(0);
+            _query.store(0);
+            _update.store(0);
+            _delete.store(0);
+            _getmore.store(0);
+            _command.store(0);
         }
+    }
+
+    BSONObj OpCounters::getObj() const {
         BSONObjBuilder b;
-        {
-            b.append( "insert" , _insert.get() );
-            b.append( "query" , _query.get() );
-            b.append( "update" , _update.get() );
-            b.append( "delete" , _delete.get() );
-            b.append( "getmore" , _getmore.get() );
-            b.append( "command" , _command.get() );
-        }
+        b.append( "insert" , _insert.loadRelaxed() );
+        b.append( "query" , _query.loadRelaxed() );
+        b.append( "update" , _update.loadRelaxed() );
+        b.append( "delete" , _delete.loadRelaxed() );
+        b.append( "getmore" , _getmore.loadRelaxed() );
+        b.append( "command" , _command.loadRelaxed() );
         return b.obj();
     }
-
-    IndexCounters::IndexCounters() {
-        _memSupported = _pi.blockCheckSupported();
-
-        _btreeMemHits = 0;
-        _btreeMemMisses = 0;
-        _btreeAccesses = 0;
-
-
-        _maxAllowed = ( numeric_limits< long long >::max() ) / 2;
-        _resets = 0;
-
-        _sampling = 0;
-        _samplingrate = 100;
-    }
-
-    void IndexCounters::append( BSONObjBuilder& b ) {
-        if ( ! _memSupported ) {
-            b.append( "note" , "not supported on this platform" );
-            return;
-        }
-
-        BSONObjBuilder bb( b.subobjStart( "btree" ) );
-        bb.appendNumber( "accesses" , _btreeAccesses );
-        bb.appendNumber( "hits" , _btreeMemHits );
-        bb.appendNumber( "misses" , _btreeMemMisses );
-
-        bb.append( "resets" , _resets );
-
-        bb.append( "missRatio" , (_btreeAccesses ? (_btreeMemMisses / (double)_btreeAccesses) : 0) );
-
-        bb.done();
-
-        if ( _btreeAccesses > _maxAllowed ) {
-            _btreeAccesses = 0;
-            _btreeMemMisses = 0;
-            _btreeMemHits = 0;
-            _resets++;
-        }
-    }
-
-    FlushCounters::FlushCounters()
-        : _total_time(0)
-        , _flushes(0)
-        , _last()
-    {}
-
-    void FlushCounters::flushed(int ms) {
-        _flushes++;
-        _total_time += ms;
-        _last_time = ms;
-        _last = jsTime();
-    }
-
-    void FlushCounters::append( BSONObjBuilder& b ) {
-        b.appendNumber( "flushes" , _flushes );
-        b.appendNumber( "total_ms" , _total_time );
-        b.appendNumber( "average_ms" , (_flushes ? (_total_time / double(_flushes)) : 0.0) );
-        b.appendNumber( "last_ms" , _last_time );
-        b.append("last_finished", _last);
-    }
-
-
-    void GenericCounter::hit( const string& name , int count ) {
-        scoped_lock lk( _mutex );
-        _counts[name]++;
-    }
-
-    BSONObj GenericCounter::getObj() {
-        BSONObjBuilder b(128);
-        {
-            mongo::mutex::scoped_lock lk( _mutex );
-            for ( map<string,long long>::iterator i=_counts.begin(); i!=_counts.end(); i++ ) {
-                b.appendNumber( i->first , i->second );
-            }
-        }
-        return b.obj();
-    }
-
 
     void NetworkCounter::hit( long long bytesIn , long long bytesOut ) {
         const long long MAX = 1ULL << 60;
@@ -190,8 +165,6 @@ namespace mongo {
 
     OpCounters globalOpCounters;
     OpCounters replOpCounters;
-    IndexCounters globalIndexCounters;
-    FlushCounters globalFlushCounters;
     NetworkCounter networkCounter;
 
 }

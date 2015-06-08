@@ -1,28 +1,54 @@
-// listen.h
+// listen.cpp
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
-#include "pch.h"
-#include "listen.h"
-#include "message_port.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
+
+#include "mongo/util/net/listen.h"
+
+#include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/config.h"
+#include "mongo/db/server_options.h"
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
+#include "mongo/util/net/message_port.h"
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/scopeguard.h"
 
 #ifndef _WIN32
 
-# ifndef __sunos__
+# ifndef __sun
 #  include <ifaddrs.h>
 # endif
 # include <sys/resource.h>
@@ -36,7 +62,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
-#ifdef __openbsd__
+#ifdef __OpenBSD__
 # include <sys/uio.h>
 #endif
 
@@ -50,10 +76,11 @@
 
 namespace mongo {
 
+    using boost::shared_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
-    void checkTicketNumbers();
-
-    
     // ----- Listener -------
 
     const Listener* Listener::_timeTracker;
@@ -88,7 +115,8 @@ namespace mongo {
             out.push_back(sa);
 
 #ifndef _WIN32
-            if (useUnixSockets && (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
+            if (sa.isValid() && useUnixSockets &&
+                    (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
                 out.push_back(SockAddr(makeUnixSockPath(port).c_str(), port));
 #endif
         }
@@ -97,14 +125,10 @@ namespace mongo {
     }
     
     Listener::Listener(const string& name, const string &ip, int port, bool logConnect ) 
-        : _port(port), _name(name), _ip(ip), _logConnect(logConnect), _elapsedTime(0) { 
-#ifdef MONGO_SSL
-        _ssl = 0;
-        _sslPort = 0;
-
-        if ( cmdLine.sslOnNormalPorts && cmdLine.sslServerManager ) {
-            secure( cmdLine.sslServerManager );
-        }
+        : _port(port), _name(name), _ip(ip), _setupSocketsSuccessful(false),
+          _logConnect(logConnect), _elapsedTime(0) {
+#ifdef MONGO_CONFIG_SSL
+        _ssl = getSSLManager();
 #endif
     }
     
@@ -113,32 +137,38 @@ namespace mongo {
             _timeTracker = 0;
     }
 
-#ifdef MONGO_SSL
-    void Listener::secure( SSLManager* manager ) {
-        _ssl = manager;
-    }
+    void Listener::setupSockets() {
+        checkTicketNumbers();
 
-    void Listener::addSecurePort( SSLManager* manager , int additionalPort ) {
-        _ssl = manager;
-        _sslPort = additionalPort;
-    }
-
+#if !defined(_WIN32)
+        _mine = ipToAddrs(_ip.c_str(), _port, (!serverGlobalParams.noUnixSocket &&
+                                               useUnixSockets()));
+#else
+        _mine = ipToAddrs(_ip.c_str(), _port, false);
 #endif
 
-    bool Listener::_setupSockets( const vector<SockAddr>& mine , vector<SOCKET>& socks ) {
-        for (vector<SockAddr>::const_iterator it=mine.begin(), end=mine.end(); it != end; ++it) {
+        for (std::vector<SockAddr>::const_iterator it=_mine.begin(), end=_mine.end();
+             it != end;
+             ++it) {
+
             const SockAddr& me = *it;
 
+            if (!me.isValid()) {
+                error() << "listen(): socket is invalid." << endl;
+                return;
+            }
+
             SOCKET sock = ::socket(me.getType(), SOCK_STREAM, 0);
+            ScopeGuard socketGuard = MakeGuard(&closesocket, sock);
             massert( 15863 , str::stream() << "listen(): invalid socket? " << errnoWithDescription() , sock >= 0 );
 
             if (me.getType() == AF_UNIX) {
 #if !defined(_WIN32)
                 if (unlink(me.getAddr().c_str()) == -1) {
-                    int x = errno;
-                    if (x != ENOENT) {
-                        log() << "couldn't unlink socket file " << me << errnoWithDescription(x) << " skipping" << endl;
-                        continue;
+                    if (errno != ENOENT) {
+                        error() << "Failed to unlink socket file " << me << " "
+                                << errnoWithDescription(errno);
+                        fassertFailedNoTrace(28578);
                     }
                 }
 #endif
@@ -154,7 +184,7 @@ namespace mongo {
             {
                 const int one = 1;
                 if ( setsockopt( sock , SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0 )
-                    out() << "Failed to set socket opt, SO_REUSEADDR" << endl;
+                    log() << "Failed to set socket opt, SO_REUSEADDR" << endl;
             }
 #endif
 
@@ -163,88 +193,73 @@ namespace mongo {
                 error() << "listen(): bind() failed " << errnoWithDescription(x) << " for socket: " << me.toString() << endl;
                 if ( x == EADDRINUSE )
                     error() << "  addr already in use" << endl;
-                closesocket(sock);
-                return false;
+                return;
             }
 
 #if !defined(_WIN32)
             if (me.getType() == AF_UNIX) {
-                if (chmod(me.getAddr().c_str(), 0777) == -1) {
-                    error() << "couldn't chmod socket file " << me << errnoWithDescription() << endl;
+                if (chmod(me.getAddr().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
+                    error() << "Failed to chmod socket file " << me << " "
+                            << errnoWithDescription(errno);
+                    fassertFailedNoTrace(28582);
                 }
                 ListeningSockets::get()->addPath( me.getAddr() );
             }
 #endif
-            
-            if ( ::listen(sock, 128) != 0 ) {
-                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
-                closesocket(sock);
-                return false;
-            }
 
-            ListeningSockets::get()->add( sock );
-
-            socks.push_back(sock);
+            _socks.push_back(sock);
+            socketGuard.Dismiss();
         }
         
-        return true;
+        _setupSocketsSuccessful = true;
     }
     
+ 
+#if !defined(_WIN32)
     void Listener::initAndListen() {
-        checkTicketNumbers();
-        vector<SOCKET> socks;
-        set<int> sslSocks;
-        
-        { // normal sockets
-            vector<SockAddr> mine = ipToAddrs(_ip.c_str(), _port, (!cmdLine.noUnixSocket && useUnixSockets()));
-            if ( ! _setupSockets( mine , socks ) )
-                return;
+        if (!_setupSocketsSuccessful) {
+            return;
         }
-        
-#ifdef MONGO_SSL
-        if ( _ssl && _sslPort > 0 ) {
-            unsigned prev = socks.size();
-            
-            vector<SockAddr> mine = ipToAddrs(_ip.c_str(), _sslPort, false );
-            if ( ! _setupSockets( mine , socks ) )
-                return;
-            
-            for ( unsigned i=prev; i<socks.size(); i++ ) {
-                sslSocks.insert( socks[i] );
-            }
-
-        }
-#endif
 
         SOCKET maxfd = 0; // needed for select()
-        for ( unsigned i=0; i<socks.size(); i++ ) {
-            if ( socks[i] > maxfd )
-                maxfd = socks[i];
+        for (unsigned i = 0; i < _socks.size(); i++) {
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+
+            if (_socks[i] > maxfd) {
+                maxfd = _socks[i];
+            }
         }
-        
-#ifdef MONGO_SSL
-        if ( _ssl == 0 ) {
-            _logListen( _port , false );
+
+        if ( maxfd >= FD_SETSIZE ) {
+            error() << "socket " << maxfd << " is higher than " << FD_SETSIZE-1 << 
+                "; not supported" << warnings;
+            return;
         }
-        else if ( _sslPort == 0 ) {
-            _logListen( _port , true );
-        }
-        else {
-            // both
-            _logListen( _port , false );
-            _logListen( _sslPort , true );
-        }
+
+#ifdef MONGO_CONFIG_SSL
+        _logListen(_port, _ssl);
 #else
-        _logListen( _port , false );
+        _logListen(_port, false);
 #endif
 
-        static long connNumber = 0;
+        {
+            // Wake up any threads blocked in waitUntilListening()
+            boost::lock_guard<boost::mutex> lock(_readyMutex);
+            _ready = true;
+            _readyCondition.notify_all();
+        }
+
         struct timeval maxSelectTime;
         while ( ! inShutdown() ) {
             fd_set fds[1];
             FD_ZERO(fds);
             
-            for (vector<SOCKET>::iterator it=socks.begin(), end=socks.end(); it != end; ++it) {
+            for (vector<SOCKET>::iterator it=_socks.begin(), end=_socks.end(); it != end; ++it) {
                 FD_SET(*it, fds);
             }
 
@@ -275,22 +290,25 @@ namespace mongo {
             }
 
 #if defined(__linux__)
-            _elapsedTime += max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
+            _elapsedTime += std::max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
 #else
             _elapsedTime += ret; // assume 1ms to grab connection. very rough
 #endif
 
-            for (vector<SOCKET>::iterator it=socks.begin(), end=socks.end(); it != end; ++it) {
+            for (vector<SOCKET>::iterator it=_socks.begin(), end=_socks.end(); it != end; ++it) {
                 if (! (FD_ISSET(*it, fds)))
                     continue;
-
                 SockAddr from;
                 int s = accept(*it, from.raw(), &from.addressSize);
                 if ( s < 0 ) {
                     int x = errno; // so no global issues
-                    if ( x == ECONNABORTED || x == EBADF ) {
-                        log() << "Listener on port " << _port << " aborted" << endl;
+                    if (x == EBADF) {
+                        log() << "Port " << _port << " is no longer valid" << endl;
                         return;
+                    }
+                    else if (x == ECONNABORTED) {
+                        log() << "Connection on port " << _port << " aborted" << endl;
+                        continue;
                     }
                     if ( x == 0 && inShutdown() ) {
                         return;   // socket closed
@@ -314,30 +332,257 @@ namespace mongo {
                 setsockopt( s , SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(int));
 #endif
 
-                if ( _logConnect && ! cmdLine.quiet ){
-                    int conns = connTicketHolder.used()+1;
+                long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
+
+                if (_logConnect && !serverGlobalParams.quiet) {
+                    int conns = globalTicketHolder.used()+1;
                     const char* word = (conns == 1 ? " connection" : " connections");
-                    log() << "connection accepted from " << from.toString() << " #" << ++connNumber << " (" << conns << word << " now open)" << endl;
+                    log() << "connection accepted from " << from.toString() << " #" << myConnectionNumber << " (" << conns << word << " now open)" << endl;
                 }
                 
                 boost::shared_ptr<Socket> pnewSock( new Socket(s, from) );
-#ifdef MONGO_SSL
-                if ( _ssl && ( _sslPort == 0 || sslSocks.count(*it) ) ) {
-                    pnewSock->secureAccepted( _ssl );
+#ifdef MONGO_CONFIG_SSL
+                if (_ssl) {
+                    pnewSock->secureAccepted(_ssl);
                 }
 #endif
-                accepted( pnewSock );
+                accepted( pnewSock , myConnectionNumber );
             }
         }
     }
+
+#else 
+    // Windows    
+    
+    // Given a SOCKET, turns off nonblocking mode
+    static void disableNonblockingMode(SOCKET socket) {
+        unsigned long resultBuffer = 0;
+        unsigned long resultBufferBytesWritten = 0;
+        unsigned long newNonblockingEnabled = 0;
+        const int status = WSAIoctl(socket, 
+                                    FIONBIO, 
+                                    &newNonblockingEnabled, 
+                                    sizeof(unsigned long), 
+                                    &resultBuffer, 
+                                    sizeof(resultBuffer), 
+                                    &resultBufferBytesWritten, 
+                                    NULL, 
+                                    NULL);
+        if (status == SOCKET_ERROR) {
+            const int mongo_errno = WSAGetLastError();
+            error() << "Windows WSAIoctl returned " << errnoWithDescription(mongo_errno) << endl;
+            fassertFailed(16726);
+        }
+    }
+
+    // RAII wrapper class to ensure we do not leak WSAEVENTs.
+    class EventHolder {
+        WSAEVENT _socketEventHandle;
+    public:
+        EventHolder() {
+            _socketEventHandle = WSACreateEvent();
+            if (_socketEventHandle == WSA_INVALID_EVENT) {
+                const int mongo_errno = WSAGetLastError();
+                error() << "Windows WSACreateEvent returned " << errnoWithDescription(mongo_errno) 
+                    << endl;
+                fassertFailed(16728);
+            }
+        }
+        ~EventHolder() {
+            BOOL bstatus = WSACloseEvent(_socketEventHandle);
+            if (bstatus == FALSE) {
+                const int mongo_errno = WSAGetLastError();
+                error() << "Windows WSACloseEvent returned " << errnoWithDescription(mongo_errno)
+                    << endl;
+                fassertFailed(16725);
+            }        
+        }
+        WSAEVENT get() {
+            return _socketEventHandle;
+        }
+    };
+    
+    void Listener::initAndListen() {
+        if (!_setupSocketsSuccessful) {
+            return;
+        }
+
+        for (unsigned i = 0; i < _socks.size(); i++) {
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+        }
+
+#ifdef MONGO_CONFIG_SSL
+        _logListen(_port, _ssl);
+#else
+        _logListen(_port, false);
+#endif
+
+        {
+            // Wake up any threads blocked in waitUntilListening()
+            boost::lock_guard<boost::mutex> lock(_readyMutex);
+            _ready = true;
+            _readyCondition.notify_all();
+        }
+
+        OwnedPointerVector<EventHolder> eventHolders;
+        boost::scoped_array<WSAEVENT> events(new WSAEVENT[_socks.size()]);
+        
+        
+        // Populate events array with an event for each socket we are watching
+        for (size_t count = 0; count < _socks.size(); ++count) {
+            EventHolder* ev(new EventHolder);
+            eventHolders.mutableVector().push_back(ev);
+            events[count] = ev->get();            
+        }
+            
+        while ( ! inShutdown() ) {
+            // Turn on listening for accept-ready sockets
+            for (size_t count = 0; count < _socks.size(); ++count) {
+                int status = WSAEventSelect(_socks[count], events[count], FD_ACCEPT | FD_CLOSE);
+                if (status == SOCKET_ERROR) {
+                    const int mongo_errno = WSAGetLastError();
+
+                    // During shutdown, we may fail to listen on the socket if it has already
+                    // been closed
+                    if (inShutdown()) {
+                        return;
+                    }
+
+                    error() << "Windows WSAEventSelect returned "
+                        << errnoWithDescription(mongo_errno) << endl;
+                    fassertFailed(16727);
+                }
+            }
+        
+            // Wait till one of them goes active, or we time out
+            DWORD result = WSAWaitForMultipleEvents(_socks.size(),
+                                                    events.get(), 
+                                                    FALSE, // don't wait for all the events
+                                                    10, // timeout, in ms 
+                                                    FALSE); // do not allow I/O interruptions
+            if (result == WSA_WAIT_FAILED) {
+                const int mongo_errno = WSAGetLastError();
+                error() << "Windows WSAWaitForMultipleEvents returned " 
+                    << errnoWithDescription(mongo_errno) << endl;
+                fassertFailed(16723);
+            }
+        
+            if (result == WSA_WAIT_TIMEOUT) {
+                _elapsedTime += 10;
+                continue;
+            }
+            _elapsedTime += 1; // assume 1ms to grab connection. very rough
+            
+            // Determine which socket is ready
+            DWORD eventIndex = result - WSA_WAIT_EVENT_0;
+            WSANETWORKEVENTS networkEvents;            
+            // Extract event details, and clear event for next pass
+            int status = WSAEnumNetworkEvents(_socks[eventIndex],
+                                              events[eventIndex], 
+                                              &networkEvents);
+            if (status == SOCKET_ERROR) {
+                const int mongo_errno = WSAGetLastError();
+                error() << "Windows WSAEnumNetworkEvents returned " 
+                    << errnoWithDescription(mongo_errno) << endl;
+                continue;
+            }
+            
+            if (networkEvents.lNetworkEvents & FD_CLOSE) {              
+                log() << "listen socket closed" << endl;
+                break;
+            }
+            
+            if (!(networkEvents.lNetworkEvents & FD_ACCEPT)) {
+                error() << "Unexpected network event: " << networkEvents.lNetworkEvents << endl;
+                continue;
+            }
+            
+            int iec = networkEvents.iErrorCode[FD_ACCEPT_BIT];
+            if (iec != 0) {                 
+                error() << "Windows socket accept did not work:" << errnoWithDescription(iec) 
+                        << endl;
+                continue;
+            }
+            
+            status = WSAEventSelect(_socks[eventIndex], NULL, 0);
+            if (status == SOCKET_ERROR) {
+                const int mongo_errno = WSAGetLastError();
+                error() << "Windows WSAEventSelect returned " 
+                    << errnoWithDescription(mongo_errno) << endl;
+                continue;
+            }
+            
+            disableNonblockingMode(_socks[eventIndex]);
+            
+            SockAddr from;
+            int s = accept(_socks[eventIndex], from.raw(), &from.addressSize);
+            if ( s < 0 ) {
+                int x = errno; // so no global issues
+                if (x == EBADF) {
+                    log() << "Port " << _port << " is no longer valid" << endl;
+                    continue;
+                }
+                else if (x == ECONNABORTED) {
+                    log() << "Listener on port " << _port << " aborted" << endl;
+                    continue;
+                }
+                if ( x == 0 && inShutdown() ) {
+                    return;   // socket closed
+                }
+                if( !inShutdown() ) {
+                    log() << "Listener: accept() returns " << s << " " 
+                        << errnoWithDescription(x) << endl;
+                    if (x == EMFILE || x == ENFILE) {
+                        // Connection still in listen queue but we can't accept it yet
+                        error() << "Out of file descriptors. Waiting one second before"
+                            " trying to accept more connections." << warnings;
+                        sleepsecs(1);
+                    }
+                }
+                continue;
+            }
+            if (from.getType() != AF_UNIX)
+                disableNagle(s);
+
+            long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
+
+            if (_logConnect && !serverGlobalParams.quiet) {
+                int conns = globalTicketHolder.used()+1;
+                const char* word = (conns == 1 ? " connection" : " connections");
+                log() << "connection accepted from " << from.toString() << " #" << myConnectionNumber << " (" << conns << word << " now open)" << endl;
+            }
+            
+            boost::shared_ptr<Socket> pnewSock( new Socket(s, from) );
+#ifdef MONGO_CONFIG_SSL
+            if (_ssl) {
+                pnewSock->secureAccepted(_ssl);
+            }
+#endif
+            accepted( pnewSock , myConnectionNumber );
+        }
+    }
+#endif
 
     void Listener::_logListen( int port , bool ssl ) {
         log() << _name << ( _name.size() ? " " : "" ) << "waiting for connections on port " << port << ( ssl ? " ssl" : "" ) << endl;
     }
 
+    void Listener::waitUntilListening() const {
+        boost::unique_lock<boost::mutex> lock(_readyMutex);
+        while (!_ready) {
+            _readyCondition.wait(lock);
+        }
+    }
 
-    void Listener::accepted(boost::shared_ptr<Socket> psocket) {
-        acceptedMP( new MessagingPort(psocket) );
+    void Listener::accepted(boost::shared_ptr<Socket> psocket, long long connectionId ) {
+        MessagingPort* port = new MessagingPort(psocket);
+        port->setConnectionId( connectionId );
+        acceptedMP( port );
     }
     
     void Listener::acceptedMP(MessagingPort *mp) {
@@ -354,9 +599,6 @@ namespace mongo {
 
     // ------ connection ticket and control ------
 
-    const int DEFAULT_MAX_CONN = 20000;
-    const int MAX_MAX_CONN = 20000;
-
     int getMaxConnections() {
 #ifdef _WIN32
         return DEFAULT_MAX_CONN;
@@ -366,36 +608,62 @@ namespace mongo {
 
         int max = (int)(limit.rlim_cur * .8);
 
-        log(1) << "fd limit"
+        LOG(1) << "fd limit"
                << " hard:" << limit.rlim_max
                << " soft:" << limit.rlim_cur
                << " max conn: " << max
                << endl;
 
-        if ( max > MAX_MAX_CONN )
-            max = MAX_MAX_CONN;
-
         return max;
 #endif
     }
 
-    void checkTicketNumbers() {
+    void Listener::checkTicketNumbers() {
         int want = getMaxConnections();
-        int current = connTicketHolder.outof();
+        int current = globalTicketHolder.outof();
         if ( current != DEFAULT_MAX_CONN ) {
             if ( current < want ) {
                 // they want fewer than they can handle
                 // which is fine
-                log(1) << " only allowing " << current << " connections" << endl;
+                LOG(1) << " only allowing " << current << " connections" << endl;
                 return;
             }
             if ( current > want ) {
                 log() << " --maxConns too high, can only handle " << want << endl;
             }
         }
-        connTicketHolder.resize( want );
+        globalTicketHolder.resize( want );
     }
 
-    TicketHolder connTicketHolder(DEFAULT_MAX_CONN);
+
+    TicketHolder Listener::globalTicketHolder(DEFAULT_MAX_CONN);
+    AtomicInt64 Listener::globalConnectionNumber;
+
+    void ListeningSockets::closeAll() {
+        std::set<int>* sockets;
+        std::set<std::string>* paths;
+
+        {
+            boost::lock_guard<boost::mutex> lk( _mutex );
+            sockets = _sockets;
+            _sockets = new std::set<int>();
+            paths = _socketPaths;
+            _socketPaths = new std::set<std::string>();
+        }
+
+        for ( std::set<int>::iterator i=sockets->begin(); i!=sockets->end(); i++ ) {
+            int sock = *i;
+            log() << "closing listening socket: " << sock << std::endl;
+            closesocket( sock );
+        }
+        delete sockets;
+
+        for ( std::set<std::string>::iterator i=paths->begin(); i!=paths->end(); i++ ) {
+            std::string path = *i;
+            log() << "removing socket file: " << path << std::endl;
+            ::remove( path.c_str() );
+        }
+        delete paths;
+    }
 
 }

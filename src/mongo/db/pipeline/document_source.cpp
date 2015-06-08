@@ -12,24 +12,35 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "db/pipeline/document_source.h"
-#include "db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
-    DocumentSource::DocumentSource(
-        const intrusive_ptr<ExpressionContext> &pCtx):
-        pSource(NULL),
-        step(-1),
-        pExpCtx(pCtx) {
-    }
+    using boost::intrusive_ptr;
+    using std::vector;
 
-    DocumentSource::~DocumentSource() {
-    }
+    DocumentSource::DocumentSource(const intrusive_ptr<ExpressionContext> &pCtx)
+        : pSource(NULL)
+        , pExpCtx(pCtx)
+    {}
 
     const char *DocumentSource::getSourceName() const {
         static const char unknown[] = "[UNKNOWN]";
@@ -41,37 +52,24 @@ namespace mongo {
         pSource = pTheSource;
     }
 
-    bool DocumentSource::coalesce(
-        const intrusive_ptr<DocumentSource> &pNextSource) {
+    bool DocumentSource::coalesce(const intrusive_ptr<DocumentSource> &pNextSource) {
         return false;
     }
 
-    void DocumentSource::optimize() {
+    intrusive_ptr<DocumentSource> DocumentSource::optimize() {
+        return this;
     }
 
-    void DocumentSource::manageDependencies(
-        const intrusive_ptr<DependencyTracker> &pTracker) {
-#ifdef MONGO_LATER_SERVER_4644
-        verify(false); // identify any sources that need this but don't have it
-#endif /* MONGO_LATER_SERVER_4644 */
+    void DocumentSource::dispose() {
+        if ( pSource ) {
+            pSource->dispose();
+        }
     }
 
-    bool DocumentSource::advance() {
-        pExpCtx->checkForInterrupt(); // might not return
-        return false;
-    }
-
-    void DocumentSource::addToBsonArray(BSONArrayBuilder *pBuilder) const {
-        BSONObjBuilder insides;
-        sourceToBson(&insides);
-        pBuilder->append(insides.done());
-    }
-
-    void DocumentSource::writeString(stringstream &ss) const {
-        BSONArrayBuilder bab;
-        addToBsonArray(&bab);
-        BSONArray ba(bab.arr());
-        ss << ba.toString(/* isArray */true); 
-            // our toString should use standard string types.....
+    void DocumentSource::serializeToArray(vector<Value>& array, bool explain) const {
+        Value entry = serialize(explain);
+        if (!entry.missing()) {
+            array.push_back(entry);
+        }
     }
 }

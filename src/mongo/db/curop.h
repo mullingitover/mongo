@@ -14,79 +14,55 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
 #pragma once
 
-#include "namespace-inl.h"
-#include "client.h"
-#include "../bson/util/atomic_int.h"
-#include "../util/concurrency/spin_lock.h"
-#include "../util/time_support.h"
-#include "../util/net/hostandport.h"
-#include "../util/progress_meter.h"
+#include <boost/noncopyable.hpp>
+
+#include "mongo/base/disallow_copying.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/progress_meter.h"
+#include "mongo/util/thread_safe_string.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
+    class Client;
+    class Command;
     class CurOp;
-
-    /* lifespan is different than CurOp because of recursives with DBDirectClient */
-    class OpDebug {
-    public:
-        OpDebug() : ns(""){ reset(); }
-
-        void reset();
-        
-        string toString() const;
-        void append( const CurOp& curop, BSONObjBuilder& b ) const;
-
-        // -------------------
-        
-        StringBuilder extra; // weird things we need to fix later
-        
-        // basic options
-        int op;
-        bool iscommand;
-        Namespace ns;
-        BSONObj query;
-        BSONObj updateobj;
-        
-        // detailed options
-        long long cursorid;
-        int ntoreturn;
-        int ntoskip;
-        bool exhaust;
-
-        // debugging/profile info
-        long long nscanned;
-        bool idhack;         // indicates short circuited code path on an update to make the update faster
-        bool scanAndOrder;   // scanandorder query plan aspect was used
-        long long  nupdated; // number of records updated
-        long long  nmoved;   // updates resulted in a move (moves are expensive)
-        bool fastmod;
-        bool fastmodinsert;  // upsert of an $operation. builds a default object
-        bool upsert;         // true if the update actually did an insert
-        int keyUpdates;
-
-        // error handling
-        ExceptionInfo exceptionInfo;
-        
-        // response info
-        int executionTime;
-        int nreturned;
-        int responseLength;
-    };
+    class OperationContext;
 
     /**
      * stores a copy of a bson obj in a fixed size buffer
      * if its too big for the buffer, says "too big"
      * useful for keeping a copy around indefinitely without wasting a lot of space or doing malloc
      */
-    class CachedBSONObj {
+    class CachedBSONObjBase {
+    public:
+        static BSONObj _tooBig; // { $msg : "query not recording (too large)" }
+    };
+
+    template <size_t BUFFER_SIZE>
+    class CachedBSONObj : public CachedBSONObjBase {
     public:
         enum { TOO_BIG_SENTINEL = 1 } ;
-        static BSONObj _tooBig; // { $msg : "query not recording (too large)" }
 
         CachedBSONObj() {
             _size = (int*)_buf;
@@ -101,8 +77,8 @@ namespace mongo {
 
         void set( const BSONObj& o ) {
             scoped_spinlock lk(_lock);
-            int sz = o.objsize();
-            if ( sz > (int) sizeof(_buf) ) {
+            size_t sz = o.objsize();
+            if ( sz > sizeof(_buf) ) {
                 _reset(TOO_BIG_SENTINEL);
             }
             else {
@@ -112,13 +88,14 @@ namespace mongo {
 
         int size() const { return *_size; }
         bool have() const { return size() > 0; }
+        bool tooBig() const { return size() == TOO_BIG_SENTINEL; }
 
         BSONObj get() const {
             scoped_spinlock lk(_lock);
             return _get();
         }
 
-        void append( BSONObjBuilder& b , const StringData& name ) const {
+        void append( BSONObjBuilder& b , StringData name ) const {
             scoped_spinlock lk(_lock);
             BSONObj temp = _get();
             b.append( name , temp );
@@ -140,187 +117,344 @@ namespace mongo {
 
         mutable SpinLock _lock;
         int * _size;
-        char _buf[512];
+        char _buf[BUFFER_SIZE];
     };
 
-    /* Current operation (for the current Client).
-       an embedded member of Client class, and typically used from within the mutex there.
-    */
-    class CurOp : boost::noncopyable {
+    /* lifespan is different than CurOp because of recursives with DBDirectClient */
+    class OpDebug {
     public:
-        CurOp( Client * client , CurOp * wrapped = 0 );
+        OpDebug() : planSummary(2048) { reset(); }
+
+        void reset();
+
+        std::string report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const;
+
+        /**
+         * Appends information about the current operation to "builder"
+         *
+         * @param curop reference to the CurOp that owns this OpDebug
+         * @param lockStats lockStats object containing locking information about the operation
+         */
+        void append(const CurOp& curop,
+                    const SingleThreadedLockStats& lockStats,
+                    BSONObjBuilder& builder) const;
+
+        // -------------------
+        
+        StringBuilder extra; // weird things we need to fix later
+        
+        // basic options
+        int op;
+        bool iscommand;
+        std::string ns;
+        BSONObj query;
+        BSONObj updateobj;
+        
+        // detailed options
+        long long cursorid;
+        int ntoreturn;
+        int ntoskip;
+        bool exhaust;
+
+        // debugging/profile info
+        long long nscanned;
+        long long nscannedObjects;
+        bool idhack;         // indicates short circuited code path on an update to make the update faster
+        bool scanAndOrder;   // scanandorder query plan aspect was used
+        long long  nMatched; // number of records that match the query
+        long long  nModified; // number of records written (no no-ops)
+        long long  nmoved;   // updates resulted in a move (moves are expensive)
+        long long  ninserted;
+        long long  ndeleted;
+        bool fastmod;
+        bool fastmodinsert;  // upsert of an $operation. builds a default object
+        bool upsert;         // true if the update actually did an insert
+        bool cursorExhausted; // true if the cursor has been closed at end a find/getMore operation
+        int keyUpdates;
+        long long writeConflicts;
+        ThreadSafeString planSummary; // a brief std::string describing the query solution
+
+        // New Query Framework debugging/profiling info
+        // TODO: should this really be an opaque BSONObj?  Not sure.
+        CachedBSONObj<4096> execStats;
+
+        // error handling
+        ExceptionInfo exceptionInfo;
+        
+        // response info
+        int executionTime;
+        int nreturned;
+        int responseLength;
+    };
+
+    /**
+     * Container for data used to report information about an OperationContext.
+     *
+     * Every OperationContext in a server with CurOp support has a stack of CurOp
+     * objects. The entry at the top of the stack is used to record timing and
+     * resource statistics for the executing operation or suboperation.
+     *
+     * All of the accessor methods on CurOp may be called by the thread executing
+     * the associated OperationContext at any time, or by other threads that have
+     * locked the context's owning Client object.
+     *
+     * The mutator methods on CurOp whose names end _inlock may only be called by the thread
+     * executing the associated OperationContext and Client, and only when that thread has also
+     * locked the Client object.  All other mutators may only be called by the thread executing
+     * CurOp, but do not require holding the Client lock.  The exception to this is the kill()
+     * method, which is self-synchronizing.
+     *
+     * The OpDebug member of a CurOp, accessed via the debug() accessor should *only* be accessed
+     * from the thread executing an operation, and as a result its fields may be accessed without
+     * any synchronization.
+     */
+    class CurOp {
+        MONGO_DISALLOW_COPYING(CurOp);
+    public:
+        static CurOp* get(const OperationContext* opCtx);
+        static CurOp* get(const OperationContext& opCtx);
+
+        /**
+         * Constructs a nested CurOp at the top of the given "opCtx"'s CurOp stack.
+         */
+        explicit CurOp(OperationContext* opCtx);
         ~CurOp();
 
         bool haveQuery() const { return _query.have(); }
-        BSONObj query() { return _query.get();  }
-        void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
-        
-        void ensureStarted() {
-            if ( _start == 0 )
-                _start = _checkpoint = curTimeMicros64();
-        }
-        bool isStarted() const { return _start > 0; }
-        void enter( Client::Context * context );
-        void leave( Client::Context * context );
-        void reset();
-        void reset( const HostAndPort& remote, int op );
-        void markCommand() { _command = true; }
-        void waitingForLock( char type ) {
-            _waitingForLock = true;
-            _lockType = type;
-        }
-        void gotLock()             { _waitingForLock = false; }
+        BSONObj query() const { return _query.get();  }
+        void appendQuery( BSONObjBuilder& b , StringData name ) const { _query.append( b , name ); }
+
+        void enter_inlock(const char* ns, int dbProfileLevel);
+
+        /**
+         * Sets the type of the current operation to "op".
+         */
+        void setOp_inlock(int op);
+
+        /**
+         * Marks the current operation as being a command.
+         */
+        void markCommand_inlock() { _isCommand = true; }
+
+        /**
+         * Returns a structure containing data used for profiling, accessed only by a thread
+         * currently executing the operation context associated with this CurOp.
+         */
         OpDebug& debug()           { return _debug; }
-        int profileLevel() const   { return _dbprofile; }
-        const char * getNS() const { return _ns; }
+
+        /**
+         * Gets the name of the namespace on which the current operation operates.
+         */
+        std::string getNS() const { return _ns; }
 
         bool shouldDBProfile( int ms ) const {
             if ( _dbprofile <= 0 )
                 return false;
 
-            return _dbprofile >= 2 || ms >= cmdLine.slowMS;
+            return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
         }
 
-        AtomicUInt opNum() const { return _opNum; }
+        /**
+         * Raises the profiling level for this operation to "dbProfileLevel" if it was previously
+         * less than "dbProfileLevel".
+         *
+         * This belongs on OpDebug, and so does not have the _inlock suffix.
+         */
+        void raiseDbProfileLevel(int dbProfileLevel);
 
-        /** if this op is running */
-        bool active() const { return _active; }
-
-        char lockType() const { return _lockType; }
-        bool displayInCurop() const { return _active && ! _suppressFromCurop; }
-        bool isWaitingForLock() const { return _waitingForLock; }
+        /**
+         * Gets the type of the current operation.
+         */
         int getOp() const { return _op; }
-        unsigned long long startTime() { // micros
+
+        /**
+         * Returns true if the current operation is known to be a command.
+         */
+        bool isCommand() const { return _isCommand; }
+
+        //
+        // Methods for controlling CurOp "max time".
+        //
+
+        /**
+         * Sets the amount of time operation this should be allowed to run, units of microseconds.
+         * The special value 0 is "allow to run indefinitely".
+         */
+        void setMaxTimeMicros(uint64_t maxTimeMicros);
+
+        /**
+         * Returns true if a time limit has been set on this operation, and false otherwise.
+         */
+        bool isMaxTimeSet() const;
+
+        /**
+         * Checks whether this operation has been running longer than its time limit.  Returns
+         * false if not, or if the operation has no time limit.
+         */
+        bool maxTimeHasExpired();
+
+        /**
+         * Returns the number of microseconds remaining for this operation's time limit, or the
+         * special value 0 if the operation has no time limit.
+         *
+         * Calling this method is more expensive than calling its sibling "maxTimeHasExpired()",
+         * since an accurate measure of remaining time needs to be calculated.
+         */
+        uint64_t getRemainingMaxTimeMicros() const;
+
+        //
+        // Methods for getting/setting elapsed time.
+        //
+
+        void ensureStarted();
+        bool isStarted() const { return _start > 0; }
+        long long startTime() { // micros
             ensureStarted();
             return _start;
         }
         void done() {
-            _active = false;
             _end = curTimeMicros64();
         }
-        unsigned long long totalTimeMicros() {
-            massert( 12601 , "CurOp not marked done yet" , ! _active );
+
+        long long totalTimeMicros() {
+            massert( 12601 , "CurOp not marked done yet" , _end );
             return _end - startTime();
         }
         int totalTimeMillis() { return (int) (totalTimeMicros() / 1000); }
+        long long elapsedMicros() {
+            return curTimeMicros64() - startTime();
+        }
         int elapsedMillis() {
-            unsigned long long total = curTimeMicros64() - startTime();
-            return (int) (total / 1000);
+            return (int) (elapsedMicros() / 1000);
         }
         int elapsedSeconds() { return elapsedMillis() / 1000; }
-        void setQuery(const BSONObj& query) { _query.set( query ); }
-        Client * getClient() const { return _client; }
-        BSONObj info();
-        BSONObj infoNoauth();
-        string getRemoteString( bool includePort = true ) { return _remote.toString(includePort); }
-        ProgressMeter& setMessage( const char * msg , unsigned long long progressMeterTotal = 0 , int secondsBetween = 3 );
-        string getMessage() const { return _message.toString(); }
-        ProgressMeter& getProgressMeter() { return _progressMeter; }
-        CurOp *parent() const { return _wrapped; }
-        void kill() { _killed = true; }
-        bool killed() const { return _killed; }
-        void yielded() { _numYields++; }
-        void setNS(const char *ns) {
-            strncpy(_ns, ns, Namespace::MaxNsLen);
-            _ns[Namespace::MaxNsLen] = 0;
-        }
-        
-        void suppressFromCurop() { _suppressFromCurop = true; }
-        
+
+        void setQuery_inlock(const BSONObj& query) { _query.set( query ); }
+
+        Command * getCommand() const { return _command; }
+        void setCommand_inlock(Command* command) { _command = command; }
+
+        /**
+         * Appends information about this CurOp to "builder".
+         *
+         * If called from a thread other than the one executing the operation associated with this
+         * CurOp, it is necessary to lock the associated Client object before executing this method.
+         */
+        void reportState(BSONObjBuilder* builder);
+
+        /**
+         * Sets the message and the progress meter for this CurOp.
+         *
+         * While it is necessary to hold the lock while this method executes, the
+         * "hit" and "finished" methods of ProgressMeter may be called safely from
+         * the thread executing the operation without locking the Client.
+         */
+        ProgressMeter& setMessage_inlock(const char * msg,
+                                  std::string name = "Progress",
+                                  unsigned long long progressMeterTotal = 0,
+                                  int secondsBetween = 3);
+
+        /**
+         * Gets the message for this CurOp.
+         */
+        const std::string& getMessage() const { return _message; }
+        const ProgressMeter& getProgressMeter() { return _progressMeter; }
+        CurOp *parent() const { return _parent; }
+        void yielded() { _numYields++; }  // Should be _inlock()?
+
+        /**
+         * Returns the number of times yielded() was called.  Callers on threads other
+         * than the one executing the operation must lock the client.
+         */
+        int numYields() const { return _numYields; }
+
         long long getExpectedLatencyMs() const { return _expectedLatencyMs; }
         void setExpectedLatencyMs( long long latency ) { _expectedLatencyMs = latency; }
 
+        /**
+         * this should be used very sparingly
+         * generally the Context should set this up
+         * but sometimes you want to do it ahead of time
+         */
+        void setNS_inlock( StringData ns );
+
     private:
-        friend class Client;
-        void _reset();
+        class CurOpStack;
 
-        static AtomicUInt _nextOpNum;
-        Client * _client;
-        CurOp * _wrapped;
-        unsigned long long _start;
-        unsigned long long _checkpoint;
-        unsigned long long _end;
-        bool _active;
-        bool _suppressFromCurop; // unless $all is set
+        static const OperationContext::Decoration<CurOpStack> _curopStack;
+
+        CurOp(OperationContext*, CurOpStack*);
+
+        CurOpStack* _stack;
+        CurOp* _parent = nullptr;
+        Command * _command;
+        long long _start;
+        long long _end;
         int _op;
-        bool _command;
-        char _lockType;                   // r w R W
-        bool _waitingForLock;
+        bool _isCommand;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
-        AtomicUInt _opNum;               // todo: simple being "unsigned" may make more sense here
-        char _ns[Namespace::MaxNsLen+2];
-        HostAndPort _remote;             // CAREFUL here with thread safety
-        CachedBSONObj _query;            // CachedBSONObj is thread safe
+        std::string _ns;
+        CachedBSONObj<512> _query;       // CachedBSONObj is thread safe
         OpDebug _debug;
-        ThreadSafeString _message;
+        std::string _message;
         ProgressMeter _progressMeter;
-        volatile bool _killed;
         int _numYields;
-
+        
         // this is how much "extra" time a query might take
         // a writebacklisten for example will block for 30s 
         // so this should be 30000 in that case
         long long _expectedLatencyMs; 
-                                     
+
+        // Time limit for this operation.  0 if the operation has no time limit.
+        uint64_t _maxTimeMicros;
+
+        /** Nested class that implements tracking of a time limit for a CurOp object. */
+        class MaxTimeTracker {
+            MONGO_DISALLOW_COPYING(MaxTimeTracker);
+        public:
+            /** Newly-constructed MaxTimeTracker objects have the time limit disabled. */
+            MaxTimeTracker();
+
+            /** Disables the time tracker. */
+            void reset();
+
+            /** Returns whether or not time tracking is enabled. */
+            bool isEnabled() const { return _enabled; }
+
+            /**
+             * Enables time tracking.  The time limit is set to be "durationMicros" microseconds
+             * from "startEpochMicros" (units of microseconds since the epoch).
+             *
+             * "durationMicros" must be nonzero.
+             */
+            void setTimeLimit(uint64_t startEpochMicros, uint64_t durationMicros);
+
+            /**
+             * Checks whether the time limit has been hit.  Returns false if not, or if time
+             * tracking is disabled.
+             */
+            bool checkTimeLimit();
+
+            /**
+             * Returns the number of microseconds remaining for the time limit, or the special
+             * value 0 if time tracking is disabled.
+             *
+             * Calling this method is more expensive than calling its sibling "checkInterval()",
+             * since an accurate measure of remaining time needs to be calculated.
+             */
+            uint64_t getRemainingMicros() const;
+        private:
+            // Whether or not time tracking is enabled for this operation.
+            bool _enabled;
+
+            // Point in time at which the time limit is hit.  Units of microseconds since the
+            // epoch.
+            uint64_t _targetEpochMicros;
+
+            // Approximate point in time at which the time limit is hit.   Units of milliseconds
+            // since the server process was started.
+            int64_t _approxTargetServerMillis;
+        } _maxTimeTracker;
 
     };
-
-    /* _globalKill: we are shutting down
-       otherwise kill attribute set on specified CurOp
-       this class does not handle races between interruptJs and the checkForInterrupt functions - those must be
-       handled by the client of this class
-    */
-    extern class KillCurrentOp {
-    public:
-        void killAll();
-        void kill(AtomicUInt i);
-
-        /** @return true if global interrupt and should terminate the operation */
-        bool globalInterruptCheck() const { return _globalKill; }
-
-        void checkForInterrupt( bool heedMutex = true ) {
-            Client& c = cc();
-            if ( heedMutex && d.dbMutex.isWriteLocked() )
-                return;
-            if( _globalKill )
-                uasserted(11600,"interrupted at shutdown");
-            if( c.curop()->killed() ) {
-                uasserted(11601,"operation was interrupted");
-            }
-            if( c.sometimes(1024) ) {
-                AbstractMessagingPort *p = cc().port();
-                if( p ) 
-                    p->assertStillConnected();
-            }
-        }
-
-        /** @return "" if not interrupted.  otherwise, you should stop. */
-        const char *checkForInterruptNoAssert( /*bool heedMutex = true*/ ) {
-            Client& c = cc();
-            // always called withi false so commented out:
-            /*if ( heedMutex && d.dbMutex.isWriteLocked() )
-                return "";*/
-            if( _globalKill )
-                return "interrupted at shutdown";
-            if( c.curop()->killed() )
-                return "interrupted";
-            if( c.sometimes(1024) ) {
-                try { 
-                    AbstractMessagingPort *p = cc().port();
-                    if( p ) 
-                        p->assertStillConnected();
-                }
-                catch(...) { 
-                    log() << "no longer connected to client";
-                    return "no longer connected to client";
-                }
-            }
-            return "";
-        }
-
-    private:
-        void interruptJs( AtomicUInt *op );
-        volatile bool _globalKill;
-    } killCurrentOp;
-
 }

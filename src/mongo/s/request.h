@@ -13,76 +13,54 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
 #pragma once
 
-#include "../pch.h"
-#include "../util/net/message.h"
-#include "../db/dbmessage.h"
-#include "config.h"
-#include "util.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
+    class Client;
 
-    class OpCounters;
-    class ClientInfo;
-
-    class Request : boost::noncopyable {
+    class Request {
+        MONGO_DISALLOW_COPYING(Request);
     public:
-        Request( Message& m, AbstractMessagingPort* p );
+        Request(Message& m, AbstractMessagingPort* p);
 
-        // ---- message info -----
-
-
-        const char * getns() const {
+        const char* getns() const {
             return _d.getns();
         }
+
         int op() const {
             return _m.operation();
         }
+
         bool expectResponse() const {
             return op() == dbQuery || op() == dbGetMore;
         }
+
         bool isCommand() const;
 
         MSGID id() const {
             return _id;
         }
 
-        DBConfigPtr getConfig() const {
-            verify( _didInit );
-            return _config;
-        }
-        bool isShardingEnabled() const {
-            verify( _didInit );
-            return _config->isShardingEnabled();
-        }
-
-        ChunkManagerPtr getChunkManager() const {
-            verify( _didInit );
-            return _chunkManager;
-        }
-
-        ClientInfo * getClientInfo() const {
-            return _clientInfo;
-        }
-
-        /**
-         * @param ns - 0=use ns from message
-         */
-        void checkAuth( Auth::Level levelNeeded , const char * ns=0 ) const;
-
-        // ---- remote location info -----
-
-
-        Shard primaryShard() const ;
-
-        // ---- low level access ----
-
-        void reply( Message & response , const string& fromServer );
+        void reply(Message & response, const std::string& fromServer);
 
         Message& m() { return _m; }
         DbMessage& d() { return _d; }
@@ -90,28 +68,18 @@ namespace mongo {
 
         void process( int attempt = 0 );
 
-        void gotInsert();
-
         void init();
 
-        void reset();
-
     private:
+        Client* const _clientInfo;
+
         Message& _m;
         DbMessage _d;
-        AbstractMessagingPort* _p;
+        AbstractMessagingPort* const _p;
 
         MSGID _id;
-        DBConfigPtr _config;
-        ChunkManagerPtr _chunkManager;
-
-        ClientInfo * _clientInfo;
-
-        OpCounters* _counter;
 
         bool _didInit;
     };
 
 }
-
-#include "strategy.h"

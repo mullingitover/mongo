@@ -15,24 +15,143 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "../bson/util/builder.h"
-#include "../db/jsobj.h"
-#include "../db/jsobjmanipulator.h"
-#include "../db/json.h"
-#include "../db/repl.h"
-#include "../db/extsort.h"
-#include "dbtests.h"
-#include "../util/stringutils.h"
-#include "../util/mongoutils/checksum.h"
-#include "../db/key.h"
-#include "../db/btree.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
+#include <cmath>
+#include <iostream>
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/json.h"
+#include "mongo/db/storage/mmap_v1/btree/key.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/util/allocator.h"
+#include "mongo/util/embedded_builder.h"
+#include "mongo/util/log.h"
+#include "mongo/util/stringutils.h"
+
+namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
+    typedef std::map<std::string, BSONElement> BSONMap;
+    BSONMap bson2map(const BSONObj& obj) {
+        BSONMap m;
+        BSONObjIterator it(obj);
+        while (it.more()) {
+            BSONElement e = it.next();
+            m[e.fieldName()] = e;
+        }
+        return m;
+    }
+
+    void dotted2nested(BSONObjBuilder& b, const BSONObj& obj) {
+        //use map to sort fields
+        BSONMap sorted = bson2map(obj);
+        EmbeddedBuilder eb(&b);
+        for(BSONMap::const_iterator it=sorted.begin(); it!=sorted.end(); ++it) {
+            eb.appendAs(it->second, it->first);
+        }
+        eb.done();
+    }
+
+    // {a.b:1} -> {a: {b:1}}
+    BSONObj dotted2nested(const BSONObj& obj) {
+        BSONObjBuilder b;
+        dotted2nested(b, obj);
+        return b.obj();
+    }
+
+
+    // {a: {b:1}} -> {a.b:1}
+    void nested2dotted(BSONObjBuilder& b, const BSONObj& obj, const string& base="") {
+        BSONObjIterator it(obj);
+        while (it.more()) {
+            BSONElement e = it.next();
+            if (e.type() == Object) {
+                string newbase = base + e.fieldName() + ".";
+                nested2dotted(b, e.embeddedObject(), newbase);
+            }
+            else {
+                string newbase = base + e.fieldName();
+                b.appendAs(e, newbase);
+            }
+        }
+    }
+
+    BSONObj nested2dotted(const BSONObj& obj) {
+        BSONObjBuilder b;
+        nested2dotted(b, obj);
+        return b.obj();
+    }
+
+    FieldCompareResult compareDottedFieldNames( const string& l , const string& r ,
+                                               const LexNumCmp& cmp ) {
+        static int maxLoops = 1024 * 1024;
+
+        size_t lstart = 0;
+        size_t rstart = 0;
+
+        for ( int i=0; i<maxLoops; i++ ) {
+
+            size_t a = l.find( '.' , lstart );
+            size_t b = r.find( '.' , rstart );
+
+            size_t lend = a == string::npos ? l.size() : a;
+            size_t rend = b == string::npos ? r.size() : b;
+
+            const string& c = l.substr( lstart , lend - lstart );
+            const string& d = r.substr( rstart , rend - rstart );
+
+            int x = cmp.cmp( c.c_str(), d.c_str() );
+
+            if ( x < 0 )
+                return LEFT_BEFORE;
+            if ( x > 0 )
+                return RIGHT_BEFORE;
+
+            lstart = lend + 1;
+            rstart = rend + 1;
+
+            if ( lstart >= l.size() ) {
+                if ( rstart >= r.size() )
+                    return SAME;
+                return RIGHT_SUBFIELD;
+            }
+            if ( rstart >= r.size() )
+                return LEFT_SUBFIELD;
+        }
+
+        log() << "compareDottedFieldNames ERROR  l: " << l << " r: " << r << "  TOO MANY LOOPS" << endl;
+        verify(0);
+        return SAME; // will never get here
+    }
+
+
+}
 
 namespace JsobjTests {
-
-    IndexInterface& indexInterfaceForTheseTests = (time(0)%2) ? *IndexDetails::iis[0] : *IndexDetails::iis[1];
 
     void keyTest(const BSONObj& o, bool mustBeCompact = false) {
         static KeyV1Owned *kLast;
@@ -109,6 +228,22 @@ namespace JsobjTests {
         }
     };
 
+    class BufBuilderReallocLimit {
+    public:
+        void run() {
+            BufBuilder b;
+            unsigned int written = 0;
+            try {
+                for (; written <= 64 * 1024 * 1024 + 1; ++written)
+                    // (re)alloc past the buffer 64mb limit
+                    b.appendStr("a");
+            }
+            catch (const AssertionException&) { }
+            // assert half of max buffer size was allocated before exception is thrown
+            ASSERT(written == mongo::BufferMaxSize / 2);
+        }
+    };
+
     class BSONElementBasic {
     public:
         void run() {
@@ -156,6 +291,36 @@ namespace JsobjTests {
                 ASSERT( basic( "a", 1 ).woCompare( basic( "a", 2 ) ) < 0 );
                 // field name comparison
                 ASSERT( basic( "a", 1 ).woCompare( basic( "b", 1 ) ) < 0 );
+            }
+        };
+
+        class IsPrefixOf : public Base {
+        public:
+            void run() {
+                {
+                    BSONObj k = BSON( "x" << 1 );
+                    verify( ! k.isPrefixOf( BSON( "a" << 1 ) ) );
+                    verify( k.isPrefixOf( BSON( "x" << 1 ) ) );
+                        verify( k.isPrefixOf( BSON( "x" << 1 << "a" << 1 ) ) );
+                        verify( ! k.isPrefixOf( BSON( "a" << 1 << "x" << 1 ) ) );
+                }
+                {
+                    BSONObj k = BSON( "x" << 1 << "y" << 1 );
+                    verify( ! k.isPrefixOf( BSON( "x" << 1 ) ) );
+                    verify( ! k.isPrefixOf( BSON( "x" << 1 << "z" << 1 ) ) );
+                    verify( k.isPrefixOf( BSON( "x" << 1 << "y" << 1 ) ) );
+                    verify( k.isPrefixOf( BSON( "x" << 1 << "y" << 1 << "z" << 1 ) ) );
+                }
+                {
+                    BSONObj k = BSON( "x" << 1 );
+                    verify( ! k.isPrefixOf( BSON( "x" << "hi" ) ) );
+                    verify( k.isPrefixOf( BSON( "x" << 1 << "a" << "hi" ) ) );
+                }
+                {
+                    BSONObj k = BSON( "x" << 1 );
+                    verify( k.isFieldNamePrefixOf( BSON( "x" << "hi" ) ) );
+                    verify( ! k.isFieldNamePrefixOf( BSON( "a" << 1  ) ) );
+                }
             }
         };
 
@@ -287,59 +452,15 @@ namespace JsobjTests {
             }
         };
 
-        class TimestampTest : public Base {
-        public:
-            void run() {
-                Client *c = currentClient.get();
-                if( c == 0 ) {
-                    Client::initThread("pretouchN");
-                    c = &cc();
-                }
-                writelock lk(""); // for initTimestamp
-        
-                BSONObjBuilder b;
-                b.appendTimestamp( "a" );
-                BSONObj o = b.done();
-                o.toString();
-                ASSERT( o.valid() );
-                ASSERT_EQUALS( Timestamp, o.getField( "a" ).type() );
-                BSONObjIterator i( o );
-                ASSERT( i.moreWithEOO() );
-                ASSERT( i.more() );
-
-                BSONElement e = i.next();
-                ASSERT_EQUALS( Timestamp, e.type() );
-                ASSERT( i.moreWithEOO() );
-                ASSERT( ! i.more() );
-
-                e = i.next();
-                ASSERT( e.eoo() );
-
-                OpTime before = OpTime::_now();
-                BSONElementManipulator( o.firstElement() ).initTimestamp();
-                OpTime after = OpTime::_now();
-
-                OpTime test = OpTime( o.firstElement().date() );
-                ASSERT( before < test && test < after );
-
-                BSONElementManipulator( o.firstElement() ).initTimestamp();
-                test = OpTime( o.firstElement().date() );
-                ASSERT( before < test && test < after );
-
-                OpTime x(123,456);
-                ASSERT_EQUALS( 528280977864LL , x.asLL() );
-            }
-        };
-
         class Nan : public Base {
         public:
             void run() {
                 double inf = numeric_limits< double >::infinity();
                 double nan = numeric_limits< double >::quiet_NaN();
                 double nan2 = numeric_limits< double >::signaling_NaN();
-                ASSERT( isNaN(nan) );
-                ASSERT( isNaN(nan2) );
-                ASSERT( !isNaN(inf) );
+                ASSERT( std::isnan(nan) );
+                ASSERT( std::isnan(nan2) );
+                ASSERT( !std::isnan(inf) );
 
                 ASSERT( BSON( "a" << inf ).woCompare( BSON( "a" << inf ) ) == 0 );
                 ASSERT( BSON( "a" << inf ).woCompare( BSON( "a" << 1 ) ) > 0 );
@@ -497,9 +618,9 @@ namespace JsobjTests {
                 ASSERT(o["i4"].type() == NumberInt);
                 ASSERT(o["i4"].number() == -1*billion);
 
-                ASSERT(o["L1"].type() == NumberLong);
+                ASSERT(o["L1"].isNumber());
                 ASSERT(o["L1"].number() == 2*billion);
-                ASSERT(o["L2"].type() == NumberLong);
+                ASSERT(o["L2"].isNumber());
                 ASSERT(o["L2"].number() == -2*billion);
                 ASSERT(o["L3"].type() == NumberLong);
                 ASSERT(o["L3"].number() == 4*billion);
@@ -558,20 +679,26 @@ namespace JsobjTests {
                 {
                     {
                         // check signed dates with new key format
-                        KeyV1Owned a( BSONObjBuilder().appendDate("", -50).obj() );
-                        KeyV1Owned b( BSONObjBuilder().appendDate("", 50).obj() );
+                        KeyV1Owned a( BSONObjBuilder().appendDate(
+                                              "", Date_t::fromMillisSinceEpoch(-50)).obj() );
+                        KeyV1Owned b( BSONObjBuilder().appendDate(
+                                              "", Date_t::fromMillisSinceEpoch(50)).obj() );
                         ASSERT( a.woCompare(b, Ordering::make(BSONObj())) < 0 );
                     }
                     {
                         // backward compatibility
-                        KeyBson a( BSONObjBuilder().appendDate("", -50).obj() );
-                        KeyBson b( BSONObjBuilder().appendDate("", 50).obj() );
+                        KeyBson a( BSONObjBuilder().appendDate(
+                                           "", Date_t::fromMillisSinceEpoch(-50)).obj() );
+                        KeyBson b( BSONObjBuilder().appendDate(
+                                           "", Date_t::fromMillisSinceEpoch(50)).obj() );
                         ASSERT( a.woCompare(b, Ordering::make(BSONObj())) > 0 );
                     }
                     {
-                        // this is an uncompactible key:
-                        BSONObj uc1 = BSONObjBuilder().appendDate("", -50).appendCode("", "abc").obj();
-                        BSONObj uc2 = BSONObjBuilder().appendDate("", 55).appendCode("", "abc").obj();
+                        // this is an uncompactable key:
+                        BSONObj uc1 = BSONObjBuilder().appendDate(
+                                "", Date_t::fromMillisSinceEpoch(-50)).appendCode("", "abc").obj();
+                        BSONObj uc2 = BSONObjBuilder().appendDate(
+                                "", Date_t::fromMillisSinceEpoch(55)).appendCode("", "abc").obj();
                         ASSERT( uc1.woCompare(uc2, Ordering::make(BSONObj())) < 0 );
                         {
                             KeyV1Owned a(uc1);
@@ -693,6 +820,9 @@ namespace JsobjTests {
 
                 b.append( "g" , -123.456 );
 
+                b.append( "h" , 0.0 );
+                b.append( "i" , -0.0 );
+
                 BSONObj x = b.obj();
                 keyTest(x);
 
@@ -706,6 +836,8 @@ namespace JsobjTests {
 
                 ASSERT_EQUALS( "-123.456" , x["g"].toString( false , true ) );
 
+                ASSERT_EQUALS( "0.0" , x["h"].toString( false , true ) );
+                ASSERT_EQUALS( "-0.0" , x["i"].toString( false , true ) );
             }
         };
 
@@ -779,21 +911,6 @@ namespace JsobjTests {
             }
         };
 
-        class ArrayAppendAs {
-        public:
-            void run() {
-                BSONArrayBuilder b;
-                {
-                    BSONObj foo = BSON( "foo" << 1 );
-                    b.appendAs( foo.firstElement(), "3" );
-                }
-                BSONArray a = b.arr();
-                BSONObj expected = BSON( "3" << 1 );
-                ASSERT_EQUALS( expected.firstElement(), a[ 3 ] );
-                ASSERT_EQUALS( 4, a.nFields() );
-            }
-        };
-
         class GetField {
         public:
             void run(){
@@ -804,7 +921,81 @@ namespace JsobjTests {
                 ASSERT_EQUALS( 2 , o.getFieldDotted( "b.a" ).numberInt() );
                 ASSERT_EQUALS( 3 , o.getFieldDotted( "c.0.a" ).numberInt() );
                 ASSERT_EQUALS( 4 , o.getFieldDotted( "c.1.a" ).numberInt() );
+                ASSERT( o.getFieldDotted( "x" ).eoo() );
+                ASSERT( o.getFieldDotted( "a.x" ).eoo() );
+                ASSERT( o.getFieldDotted( "x.y" ).eoo() );
+                ASSERT( o.getFieldDotted( "" ).eoo() );
+                ASSERT( o.getFieldDotted( "." ).eoo() );
+                ASSERT( o.getFieldDotted( ".." ).eoo() );
+                ASSERT( o.getFieldDotted( "..." ).eoo() );
+                ASSERT( o.getFieldDotted( "a." ).eoo() );
+                ASSERT( o.getFieldDotted( ".a" ).eoo() );
+                ASSERT( o.getFieldDotted( "b.a." ).eoo() );
                 keyTest(o);
+            }
+        };
+
+        class ToStringRecursionDepth {
+        public:
+            // create a nested BSON object with the specified recursion depth
+            BSONObj recursiveBSON( int depth )  {
+                BSONObjBuilder b;
+                if ( depth==0 ) {
+                    b << "name" << "Joe";
+                    return b.obj();
+                }
+                b.append( "test", recursiveBSON( depth - 1) );
+                return b.obj();
+            }
+
+            void run() {
+                BSONObj nestedBSON;
+                StringBuilder s;
+                string nestedBSONString;
+                size_t found;
+
+                // recursion depth one less than max allowed-- do not shorten the string
+                nestedBSON = recursiveBSON( BSONObj::maxToStringRecursionDepth - 1  );
+                nestedBSON.toString( s, true, false );
+                nestedBSONString = s.str();
+                found = nestedBSONString.find( "..." );
+                // did not find the "..." pattern
+                ASSERT_EQUALS( found!=string::npos, false );
+
+                // recursion depth is equal to max allowed  -- do not shorten the string
+                nestedBSON = recursiveBSON( BSONObj::maxToStringRecursionDepth );
+                nestedBSON.toString( s, true, false );
+                nestedBSONString = s.str();
+                found = nestedBSONString.find( "..." );
+                // did not find the "..." pattern
+                ASSERT_EQUALS( found!=string::npos, false );
+
+                // recursion depth - one greater than max allowed -- shorten the string
+                nestedBSON = recursiveBSON( BSONObj::maxToStringRecursionDepth + 1 );
+                nestedBSON.toString( s, false, false );
+                nestedBSONString = s.str();
+                found = nestedBSONString.find( "..." );
+                // found the "..." pattern
+                ASSERT_EQUALS( found!=string::npos, true );
+
+                /* recursion depth - one greater than max allowed but with full=true
+                 * should fail with an assertion
+                 */
+                nestedBSON = recursiveBSON( BSONObj::maxToStringRecursionDepth + 1 );
+                ASSERT_THROWS( nestedBSON.toString( s, false, true ) , UserException );
+            }
+        };
+
+        class StringWithNull {
+        public:
+            void run() {
+                const string input = string("a") + '\0' + 'b';
+                ASSERT_EQUALS(input.size(), 3U);
+
+                BSONObj obj = BSON("str" << input);
+                const string output = obj.firstElement().String();
+                ASSERT_EQUALS(escape(output), escape(input)); // for better failure output
+                ASSERT_EQUALS(output, input);
             }
         };
 
@@ -1047,41 +1238,6 @@ namespace JsobjTests {
                 BSONType type_;
             };
 
-            // Randomized BSON parsing test.  See if we seg fault.
-            // NOTE This test is disabled (below), see SERVER-4948.
-            class Fuzz {
-            public:
-                Fuzz( double frequency ) : frequency_( frequency ) {}
-                void run() {
-                    BSONObj a = fromjson( "{\"a\": 1, \"b\": \"c\"}" );
-                    fuzz( a );
-                    a.valid();
-
-                    BSONObj b = fromjson( "{\"one\":2, \"two\":5, \"three\": {},"
-                                          "\"four\": { \"five\": { \"six\" : 11 } },"
-                                          "\"seven\": [ \"a\", \"bb\", \"ccc\", 5 ],"
-                                          "\"eight\": Dbref( \"rrr\", \"01234567890123456789aaaa\" ),"
-                                          "\"_id\": ObjectId( \"deadbeefdeadbeefdeadbeef\" ),"
-                                          "\"nine\": { \"$binary\": \"abc=\", \"$type\": \"00\" },"
-                                          "\"ten\": Date( 44 ), \"eleven\": /foooooo/i }" );
-                    fuzz( b );
-                    b.valid();
-                }
-            private:
-                void fuzz( BSONObj &o ) const {
-                    for( int i = 4; i < o.objsize(); ++i )
-                        for( unsigned char j = 1; j; j <<= 1 )
-                            if ( rand() < int( RAND_MAX * frequency_ ) ) {
-                                char *c = const_cast< char * >( o.objdata() ) + i;
-                                if ( *c & j )
-                                    *c &= ~j;
-                                else
-                                    *c |= j;
-                            }
-                }
-                double frequency_;
-            };
-
         } // namespace Validation
 
     } // namespace BSONObjTests
@@ -1109,7 +1265,7 @@ namespace JsobjTests {
                 OID b;
 
                 a.init();
-                b.init( a.str() );
+                b.init( a.toString() );
 
                 ASSERT( a == b );
             }
@@ -1125,9 +1281,9 @@ namespace JsobjTests {
                 BSONObj o = b.obj();
                 keyTest(o);
 
-                ASSERT( o["a"].__oid().str() == "000000000000000000000000" );
-                ASSERT( o["b"].__oid().str() == "000000000000000000000000" );
-                ASSERT( o["c"].__oid().str() != "000000000000000000000000" );
+                ASSERT( o["a"].__oid().toString() == "000000000000000000000000" );
+                ASSERT( o["b"].__oid().toString() == "000000000000000000000000" );
+                ASSERT( o["c"].__oid().toString() != "000000000000000000000000" );
 
             }
         };
@@ -1158,23 +1314,12 @@ namespace JsobjTests {
         public:
             void run() {
                 OID oid;
+                const Date_t base(Date_t::now());
+                oid.init( base );
 
-                {
-                    time_t before = ::time(0);
-                    oid.init();
-                    time_t after = ::time(0);
-                    ASSERT( oid.asTimeT() >= before );
-                    ASSERT( oid.asTimeT() <= after );
-                }
-
-                {
-                    Date_t before = jsTime();
-                    sleepsecs(1);
-                    oid.init();
-                    Date_t after = jsTime();
-                    ASSERT( oid.asDateT() >= before );
-                    ASSERT( oid.asDateT() <= after );
-                }
+                ASSERT_EQUALS(base.toMillisSinceEpoch() / 1000,
+                              oid.asDateT().toMillisSinceEpoch() / 1000);
+                ASSERT_EQUALS( base.toTimeT(), oid.asTimeT() );
             }
         };
 
@@ -1182,18 +1327,19 @@ namespace JsobjTests {
         public:
             void run() {
                 OID min, oid, max;
-                Date_t now = jsTime();
-                oid.init(); // slight chance this has different time. If its a problem, can change.
-                min.init(now);
+                oid.init();
+                const Date_t now = oid.asDateT();
+                min.init(now, false);
                 max.init(now, true);
 
-                ASSERT_EQUALS( (unsigned)oid.asTimeT() , now/1000 );
-                ASSERT_EQUALS( (unsigned)min.asTimeT() , now/1000 );
-                ASSERT_EQUALS( (unsigned)max.asTimeT() , now/1000 );
-                ASSERT( BSON("" << min).woCompare( BSON("" << oid) ) < 0  );
-                ASSERT( BSON("" << max).woCompare( BSON("" << oid)  )> 0  );
+                ASSERT_EQUALS(oid.asDateT(), now);
+                ASSERT_EQUALS(min.asDateT(), now);
+                ASSERT_EQUALS(max.asDateT(), now);
+                ASSERT_LT(BSON("" << min), BSON("" << oid));
+                ASSERT_GT(BSON("" << max), BSON("" << oid));
             }
         };
+
     } // namespace OIDTests
 
 
@@ -1302,6 +1448,88 @@ namespace JsobjTests {
             }
         };
 
+        class AllTypes {
+        public:
+            void run() {
+                // These are listed in order of BSONType
+
+                ASSERT_EQUALS(objTypeOf(MINKEY), MinKey);
+                ASSERT_EQUALS(arrTypeOf(MINKEY), MinKey);
+
+                // EOO not valid in middle of BSONObj
+
+                ASSERT_EQUALS(objTypeOf(1.0), NumberDouble);
+                ASSERT_EQUALS(arrTypeOf(1.0), NumberDouble);
+
+                ASSERT_EQUALS(objTypeOf(""), String);
+                ASSERT_EQUALS(arrTypeOf(""), String);
+                ASSERT_EQUALS(objTypeOf(string()), String);
+                ASSERT_EQUALS(arrTypeOf(string()), String);
+                ASSERT_EQUALS(objTypeOf(StringData("")), String);
+                ASSERT_EQUALS(arrTypeOf(StringData("")), String);
+
+                ASSERT_EQUALS(objTypeOf(BSONObj()), Object);
+                ASSERT_EQUALS(arrTypeOf(BSONObj()), Object);
+
+                ASSERT_EQUALS(objTypeOf(BSONArray()), Array);
+                ASSERT_EQUALS(arrTypeOf(BSONArray()), Array);
+
+                ASSERT_EQUALS(objTypeOf(BSONBinData("", 0, BinDataGeneral)), BinData);
+                ASSERT_EQUALS(arrTypeOf(BSONBinData("", 0, BinDataGeneral)), BinData);
+
+                ASSERT_EQUALS(objTypeOf(BSONUndefined), Undefined);
+                ASSERT_EQUALS(arrTypeOf(BSONUndefined), Undefined);
+
+                ASSERT_EQUALS(objTypeOf(OID()), jstOID);
+                ASSERT_EQUALS(arrTypeOf(OID()), jstOID);
+
+                ASSERT_EQUALS(objTypeOf(true), Bool);
+                ASSERT_EQUALS(arrTypeOf(true), Bool);
+
+                ASSERT_EQUALS(objTypeOf(Date_t()), Date);
+                ASSERT_EQUALS(arrTypeOf(Date_t()), Date);
+
+                ASSERT_EQUALS(objTypeOf(BSONNULL), jstNULL);
+                ASSERT_EQUALS(arrTypeOf(BSONNULL), jstNULL);
+
+                ASSERT_EQUALS(objTypeOf(BSONRegEx("", "")), RegEx);
+                ASSERT_EQUALS(arrTypeOf(BSONRegEx("", "")), RegEx);
+
+                ASSERT_EQUALS(objTypeOf(BSONDBRef("", OID())), DBRef);
+                ASSERT_EQUALS(arrTypeOf(BSONDBRef("", OID())), DBRef);
+
+                ASSERT_EQUALS(objTypeOf(BSONCode("")), Code);
+                ASSERT_EQUALS(arrTypeOf(BSONCode("")), Code);
+
+                ASSERT_EQUALS(objTypeOf(BSONSymbol("")), Symbol);
+                ASSERT_EQUALS(arrTypeOf(BSONSymbol("")), Symbol);
+
+                ASSERT_EQUALS(objTypeOf(BSONCodeWScope("", BSONObj())), CodeWScope);
+                ASSERT_EQUALS(arrTypeOf(BSONCodeWScope("", BSONObj())), CodeWScope);
+
+                ASSERT_EQUALS(objTypeOf(1), NumberInt);
+                ASSERT_EQUALS(arrTypeOf(1), NumberInt);
+
+                ASSERT_EQUALS(objTypeOf(Timestamp()), bsonTimestamp);
+                ASSERT_EQUALS(arrTypeOf(Timestamp()), bsonTimestamp);
+
+                ASSERT_EQUALS(objTypeOf(1LL), NumberLong);
+                ASSERT_EQUALS(arrTypeOf(1LL), NumberLong);
+
+                ASSERT_EQUALS(objTypeOf(MAXKEY), MaxKey);
+                ASSERT_EQUALS(arrTypeOf(MAXKEY), MaxKey);
+            }
+
+            template<typename T>
+            BSONType objTypeOf(const T& thing) {
+                return BSON("" << thing).firstElement().type();
+            }
+
+            template<typename T>
+            BSONType arrTypeOf(const T& thing) {
+                return BSON_ARRAY(thing).firstElement().type();
+            }
+        };
     } // namespace ValueStreamTests
 
     class SubObjectBuilder {
@@ -1322,9 +1550,9 @@ namespace JsobjTests {
     class DateBuilder {
     public:
         void run() {
-            BSONObj o = BSON("" << Date_t(1234567890));
+            BSONObj o = BSON("" << Date_t::fromMillisSinceEpoch(1234567890));
             ASSERT( o.firstElement().type() == Date );
-            ASSERT( o.firstElement().date() == Date_t(1234567890) );
+            ASSERT( o.firstElement().date() == Date_t::fromMillisSinceEpoch(1234567890) );
         }
     };
 
@@ -1347,22 +1575,17 @@ namespace JsobjTests {
     class TimeTBuilder {
     public:
         void run() {
-            Date_t before = jsTime();
-            sleepmillis(1);
-            time_t now = time(NULL);
-            sleepmillis(1);
-            Date_t after = jsTime();
-
+            Date_t aDate = Date_t::now();
+            time_t aTime = aDate.toTimeT();
             BSONObjBuilder b;
-            b.appendTimeT("now", now);
+            b.appendTimeT("now", aTime);
             BSONObj o = b.obj();
 
             ASSERT( o.valid() );
 
             BSONElement e = o["now"];
-            ASSERT( e.type() == Date );
-            ASSERT( e.date()/1000 >= before/1000 );
-            ASSERT( e.date()/1000 <= after/1000 );
+            ASSERT_EQUALS(Date,  e.type());
+            ASSERT_EQUALS(aTime, e.date().toTimeT());
         }
     };
 
@@ -1470,216 +1693,24 @@ namespace JsobjTests {
         }
     };
 
-    namespace external_sort {
-        class Basic1 {
-        public:
-            void run() {
-                BSONObjExternalSorter sorter(indexInterfaceForTheseTests);
-
-                sorter.add( BSON( "x" << 10 ) , 5  , 1);
-                sorter.add( BSON( "x" << 2 ) , 3 , 1 );
-                sorter.add( BSON( "x" << 5 ) , 6 , 1 );
-                sorter.add( BSON( "x" << 5 ) , 7 , 1 );
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                int num=0;
-                while ( i->more() ) {
-                    pair<BSONObj,DiskLoc> p = i->next();
-                    if ( num == 0 )
-                        verify( p.first["x"].number() == 2 );
-                    else if ( num <= 2 ) {
-                        verify( p.first["x"].number() == 5 );
-                    }
-                    else if ( num == 3 )
-                        verify( p.first["x"].number() == 10 );
-                    else
-                        ASSERT( 0 );
-                    num++;
-                }
-
-
-                ASSERT_EQUALS( 0 , sorter.numFiles() );
-            }
-        };
-
-        class Basic2 {
-        public:
-            void run() {
-                BSONObjExternalSorter sorter( indexInterfaceForTheseTests, BSONObj() , 10 );
-                sorter.add( BSON( "x" << 10 ) , 5  , 11 );
-                sorter.add( BSON( "x" << 2 ) , 3 , 1 );
-                sorter.add( BSON( "x" << 5 ) , 6 , 1 );
-                sorter.add( BSON( "x" << 5 ) , 7 , 1 );
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                int num=0;
-                while ( i->more() ) {
-                    pair<BSONObj,DiskLoc> p = i->next();
-                    if ( num == 0 ) {
-                        verify( p.first["x"].number() == 2 );
-                        ASSERT_EQUALS( p.second.toString() , "3:1" );
-                    }
-                    else if ( num <= 2 )
-                        verify( p.first["x"].number() == 5 );
-                    else if ( num == 3 ) {
-                        verify( p.first["x"].number() == 10 );
-                        ASSERT_EQUALS( p.second.toString() , "5:b" );
-                    }
-                    else
-                        ASSERT( 0 );
-                    num++;
-                }
-
-            }
-        };
-
-        class Basic3 {
-        public:
-            void run() {
-                BSONObjExternalSorter sorter( indexInterfaceForTheseTests, BSONObj() , 10 );
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                verify( ! i->more() );
-
-            }
-        };
-
-
-        class ByDiskLock {
-        public:
-            void run() {
-                BSONObjExternalSorter sorter(indexInterfaceForTheseTests);
-                sorter.add( BSON( "x" << 10 ) , 5  , 4);
-                sorter.add( BSON( "x" << 2 ) , 3 , 0 );
-                sorter.add( BSON( "x" << 5 ) , 6 , 2 );
-                sorter.add( BSON( "x" << 5 ) , 7 , 3 );
-                sorter.add( BSON( "x" << 5 ) , 2 , 1 );
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                int num=0;
-                while ( i->more() ) {
-                    pair<BSONObj,DiskLoc> p = i->next();
-                    if ( num == 0 )
-                        verify( p.first["x"].number() == 2 );
-                    else if ( num <= 3 ) {
-                        verify( p.first["x"].number() == 5 );
-                    }
-                    else if ( num == 4 )
-                        verify( p.first["x"].number() == 10 );
-                    else
-                        ASSERT( 0 );
-                    ASSERT_EQUALS( num , p.second.getOfs() );
-                    num++;
-                }
-
-
-            }
-        };
-
-
-        class Big1 {
-        public:
-            void run() {
-                BSONObjExternalSorter sorter( indexInterfaceForTheseTests, BSONObj() , 2000 );
-                for ( int i=0; i<10000; i++ ) {
-                    sorter.add( BSON( "x" << rand() % 10000 ) , 5  , i );
-                }
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                int num=0;
-                double prev = 0;
-                while ( i->more() ) {
-                    pair<BSONObj,DiskLoc> p = i->next();
-                    num++;
-                    double cur = p.first["x"].number();
-                    verify( cur >= prev );
-                    prev = cur;
-                }
-                verify( num == 10000 );
-            }
-        };
-
-        class Big2 {
-        public:
-            void run() {
-                const int total = 100000;
-                BSONObjExternalSorter sorter( indexInterfaceForTheseTests, BSONObj() , total * 2 );
-                for ( int i=0; i<total; i++ ) {
-                    sorter.add( BSON( "a" << "b" ) , 5  , i );
-                }
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                int num=0;
-                double prev = 0;
-                while ( i->more() ) {
-                    pair<BSONObj,DiskLoc> p = i->next();
-                    num++;
-                    double cur = p.first["x"].number();
-                    verify( cur >= prev );
-                    prev = cur;
-                }
-                verify( num == total );
-                ASSERT( sorter.numFiles() > 2 );
-            }
-        };
-
-        class D1 {
-        public:
-            void run() {
-
-                BSONObjBuilder b;
-                b.appendNull("");
-                BSONObj x = b.obj();
-
-                BSONObjExternalSorter sorter(indexInterfaceForTheseTests);
-                sorter.add(x, DiskLoc(3,7));
-                sorter.add(x, DiskLoc(4,7));
-                sorter.add(x, DiskLoc(2,7));
-                sorter.add(x, DiskLoc(1,7));
-                sorter.add(x, DiskLoc(3,77));
-
-                sorter.sort();
-
-                auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
-                while( i->more() ) {
-                    BSONObjExternalSorter::Data d = i->next();
-                    /*cout << d.second.toString() << endl;
-                    cout << d.first.objsize() << endl;
-                    cout<<"SORTER next:" << d.first.toString() << endl;*/
-                }
-            }
-        };
-    }
-
     class CompatBSON {
     public:
 
-#define JSONBSONTEST(j,s,m) ASSERT_EQUALS( fromjson( j ).objsize() , s ); ASSERT_EQUALS( fromjson( j ).md5() , m );
-#define RAWBSONTEST(j,s,m) ASSERT_EQUALS( j.objsize() , s ); ASSERT_EQUALS( j.md5() , m );
+#define JSONBSONTEST(j,s) ASSERT_EQUALS( fromjson( j ).objsize() , s );
+#define RAWBSONTEST(j,s) ASSERT_EQUALS( j.objsize() , s );
 
         void run() {
 
-            JSONBSONTEST( "{ 'x' : true }" , 9 , "6fe24623e4efc5cf07f027f9c66b5456" );
-            JSONBSONTEST( "{ 'x' : null }" , 8 , "12d43430ff6729af501faf0638e68888" );
-            JSONBSONTEST( "{ 'x' : 5.2 }" , 16 , "aaeeac4a58e9c30eec6b0b0319d0dff2" );
-            JSONBSONTEST( "{ 'x' : 'eliot' }" , 18 , "331a3b8b7cbbe0706c80acdb45d4ebbe" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : 'truth' , 'z' : 1.1 }" , 40 , "7c77b3a6e63e2f988ede92624409da58" );
-            JSONBSONTEST( "{ 'a' : { 'b' : 1.1 } }" , 24 , "31887a4b9d55cd9f17752d6a8a45d51f" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : { 'a' : 'eliot' , b : true } , 'z' : null }" , 44 , "b3de8a0739ab329e7aea138d87235205" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : [ 'a' , 'eliot' , 'b' , true ] , 'z' : null }" , 62 , "cb7bad5697714ba0cbf51d113b6a0ee8" );
+            JSONBSONTEST( "{ 'x' : true }" , 9 );
+            JSONBSONTEST( "{ 'x' : null }" , 8 );
+            JSONBSONTEST( "{ 'x' : 5.2 }" , 16 );
+            JSONBSONTEST( "{ 'x' : 'eliot' }" , 18 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : 'truth' , 'z' : 1.1 }" , 40 );
+            JSONBSONTEST( "{ 'a' : { 'b' : 1.1 } }" , 24 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : { 'a' : 'eliot' , b : true } , 'z' : null }" , 44 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : [ 'a' , 'eliot' , 'b' , true ] , 'z' : null }" , 62 );
 
-            RAWBSONTEST( BSON( "x" << 4 ) , 12 , "d1ed8dbf79b78fa215e2ded74548d89d" );
+            RAWBSONTEST( BSON( "x" << 4 ) , 12 );
 
         }
     };
@@ -1771,17 +1802,45 @@ namespace JsobjTests {
             objb << objb.numStr(i++) << oid;
             arrb                     << oid;
 
+            objb.appendUndefined(objb.numStr(i++));
+            arrb.appendUndefined();
+
+            objb.appendRegex(objb.numStr(i++), "test", "imx");
+            arrb.appendRegex("test", "imx");
+
+            objb.appendBinData(objb.numStr(i++), 4, BinDataGeneral, "wow");
+            arrb.appendBinData(4, BinDataGeneral, "wow");
+
+            objb.appendCode(objb.numStr(i++), "function(){ return 1; }");
+            arrb.appendCode("function(){ return 1; }");
+
+            objb.appendCodeWScope(objb.numStr(i++), "function(){ return a; }", BSON("a" << 1));
+            arrb.appendCodeWScope("function(){ return a; }", BSON("a" << 1));
+
+            time_t dt(0);
+            objb.appendTimeT(objb.numStr(i++), dt);
+            arrb.appendTimeT(dt);
+
+            Date_t date{};
+            objb.appendDate(objb.numStr(i++), date);
+            arrb.appendDate(date);
+
+            objb.append(objb.numStr(i++), BSONRegEx("test2", "s"));
+            arrb.append(BSONRegEx("test2", "s"));
+
             BSONObj obj = objb.obj();
             BSONArray arr = arrb.arr();
 
             ASSERT_EQUALS(obj, arr);
 
-            BSONObj o = BSON( "obj" << obj << "arr" << arr << "arr2" << BSONArray(obj) );
+            BSONObj o = BSON( "obj" << obj << "arr" << arr << "arr2" << BSONArray(obj)
+                    << "regex" << BSONRegEx("reg", "x"));
             keyTest(o);
 
             ASSERT_EQUALS(o["obj"].type(), Object);
             ASSERT_EQUALS(o["arr"].type(), Array);
             ASSERT_EQUALS(o["arr2"].type(), Array);
+            ASSERT_EQUALS(o["regex"].type(), RegEx);
         }
     };
 
@@ -1881,25 +1940,82 @@ namespace JsobjTests {
     public:
 
         void good( string s ) {
-            BSONObj o = fromjson( s );
-            if ( o.okForStorage() )
+            good( fromjson( s ) );
+        }
+
+        void good( BSONObj o ) {
+            if ( o.okForStorageAsRoot() )
                 return;
-            throw UserException( 12528 , (string)"should be ok for storage:" + s );
+            throw UserException( 12528 , (string)"should be ok for storage:" + o.toString() );
         }
 
         void bad( string s ) {
-            BSONObj o = fromjson( s );
-            if ( ! o.okForStorage() )
+            bad( fromjson( s ) );
+        }
+
+        void bad( BSONObj o ) {
+            if ( ! o.okForStorageAsRoot() )
                 return;
-            throw UserException( 12529 , (string)"should NOT be ok for storage:" + s );
+            throw UserException( 12529 , (string)"should NOT be ok for storage:" + o.toString() );
         }
 
         void run() {
+            // basic docs are good
+            good( "{}" );
             good( "{x:1}" );
-            bad( "{'x.y':1}" );
-
             good( "{x:{a:2}}" );
+
+            // no dots allowed
+            bad( "{'x.y':1}" );
+            bad( "{'x\\.y':1}" );
+
+            // Check for $
             bad( "{x:{'$a':2}}" );
+            good( "{'a$b':2}" );
+            good( "{'a$': {b: 2}}" );
+            good( "{'a$':2}" );
+            good( "{'a $ a': 'foo'}" );
+
+            // Queries are not ok
+            bad( "{num: {$gt: 1}}" );
+            bad( "{_id: {$regex:'test'}}" );
+            bad( "{$gt: 2}" );
+            bad( "{a : { oo: [ {$bad:1}, {good:1}] }}");
+            good( "{a : { oo: [ {'\\\\$good':1}, {good:1}] }}");
+
+            // DBRef stuff -- json parser can't handle this yet
+            good( BSON("a" << BSON("$ref" << "coll" << "$id" << 1)) );
+            good( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "$db" << "a")) );
+            good( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "stuff" << 1)) );
+            good( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "$db" <<
+                                   "a" << "stuff" << 1)) );
+
+            bad( BSON("a" << BSON("$ref" << 1 << "$id" << 1)) );
+            bad( BSON("a" << BSON("$ref" << 1 << "$id" << 1 << "$db" << "a")) );
+            bad( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "$db" << 1)) );
+            bad( BSON("a" << BSON("$ref" << "coll")) );
+            bad( BSON("a" << BSON("$ref" << "coll" << "$db" << "db")) );
+            bad( BSON("a" << BSON("$id" << 1)) );
+            bad( BSON("a" << BSON("$id" << 1 << "$ref" << "coll")) );
+            bad( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "$hater" << 1)) );
+            bad( BSON("a" << BSON("$ref" << "coll" << "$id" << 1 << "dot.dot" << 1)) );
+
+            // _id isn't a RegEx, or Array
+            good( "{_id: 0}" );
+            good( "{_id: {a:1, b:1}}" );
+            good( "{_id: {rx: /a/}}" );
+            good( "{_id: {rx: {$regex: 'a'}}}" );
+            bad( "{_id: /a/ }" );
+            bad( "{_id: /a/, other:1}" );
+            bad( "{hi:1, _id: /a/ }" );
+            bad( "{_id: /a/i }" );
+            bad( "{first:/f/i, _id: /a/i }" );
+            //Not really a regex type
+            bad( "{_id: {$regex: 'a'} }" );
+            bad( "{_id: {$regex: 'a', $options:'i'} }" );
+            bad( "{_id:  [1,2]}" );
+            bad( "{_id:  [1]}" );
+
         }
     };
 
@@ -1908,7 +2024,7 @@ namespace JsobjTests {
         void run() {
             BSONObj x = BSON( "_id" << 5 << "t" << 2 );
             {
-                char * crap = (char*)malloc( x.objsize() );
+                char * crap = (char*)mongoMalloc( x.objsize() );
                 memcpy( crap , x.objdata() , x.objsize() );
                 BSONObj y( crap );
                 ASSERT_EQUALS( x , y );
@@ -1916,7 +2032,7 @@ namespace JsobjTests {
             }
 
             {
-                char * crap = (char*)malloc( x.objsize() );
+                char * crap = (char*)mongoMalloc( x.objsize() );
                 memcpy( crap , x.objdata() , x.objsize() );
                 int * foo = (int*)crap;
                 foo[0] = 123123123;
@@ -1927,7 +2043,7 @@ namespace JsobjTests {
                 }
                 catch ( std::exception& e ) {
                     state = 2;
-                    ASSERT( strstr( e.what() , "_id: 5" ) > 0 );
+                    ASSERT( strstr( e.what() , "_id: 5" ) != NULL );
                 }
                 free( crap );
                 ASSERT_EQUALS( 2 , state );
@@ -2027,33 +2143,6 @@ namespace JsobjTests {
         }
     };
 
-    class BSONFieldTests {
-    public:
-        void run() {
-            {
-                BSONField<int> x("x");
-                BSONObj o = BSON( x << 5 );
-                ASSERT_EQUALS( BSON( "x" << 5 ) , o );
-            }
-
-            {
-                BSONField<int> x("x");
-                BSONObj o = BSON( x.make(5) );
-                ASSERT_EQUALS( BSON( "x" << 5 ) , o );
-            }
-
-            {
-                BSONField<int> x("x");
-                BSONObj o = BSON( x(5) );
-                ASSERT_EQUALS( BSON( "x" << 5 ) , o );
-
-                o = BSON( x.gt(5) );
-                ASSERT_EQUALS( BSON( "x" << BSON( "$gt" << 5 ) ) , o );
-            }
-
-        }
-    };
-
     class BSONForEachTest {
     public:
         void run() {
@@ -2066,26 +2155,6 @@ namespace JsobjTests {
             }
 
             ASSERT_EQUALS( count , 1+2+3 );
-        }
-    };
-
-    class StringDataTest {
-    public:
-        void run() {
-            StringData a( string( "aaa" ) );
-            ASSERT_EQUALS( 3u , a.size() );
-
-            StringData b( string( "bbb" ).c_str() );
-            ASSERT_EQUALS( 3u , b.size() );
-
-            StringData c( "ccc", StringData::LiteralTag() );
-            ASSERT_EQUALS( 3u , c.size() );
-
-            // TODO update test when second parm takes StringData too
-            BSONObjBuilder builder;
-            builder.append( c, "value");
-            ASSERT_EQUALS( builder.obj() , BSON( c.data() << "value" ) );
-
         }
     };
 
@@ -2110,38 +2179,24 @@ namespace JsobjTests {
         }
     };
 
-    class HashingTest {
+    class NestedBuilderOversize {
     public:
         void run() {
-            int N = 100000;
-            BSONObj x = BSON( "name" << "eliot was here"
-                              << "x" << 5
-                              << "asdasdasdas" << "asldkasldjasldjasldjlasjdlasjdlasdasdasdasdasdasdasd" );
+            try {
+                BSONObjBuilder outer;
+                BSONObjBuilder inner(outer.subobjStart("inner"));
 
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    x.md5();
-                //int millis = t.millis();
-                //cout << "md5 : " << millis << endl;
+                string bigStr(1000, 'x');
+                while (true) {
+                    ASSERT_LESS_THAN_OR_EQUALS(inner.len(), BufferMaxSize);
+                    inner.append("", bigStr);
+                }
+
+                ASSERT(!"Expected Throw");
+            } catch (const DBException& e) {
+                if (e.getCode() != 13548) // we expect the code for oversized buffer
+                    throw;
             }
-
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    x.toString();
-                //int millis = t.millis();
-                //cout << "toString : " << millis << endl;
-            }
-
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    checksum( x.objdata() , x.objsize() );
-                //int millis = t.millis();
-                //cout << "checksum : " << millis << endl;
-            }
-
         }
     };
 
@@ -2152,6 +2207,7 @@ namespace JsobjTests {
 
         void setupTests() {
             add< BufBuilderBasic >();
+            add< BufBuilderReallocLimit >();
             add< BSONElementBasic >();
             add< BSONObjTests::NullString >();
             add< BSONObjTests::Create >();
@@ -2162,8 +2218,8 @@ namespace JsobjTests {
             add< BSONObjTests::WoCompareOrdered >();
             add< BSONObjTests::WoCompareDifferentLength >();
             add< BSONObjTests::WoSortOrder >();
+            add< BSONObjTests::IsPrefixOf >();
             add< BSONObjTests::MultiKeySortOrder > ();
-            add< BSONObjTests::TimestampTest >();
             add< BSONObjTests::Nan >();
             add< BSONObjTests::AsTempObj >();
             add< BSONObjTests::AppendIntOrLL >();
@@ -2171,8 +2227,9 @@ namespace JsobjTests {
             add< BSONObjTests::ToStringArray >();
             add< BSONObjTests::ToStringNumber >();
             add< BSONObjTests::AppendAs >();
-            add< BSONObjTests::ArrayAppendAs >();
             add< BSONObjTests::GetField >();
+            add< BSONObjTests::ToStringRecursionDepth >();
+            add< BSONObjTests::StringWithNull >();
 
             add< BSONObjTests::Validation::BadType >();
             add< BSONObjTests::Validation::EooBeforeEnd >();
@@ -2201,13 +2258,6 @@ namespace JsobjTests {
             add< BSONObjTests::Validation::NoSize >( Object );
             add< BSONObjTests::Validation::NoSize >( Array );
             add< BSONObjTests::Validation::NoSize >( BinData );
-            if ( 0 ) { // SERVER-4948
-            add< BSONObjTests::Validation::Fuzz >( .5 );
-            add< BSONObjTests::Validation::Fuzz >( .1 );
-            add< BSONObjTests::Validation::Fuzz >( .05 );
-            add< BSONObjTests::Validation::Fuzz >( .01 );
-            add< BSONObjTests::Validation::Fuzz >( .001 );
-            }
             add< OIDTests::init1 >();
             add< OIDTests::initParse1 >();
             add< OIDTests::append >();
@@ -2223,6 +2273,7 @@ namespace JsobjTests {
             add< ValueStreamTests::LabelishOr >();
             add< ValueStreamTests::Unallowed >();
             add< ValueStreamTests::ElementAppend >();
+            add< ValueStreamTests::AllTypes >();
             add< SubObjectBuilder >();
             add< DateBuilder >();
             add< DateNowBuilder >();
@@ -2231,13 +2282,6 @@ namespace JsobjTests {
             add< MinMaxElementTest >();
             add< ComparatorTest >();
             add< ExtractFieldsTest >();
-            add< external_sort::Basic1 >();
-            add< external_sort::Basic2 >();
-            add< external_sort::Basic3 >();
-            add< external_sort::ByDiskLock >();
-            add< external_sort::Big1 >();
-            add< external_sort::Big2 >();
-            add< external_sort::D1 >();
             add< CompatBSON >();
             add< CompareDottedFieldNamesTest >();
             add< CompareDottedArrayFieldNamesTest >();
@@ -2252,13 +2296,13 @@ namespace JsobjTests {
             add< ElementSetTest >();
             add< EmbeddedNumbers >();
             add< BuilderPartialItearte >();
-            add< BSONFieldTests >();
             add< BSONForEachTest >();
-            add< StringDataTest >();
             add< CompareOps >();
-            add< HashingTest >();
+            add< NestedBuilderOversize >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JsobjTests
 

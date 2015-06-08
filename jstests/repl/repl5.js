@@ -7,21 +7,23 @@ soonCountAtLeast = function( db, coll, count ) {
                 } );    
 }
 
-doTest = function( signal ) {
+doTest = function(signal, extraOpts) {
 
     rt = new ReplTest( "repl5tests" );
     
     m = rt.start( true );
     
     ma = m.getDB( "a" ).a;
+    var bulk = ma.initializeUnorderedBulkOp();
     for( i = 0; i < 10000; ++i )
-        ma.save( { i:i } );
+        bulk.insert({ i: i });
+    assert.writeOK(bulk.execute());
     
-    s = rt.start( false );
+    s = rt.start(false, extraOpts);
     soonCountAtLeast( "a", "a", 1 );
     rt.stop( false, signal );
 
-    s = rt.start( false, null, true );
+    s = rt.start(false, extraOpts, true);
     sleep( 1000 );
     soonCountAtLeast( "a", "a", 10000 );
 
@@ -29,4 +31,4 @@ doTest = function( signal ) {
 }
 
 doTest( 15 ); // SIGTERM
-doTest( 9 );  // SIGKILL
+doTest(9, { journal: null });  // SIGKILL

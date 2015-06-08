@@ -15,21 +15,48 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "dbtests.h"
-#include "../util/base64.h"
-#include "../util/array.h"
-#include "../util/text.h"
-#include "../util/queue.h"
-#include "../util/paths.h"
-#include "../util/stringutils.h"
-#include "../util/compress.h"
-#include "../db/db.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+#include <iostream>
+
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/paths.h"
+#include "mongo/db/storage/mmap_v1/compress.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/queue.h"
+#include "mongo/util/stringutils.h"
+#include "mongo/util/text.h"
+#include "mongo/util/thread_safe_string.h"
+#include "mongo/util/time_support.h"
 
 namespace BasicTests {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::cout;
+    using std::dec;
+    using std::endl;
+    using std::hex;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class Rarely {
     public:
@@ -202,12 +229,12 @@ namespace BasicTests {
                 if( sec == 1 ) 
                     matches++;
                 else
-                    log() << "temp millis: " << t.millis() << endl;
+                    mongo::unittest::log() << "temp millis: " << t.millis() << endl;
                 ASSERT( sec >= 0 && sec <= 2 );
                 t.reset();
             }
             if ( matches < 2 )
-                log() << "matches:" << matches << endl;
+                mongo::unittest::log() << "matches:" << matches << endl;
             ASSERT( matches >= 2 );
 
             sleepmicros( 1527123 );
@@ -260,6 +287,31 @@ namespace BasicTests {
 
     };
 
+    class SleepBackoffTest {
+    public:
+        void run() {
+
+            int maxSleepTimeMillis = 1000;
+
+            Backoff backoff( maxSleepTimeMillis, maxSleepTimeMillis * 2 );
+
+            // Double previous sleep duration
+            ASSERT_EQUALS( backoff.getNextSleepMillis( 0,   0, 0 ), 1 );
+            ASSERT_EQUALS( backoff.getNextSleepMillis( 2,   0, 0 ), 4 );
+            ASSERT_EQUALS( backoff.getNextSleepMillis( 256, 0, 0 ), 512 );
+
+            // Make sure our backoff increases to the maximum value
+            ASSERT_EQUALS( backoff.getNextSleepMillis( maxSleepTimeMillis - 200, 0, 0 ), maxSleepTimeMillis );
+            ASSERT_EQUALS( backoff.getNextSleepMillis( maxSleepTimeMillis * 2, 0, 0 ), maxSleepTimeMillis );
+
+            // Make sure that our backoff gets reset if we wait much longer than the maximum wait
+            unsigned long long resetAfterMillis = maxSleepTimeMillis + maxSleepTimeMillis * 2;
+            ASSERT_EQUALS( backoff.getNextSleepMillis( 20, resetAfterMillis, 0), 40 ); // no reset here
+            ASSERT_EQUALS( backoff.getNextSleepMillis( 20, resetAfterMillis + 1, 0), 1 ); // reset expected
+
+        }
+    };
+
     class AssertTests {
     public:
 
@@ -286,38 +338,17 @@ namespace BasicTests {
         }
     };
 
-    namespace ArrayTests {
-        class basic1 {
-        public:
-            void run() {
-                FastArray<int> a(100);
-                a.push_back( 5 );
-                a.push_back( 6 );
-
-                ASSERT_EQUALS( 2 , a.size() );
-
-                FastArray<int>::iterator i = a.begin();
-                ASSERT( i != a.end() );
-                ASSERT_EQUALS( 5 , *i );
-                ++i;
-                ASSERT( i != a.end() );
-                ASSERT_EQUALS( 6 , *i );
-                ++i;
-                ASSERT( i == a.end() );
-            }
-        };
-    };
-
     class ThreadSafeStringTest {
     public:
         void run() {
             ThreadSafeString s;
             s = "eliot";
-            ASSERT_EQUALS( s , "eliot" );
-            ASSERT( s != "eliot2" );
+            ASSERT_EQUALS( s.toString() , "eliot" );
+            ASSERT( s.toString() != "eliot2" );
 
-            ThreadSafeString s2 = s;
-            ASSERT_EQUALS( s2 , "eliot" );
+            ThreadSafeString s2;
+            s2 = s.toString().c_str();
+            ASSERT_EQUALS( s2.toString() , "eliot" );
 
 
             {
@@ -332,206 +363,6 @@ namespace BasicTests {
         }
     };
 
-    class LexNumCmp {
-    public:
-        static void assertCmp( int expected, const char *s1, const char *s2,
-                              bool lexOnly = false ) {
-            mongo::LexNumCmp cmp( lexOnly );
-            ASSERT_EQUALS( expected, cmp.cmp( s1, s2, lexOnly ) );
-            ASSERT_EQUALS( expected, cmp.cmp( s1, s2 ) );
-            ASSERT_EQUALS( expected < 0, cmp( s1, s2 ) );
-            ASSERT_EQUALS( expected < 0, cmp( string( s1 ), string( s2 ) ) );
-        }
-        void run() {
-
-            ASSERT( ! isNumber( (char)255 ) );
-
-            assertCmp( 0, "a", "a" );
-            assertCmp( -1, "a", "aa" );
-            assertCmp( 1, "aa", "a" );
-            assertCmp( -1, "a", "b" );
-            assertCmp( 1, "100", "50" );
-            assertCmp( -1, "50", "100" );
-            assertCmp( 1, "b", "a" );
-            assertCmp( 0, "aa", "aa" );
-            assertCmp( -1, "aa", "ab" );
-            assertCmp( 1, "ab", "aa" );
-            assertCmp( 1, "0", "a" );
-            assertCmp( 1, "a0", "aa" );
-            assertCmp( -1, "a", "0" );
-            assertCmp( -1, "aa", "a0" );
-            assertCmp( 0, "0", "0" );
-            assertCmp( 0, "10", "10" );
-            assertCmp( -1, "1", "10" );
-            assertCmp( 1, "10", "1" );
-            assertCmp( 1, "11", "10" );
-            assertCmp( -1, "10", "11" );
-            assertCmp( 1, "f11f", "f10f" );
-            assertCmp( -1, "f10f", "f11f" );
-            assertCmp( -1, "f11f", "f111" );
-            assertCmp( 1, "f111", "f11f" );
-            assertCmp( -1, "f12f", "f12g" );
-            assertCmp( 1, "f12g", "f12f" );
-            assertCmp( 1, "aa{", "aab" );
-            assertCmp( -1, "aa{", "aa1" );
-            assertCmp( -1, "a1{", "a11" );
-            assertCmp( 1, "a1{a", "a1{" );
-            assertCmp( -1, "a1{", "a1{a" );
-            assertCmp( 1, "21", "11" );
-            assertCmp( -1, "11", "21" );
-
-            assertCmp( -1 , "a.0" , "a.1" );
-            assertCmp( -1 , "a.0.b" , "a.1" );
-
-            assertCmp( -1 , "b." , "b.|" );
-            assertCmp( -1 , "b.0e" , (string("b.") + (char)255).c_str() );
-            assertCmp( -1 , "b." , "b.0e" );
-
-            assertCmp( 0, "238947219478347782934718234", "238947219478347782934718234");
-            assertCmp( 0, "000238947219478347782934718234", "238947219478347782934718234");
-            assertCmp( 1, "000238947219478347782934718235", "238947219478347782934718234");
-            assertCmp( -1, "238947219478347782934718234", "238947219478347782934718234.1");
-            assertCmp( 0, "238", "000238");
-            assertCmp( 0, "002384", "0002384");
-            assertCmp( 0, "00002384", "0002384");
-            assertCmp( 0, "0", "0");
-            assertCmp( 0, "0000", "0");
-            assertCmp( 0, "0", "000");
-            assertCmp( -1, "0000", "0.0");
-            assertCmp( 1, "2380", "238");
-            assertCmp( 1, "2385", "2384");
-            assertCmp( 1, "2385", "02384");
-            assertCmp( 1, "2385", "002384");
-            assertCmp( -1, "123.234.4567", "00238");
-            assertCmp( 0, "123.234", "00123.234");
-            assertCmp( 0, "a.123.b", "a.00123.b");
-            assertCmp( 1, "a.123.b", "a.b.00123.b");
-            assertCmp( -1, "a.00.0", "a.0.1");
-            assertCmp( 0, "01.003.02", "1.3.2");
-            assertCmp( -1, "1.3.2", "10.300.20");
-            assertCmp( 0, "10.300.20", "000000000000010.0000300.000000020");
-            assertCmp( 0, "0000a", "0a");
-            assertCmp( -1, "a", "0a");
-            assertCmp( -1, "000a", "001a");
-            assertCmp( 0, "010a", "0010a");
-            
-            assertCmp( -1 , "a0" , "a00" );
-            assertCmp( 0 , "a.0" , "a.00" );
-            assertCmp( -1 , "a.b.c.d0" , "a.b.c.d00" );
-            assertCmp( 1 , "a.b.c.0.y" , "a.b.c.00.x" );
-            
-            assertCmp( -1, "a", "a-" );
-            assertCmp( 1, "a-", "a" );
-            assertCmp( 0, "a-", "a-" );
-
-            assertCmp( -1, "a", "a-c" );
-            assertCmp( 1, "a-c", "a" );
-            assertCmp( 0, "a-c", "a-c" );
-
-            assertCmp( 1, "a-c.t", "a.t" );
-            assertCmp( -1, "a.t", "a-c.t" );
-            assertCmp( 0, "a-c.t", "a-c.t" );
-
-            assertCmp( 1, "ac.t", "a.t" );
-            assertCmp( -1, "a.t", "ac.t" );
-            assertCmp( 0, "ac.t", "ac.t" );            
-        }
-    };
-    
-    class LexNumCmpLexOnly : public LexNumCmp {
-    public:
-        void run() {
-            assertCmp( -1, "0", "00", true );
-            assertCmp( 1, "1", "01", true );
-            assertCmp( -1, "1", "11", true );
-            assertCmp( 1, "2", "11", true );
-        }
-    };
-
-    class DatabaseValidNames {
-    public:
-        void run() {
-            ASSERT( NamespaceString::validDBName( "foo" ) );
-            ASSERT( ! NamespaceString::validDBName( "foo/bar" ) );
-            ASSERT( ! NamespaceString::validDBName( "foo bar" ) );
-            ASSERT( ! NamespaceString::validDBName( "foo.bar" ) );
-
-            ASSERT( NamespaceString::normal( "asdads" ) );
-            ASSERT( ! NamespaceString::normal( "asda$ds" ) );
-            ASSERT( NamespaceString::normal( "local.oplog.$main" ) );
-        }
-    };
-
-    class DatabaseOwnsNS {
-    public:
-        void run() {
-            Lock::GlobalWrite lk;
-            bool isNew = false;
-            // this leaks as ~Database is private
-            // if that changes, should put this on the stack
-            {
-                Database * db = new Database( "dbtests_basictests_ownsns" , isNew );
-                verify( isNew );
-
-                ASSERT( db->ownsNS( "dbtests_basictests_ownsns.x" ) );
-                ASSERT( db->ownsNS( "dbtests_basictests_ownsns.x.y" ) );
-                ASSERT( ! db->ownsNS( "dbtests_basictests_ownsn.x.y" ) );
-                ASSERT( ! db->ownsNS( "dbtests_basictests_ownsnsa.x.y" ) );
-            }
-        }
-    };
-
-    class NSValidNames {
-    public:
-        void run() {
-            ASSERT( isValidNS( "test.foo" ) );
-            ASSERT( ! isValidNS( "test." ) );
-            ASSERT( ! isValidNS( "test" ) );
-        }
-    };
-
-    class PtrTests {
-    public:
-        void run() {
-            scoped_ptr<int> p1 (new int(1));
-            boost::shared_ptr<int> p2 (new int(2));
-            scoped_ptr<const int> p3 (new int(3));
-            boost::shared_ptr<const int> p4 (new int(4));
-
-            //non-const
-            ASSERT_EQUALS( p1.get() , ptr<int>(p1) );
-            ASSERT_EQUALS( p2.get() , ptr<int>(p2) );
-            ASSERT_EQUALS( p2.get() , ptr<int>(p2.get()) ); // T* constructor
-            ASSERT_EQUALS( p2.get() , ptr<int>(ptr<int>(p2)) ); // copy constructor
-            ASSERT_EQUALS( *p2      , *ptr<int>(p2));
-            ASSERT_EQUALS( p2.get() , ptr<boost::shared_ptr<int> >(&p2)->get() ); // operator->
-
-            //const
-            ASSERT_EQUALS( p1.get() , ptr<const int>(p1) );
-            ASSERT_EQUALS( p2.get() , ptr<const int>(p2) );
-            ASSERT_EQUALS( p2.get() , ptr<const int>(p2.get()) );
-            ASSERT_EQUALS( p3.get() , ptr<const int>(p3) );
-            ASSERT_EQUALS( p4.get() , ptr<const int>(p4) );
-            ASSERT_EQUALS( p4.get() , ptr<const int>(p4.get()) );
-            ASSERT_EQUALS( p2.get() , ptr<const int>(ptr<const int>(p2)) );
-            ASSERT_EQUALS( p2.get() , ptr<const int>(ptr<int>(p2)) ); // constizing copy constructor
-            ASSERT_EQUALS( *p2      , *ptr<int>(p2));
-            ASSERT_EQUALS( p2.get() , ptr<const boost::shared_ptr<int> >(&p2)->get() );
-
-            //bool context
-            ASSERT( ptr<int>(p1) );
-            ASSERT( !ptr<int>(NULL) );
-            ASSERT( !ptr<int>() );
-
-#if 0
-            // These shouldn't compile
-            ASSERT_EQUALS( p3.get() , ptr<int>(p3) );
-            ASSERT_EQUALS( p4.get() , ptr<int>(p4) );
-            ASSERT_EQUALS( p2.get() , ptr<int>(ptr<const int>(p2)) );
-#endif
-        }
-    };
-
     struct StringSplitterTest {
 
         void test( string s ) {
@@ -543,6 +374,19 @@ namespace BasicTests {
             test( "a" );
             test( "a,b" );
             test( "a,b,c" );
+
+            vector<string> x = StringSplitter::split( "axbxc" , "x" );
+            ASSERT_EQUALS( 3 , (int)x.size() );
+            ASSERT_EQUALS( "a" , x[0] );
+            ASSERT_EQUALS( "b" , x[1] );
+            ASSERT_EQUALS( "c" , x[2] );
+
+            x = StringSplitter::split( "axxbxxc" , "xx" );
+            ASSERT_EQUALS( 3 , (int)x.size() );
+            ASSERT_EQUALS( "a" , x[0] );
+            ASSERT_EQUALS( "b" , x[1] );
+            ASSERT_EQUALS( "c" , x[2] );
+
         }
     };
 
@@ -633,25 +477,6 @@ namespace BasicTests {
         }
     };
 
-    class CmdLineParseConfigTest {
-    public:
-        void run() {
-            stringstream ss1;
-            istringstream iss1("");
-            CmdLine::parseConfigFile( iss1, ss1 );
-            stringstream ss2;
-            istringstream iss2("password=\'foo bar baz\'");
-            CmdLine::parseConfigFile( iss2, ss2 );
-            stringstream ss3;
-            istringstream iss3("\t    this = false  \n#that = true\n  #another = whocares\n\n  other = monkeys  ");
-            CmdLine::parseConfigFile( iss3, ss3 );
-
-            ASSERT( ss1.str().compare("\n") == 0 );
-            ASSERT( ss2.str().compare("password=\'foo bar baz\'\n\n") == 0 );
-            ASSERT( ss3.str().compare("\n  other = monkeys  \n\n") == 0 );
-        }
-    };
-
     struct CompressionTest1 { 
         void run() { 
             const char * c = "this is a test";
@@ -665,7 +490,6 @@ namespace BasicTests {
             verify( strcmp(out.c_str(), c) == 0 );
         }
     } ctest1;
-
 
     class All : public Suite {
     public:
@@ -682,18 +506,8 @@ namespace BasicTests {
             add< stringbuildertests::reset2 >();
 
             add< sleeptest >();
+            add< SleepBackoffTest >();
             add< AssertTests >();
-
-            add< ArrayTests::basic1 >();
-            add< LexNumCmp >();
-            add< LexNumCmpLexOnly >();
-
-            add< DatabaseValidNames >();
-            add< DatabaseOwnsNS >();
-
-            add< NSValidNames >();
-
-            add< PtrTests >();
 
             add< StringSplitterTest >();
             add< IsValidUTF8Test >();
@@ -704,11 +518,13 @@ namespace BasicTests {
 
             add< HostAndPortTests >();
             add< RelativePathTest >();
-            add< CmdLineParseConfigTest >();
 
             add< CompressionTest1 >();
+
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace BasicTests
 

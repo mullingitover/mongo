@@ -1,75 +1,143 @@
-s = new ShardingTest( "mrShardedOutput" , 2 , 1 , 1 , { chunksize : 1 } );
+// This test runs map reduce from a sharded input collection and outputs it to a sharded
+// collection. The test is done in 2 passes - the first pass runs the map reduce and
+// outputs it to a non-existing collection. The second pass runs map reduce with the
+// collection input twice the size of the first and outputs it to the new sharded
+// collection created in the first pass.
 
-// reduce chunk size to split
-var config = s.getDB("config");
-config.settings.save({_id: "chunksize", value: 1});
+var st = new ShardingTest({ shards: 2, verbose: 1, other: { chunksize : 1 }});
 
-s.adminCommand( { enablesharding : "test" } )
-s.adminCommand( { shardcollection : "test.foo", key : { "a" : 1 } } )
+st.stopBalancer();
 
-db = s.getDB( "test" );
-var aaa = "aaaaaaaaaaaaaaaa";
-var str = aaa;
-while (str.length < 1*1024) { str += aaa; }
+var config = st.getDB("config");
+st.adminCommand( { enablesharding: "test" } );
+st.getDB("admin").runCommand( { movePrimary: "test", to: "shard0001"});
+st.adminCommand( { shardcollection: "test.foo", key: { "a": 1 } } );
 
-s.printChunks();
-s.printChangeLog();
+var testDB = st.getDB( "test" );
 
-function map2() { emit(this._id, {count: 1, y: this.y}); }
+function map2() { emit(this.i, { count: 1, y: this.y }); }
 function reduce2(key, values) { return values[0]; }
 
-var numdocs = 0;
-var numbatch = 100000;
-var nchunks = 0;
-for ( iter=0; iter<2; iter++ ){
-    // add some more data for input so that chunks will get split further
-    for (i=0; i<numbatch; i++){ db.foo.save({a: Math.random() * 1000, y:str})}
-    db.getLastError();
-    numdocs += numbatch
-    
-    var isBad = db.foo.find().itcount() != numdocs
-    
-    // Verify that wbl weirdness isn't causing this
-    assert.soon( function(){ var c = db.foo.find().itcount(); print( "Count is " + c ); return c == numdocs } )
-    assert( ! isBad )
-    //assert.eq( numdocs, db.foo.find().itcount(), "Not all data was saved!" )
-    
-    res = db.foo.mapReduce(map2, reduce2, { out : { replace: "mrShardedOut", sharded: true }});
-    assert.eq( numdocs , res.counts.output , "Output is wrong " );
-    printjson(res);
+var numDocs = 0;
+var numBatch = 5000;
+var str = new Array(1024).join('a');
 
-    outColl = db["mrShardedOut"];
-    // SERVER-3645 -can't use count()
-    assert.eq( numdocs , outColl.find().itcount() , "Received wrong result, this may happen intermittently until resolution of SERVER-3627" );
-    // make sure it's sharded and split
-    var newnchunks = config.chunks.count({ns: db.mrShardedOut._fullName});
-    print("Number of chunks: " + newnchunks);
-    assert.gt( newnchunks, 1, "didnt split");
+// Pre split now so we don't have to balance the chunks later.
+// M/R is strange in that it chooses the output shards based on currently sharded
+// collections in the database. The upshot is that we need a sharded collection on
+// both shards in order to ensure M/R will output to two shards.
+st.adminCommand({ split: 'test.foo', middle: { a: numDocs + numBatch / 2 }});
+st.adminCommand({ moveChunk: 'test.foo', find: { a: numDocs }, to: 'shard0000' });
 
-    // make sure num of chunks increases over time
-    if (nchunks)
-        assert.gt( newnchunks, nchunks, "number of chunks did not increase between iterations");
-    nchunks = newnchunks;
-
-    // check that chunks are well distributed
-    cur = config.chunks.find({ns: db.mrShardedOut._fullName});
-    shardChunks = {};
-    while (cur.hasNext()) {
-        chunk = cur.next();
-        printjson(chunk);
-        sname = chunk.shard;
-        if (shardChunks[sname] == undefined) shardChunks[sname] = 0;
-        shardChunks[chunk.shard] += 1;
-    }
-
-    var count = 0;
-    for (var prop in shardChunks) {
-        print ("NUMBER OF CHUNKS FOR SHARD " + prop + ": " + shardChunks[prop]);
-        if (!count)
-            count = shardChunks[prop];
-        assert.lt(Math.abs(count - shardChunks[prop]), nchunks / 10, "Chunks are not well balanced: " + count + " vs " + shardChunks[prop]);
-    }
+// Add some more data for input so that chunks will get split further
+for (var splitPoint = 0; splitPoint < numBatch; splitPoint += 400) {
+    testDB.adminCommand({ split: 'test.foo', middle: { a: splitPoint }});
 }
 
+var bulk = testDB.foo.initializeUnorderedBulkOp();
+for (var i = 0; i < numBatch; ++i) {
+    bulk.insert({ a: numDocs + i, y: str, i: numDocs + i });
+}
+assert.writeOK(bulk.execute());
 
-s.stop();
+numDocs += numBatch;
+
+// Do the MapReduce step
+jsTest.log("Setup OK: count matches (" + numDocs + ") -- Starting MapReduce");
+var res = testDB.foo.mapReduce(map2, reduce2, {out: {replace: "mrShardedOut", sharded: true}});
+jsTest.log("MapReduce results:" + tojson(res));
+
+var reduceOutputCount = res.counts.output;
+assert.eq(numDocs, reduceOutputCount,
+          "MapReduce FAILED: res.counts.output = " + reduceOutputCount +
+               ", should be " + numDocs);
+
+jsTest.log("Checking that all MapReduce output documents are in output collection");
+var outColl = testDB["mrShardedOut"];
+var outCollCount = outColl.find().itcount();
+assert.eq(numDocs, outCollCount,
+          "MapReduce FAILED: outColl.find().itcount() = " + outCollCount +
+               ", should be " + numDocs +
+               ": this may happen intermittently until resolution of SERVER-3627");
+
+// Make sure it's sharded and split
+var newNumChunks = config.chunks.count({ns: testDB.mrShardedOut._fullName});
+assert.gt(newNumChunks, 1,
+          "Sharding FAILURE: " + testDB.mrShardedOut._fullName + " has only 1 chunk");
+
+// Check that there are no "jumbo" chunks.
+var objSize = Object.bsonsize(testDB.mrShardedOut.findOne());
+var docsPerChunk = 1024 * 1024 / objSize * 1.1; // 1MB chunk size + allowance
+
+printShardingStatus(config, true);
+
+config.chunks.find({ ns: testDB.mrShardedOut.getFullName() }).forEach(function(chunkDoc) {
+    var count = testDB.mrShardedOut.find({ _id: { $gte: chunkDoc.min._id,
+                                                  $lt: chunkDoc.max._id }}).itcount();
+    assert.lte(count, docsPerChunk, 'Chunk has too many docs: ' + tojson(chunkDoc));
+});
+
+// Check that chunks for the newly created sharded output collection are well distributed.
+var shard0Chunks = config.chunks.find({ ns: testDB.mrShardedOut._fullName,
+                                        shard: 'shard0000' }).count();
+var shard1Chunks = config.chunks.find({ ns: testDB.mrShardedOut._fullName,
+                                        shard: 'shard0001' }).count();
+assert.lte(Math.abs(shard0Chunks - shard1Chunks), 1);
+
+jsTest.log('Starting second pass');
+
+st.adminCommand({ split: 'test.foo', middle: { a: numDocs + numBatch / 2 }});
+st.adminCommand({ moveChunk: 'test.foo', find: { a: numDocs }, to: 'shard0000' });
+
+// Add some more data for input so that chunks will get split further
+for (splitPoint = 0; splitPoint < numBatch; splitPoint += 400) {
+    testDB.adminCommand({ split: 'test.foo', middle: { a: numDocs + splitPoint }});
+}
+
+bulk = testDB.foo.initializeUnorderedBulkOp();
+for (var i = 0; i < numBatch; ++i) {
+    bulk.insert({ a: numDocs + i, y: str, i: numDocs + i });
+}
+assert.writeOK(bulk.execute());
+jsTest.log("No errors on insert batch.");
+numDocs += numBatch;
+
+// Do the MapReduce step
+jsTest.log("Setup OK: count matches (" + numDocs + ") -- Starting MapReduce");
+res = testDB.foo.mapReduce(map2, reduce2, {out: {replace: "mrShardedOut", sharded: true}});
+jsTest.log("MapReduce results:" + tojson(res));
+
+reduceOutputCount = res.counts.output;
+assert.eq(numDocs, reduceOutputCount,
+          "MapReduce FAILED: res.counts.output = " + reduceOutputCount +
+               ", should be " + numDocs);
+
+jsTest.log("Checking that all MapReduce output documents are in output collection");
+outColl = testDB["mrShardedOut"];
+outCollCount = outColl.find().itcount();
+assert.eq(numDocs, outCollCount,
+          "MapReduce FAILED: outColl.find().itcount() = " + outCollCount +
+               ", should be " + numDocs +
+               ": this may happen intermittently until resolution of SERVER-3627");
+
+// Make sure it's sharded and split
+newNumChunks = config.chunks.count({ns: testDB.mrShardedOut._fullName});
+assert.gt(newNumChunks, 1,
+          "Sharding FAILURE: " + testDB.mrShardedOut._fullName + " has only 1 chunk");
+
+printShardingStatus(config, true);
+
+// TODO: fix SERVER-12581
+/*
+config.chunks.find({ ns: testDB.mrShardedOut.getFullName() }).forEach(function(chunkDoc) {
+    var count = testDB.mrShardedOut.find({ _id: { $gte: chunkDoc.min._id,
+                                                  $lt: chunkDoc.max._id }}).itcount();
+    assert.lte(count, docsPerChunk, 'Chunk has too many docs: ' + tojson(chunkDoc));
+});
+*/
+
+// Note: No need to check if chunk is balanced. It is the job of the balancer
+// to balance chunks.
+
+st.stop();
+

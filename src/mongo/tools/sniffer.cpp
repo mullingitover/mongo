@@ -1,4 +1,3 @@
-// sniffer.cpp
 /*
  *    Copyright (C) 2010 10gen Inc.
  *
@@ -13,65 +12,74 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
-
 
 /*
   TODO:
-    large messages - need to track what's left and ingore
-    single object over packet size - can only display begging of object
+    large messages - need to track what's left and ignore
+    single object over packet size - can only display beginning of object
 
     getmore
     delete
     killcursors
 
  */
-#include "../pch.h"
-#include <pcap.h>
+
+#include "mongo/platform/basic.h"
 
 #ifdef _WIN32
 #undef min
 #undef max
 #endif
 
-#include "../bson/util/builder.h"
-#include "../util/net/message.h"
-#include "../util/mmap.h"
-#include "../db/dbmessage.h"
-
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include <boost/shared_ptr.hpp>
 #include <ctype.h>
 #include <errno.h>
-#include <sys/types.h>
-#ifndef _WIN32
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#endif
-
 #include <iostream>
 #include <map>
+#include <pcap.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string>
+#include <string.h>
+#include <sys/types.h>
 
-#include <boost/shared_ptr.hpp>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
+#include "mongo/base/initializer.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/util/net/message.h"
+#include "mongo/db/storage/mmap_v1/mmap.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/text.h"
 
 using namespace std;
-using mongo::asserted;
+using boost::shared_ptr;
 using mongo::Message;
-using mongo::MsgData;
 using mongo::DbMessage;
 using mongo::BSONObj;
 using mongo::BufBuilder;
 using mongo::DBClientConnection;
-using mongo::QueryResult;
 using mongo::MemoryMappedFile;
-
-mongo::CmdLine mongo::cmdLine;
-namespace mongo {
-    void setupSignals( bool inFork ){}
-}
+using std::string;
 
 #define SNAP_LEN 65535
 
@@ -91,7 +99,7 @@ struct sniff_ip {
     u_short ip_id;                  /* identification */
     u_short ip_off;                 /* fragment offset field */
 #define IP_RF 0x8000            /* reserved fragment flag */
-#define IP_DF 0x4000            /* dont fragment flag */
+#define IP_DF 0x4000            /* don't fragment flag */
 #define IP_MF 0x2000            /* more fragments flag */
 #define IP_OFFMASK 0x1fff       /* mask for fragmenting bits */
     u_char  ip_ttl;                 /* time to live */
@@ -216,17 +224,17 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
     Message m;
 
     if ( bytesRemainingInMessage[ c ] == 0 ) {
-        m.setData( (MsgData*)payload , false );
-        if ( !m.header()->valid() ) {
+        m.setData( const_cast<char *>(reinterpret_cast<const char *>(payload)) , false );
+        if ( !m.header().valid() ) {
             cerr << "Invalid message start, skipping packet." << endl;
             return;
         }
-        if ( size_payload > m.header()->len ) {
+        if ( size_payload > m.header().getLen() ) {
             cerr << "Multiple messages in packet, skipping packet." << endl;
             return;
         }
-        if ( size_payload < m.header()->len ) {
-            bytesRemainingInMessage[ c ] = m.header()->len - size_payload;
+        if ( size_payload < m.header().getLen() ) {
+            bytesRemainingInMessage[ c ] = m.header().getLen() - size_payload;
             messageBuilder[ c ].reset( new BufBuilder() );
             messageBuilder[ c ]->appendBuf( (void*)payload, size_payload );
             return;
@@ -243,19 +251,22 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
         }
         if ( bytesRemainingInMessage[ c ] > 0 )
             return;
-        m.setData( (MsgData*)messageBuilder[ c ]->buf(), true );
+        m.setData( messageBuilder[ c ]->buf(), true );
         messageBuilder[ c ]->decouple();
         messageBuilder[ c ].reset();
     }
 
     DbMessage d( m );
 
-    out() << inet_ntoa(ip->ip_src) << ":" << ntohs( tcp->th_sport )
+    // inet_ntoa uses statically allocated buffer.
+    string sourceAddress = inet_ntoa(ip->ip_src);
+    string destinationAddress = inet_ntoa(ip->ip_dst);
+    out() << sourceAddress << ":" << ntohs( tcp->th_sport )
           << ( serverPorts.count( ntohs( tcp->th_dport ) ) ? "  -->> " : "  <<--  " )
-          << inet_ntoa(ip->ip_dst) << ":" << ntohs( tcp->th_dport )
-          << " " << d.getns()
-          << "  " << m.header()->len << " bytes "
-          << " id:" << hex << m.header()->id << dec << "\t" << m.header()->id;
+          << destinationAddress << ":" << ntohs( tcp->th_dport )
+          << " " << (d.messageShouldHaveNs() ? d.getns() : "")
+          << "  " << m.header().getLen() << " bytes "
+          << " id:" << hex << m.header().getId() << dec << "\t" << m.header().getId();
 
     processMessage( c , m );
 }
@@ -277,16 +288,21 @@ void processMessage( Connection& c , Message& m ) {
     AuditingDbMessage d(m);
 
     if ( m.operation() == mongo::opReply )
-        out() << " - " << (unsigned)m.header()->responseTo;
+        out() << " - " << (unsigned)m.header().getResponseTo();
     out() << '\n';
 
     try {
         switch( m.operation() ) {
         case mongo::opReply: {
-            mongo::QueryResult* r = (mongo::QueryResult*)m.singleData();
-            out() << "\treply" << " n:" << r->nReturned << " cursorId: " << r->cursorId << endl;
-            if ( r->nReturned ) {
-                mongo::BSONObj o( r->data() );
+            mongo::QueryResult::View r = m.singleData().view2ptr();
+
+            out() << "\treply"
+                  << " n:" << r.getNReturned()
+                  << " cursorId: " << r.getCursorId()
+                  << endl;
+
+            if ( r.getNReturned() ) {
+                mongo::BSONObj o( r.data() );
                 out() << "\t" << o << endl;
             }
             break;
@@ -332,9 +348,7 @@ void processMessage( Connection& c , Message& m ) {
             break;
         }
         case mongo::dbKillCursors: {
-            int *x = (int *) m.singleData()->_data;
-            x++; // reserved
-            int n = *x;
+            int n = d.pullInt();
             out() << "\tkillCursors n: " << n << endl;
             break;
         }
@@ -360,15 +374,15 @@ void processMessage( Connection& c , Message& m ) {
                 if ( m.operation() == mongo::dbGetMore ) {
                     DbMessage d( m );
                     d.pullInt();
-                    long long &cId = d.pullInt64();
+                    long long cId = d.pullInt64();
                     cId = mapCursor[ c ][ cId ];
                 }
                 Message response;
                 conn->port().call( m, response );
-                QueryResult *qr = (QueryResult *) response.singleData();
-                if ( !( qr->resultFlags() & mongo::ResultFlag_CursorNotFound ) ) {
-                    if ( qr->cursorId != 0 ) {
-                        lastCursor[ c ] = qr->cursorId;
+                mongo::QueryResult::View qr = response.singleData().view2ptr();
+                if ( !( qr.getResultFlags() & mongo::ResultFlag_CursorNotFound ) ) {
+                    if ( qr.getCursorId() != 0 ) {
+                        lastCursor[ c ] = qr.getCursorId();
                         return;
                     }
                 }
@@ -381,16 +395,16 @@ void processMessage( Connection& c , Message& m ) {
         else {
             Connection r = c.reverse();
             long long myCursor = lastCursor[ r ];
-            QueryResult *qr = (QueryResult *) m.singleData();
-            long long yourCursor = qr->cursorId;
-            if ( ( qr->resultFlags() & mongo::ResultFlag_CursorNotFound ) )
+            mongo::QueryResult::View qr = m.singleData().view2ptr();
+            long long yourCursor = qr.getCursorId();
+            if ( ( qr.getResultFlags() & mongo::ResultFlag_CursorNotFound ) )
                 yourCursor = 0;
             if ( myCursor && !yourCursor )
                 cerr << "Expected valid cursor in sniffed response, found none" << endl;
             if ( !myCursor && yourCursor )
                 cerr << "Sniffed valid cursor when none expected" << endl;
             if ( myCursor && yourCursor ) {
-                mapCursor[ r ][ qr->cursorId ] = lastCursor[ r ];
+                mapCursor[ r ][ qr.getCursorId() ] = lastCursor[ r ];
                 lastCursor[ r ] = 0;
             }
         }
@@ -413,7 +427,7 @@ void processDiagLog( const char * file ) {
     long read = 0;
     while ( read < length ) {
         Message m(pos,false);
-        int len = m.header()->len;
+        int len = m.header().getLen();
         DbMessage d(m);
         cout << len << " " << d.getns() << endl;
 
@@ -428,7 +442,8 @@ void processDiagLog( const char * file ) {
 
 void usage() {
     cout <<
-         "Usage: mongosniff [--help] [--forward host:port] [--source (NET <interface> | (FILE | DIAGLOG) <filename>)] [<port0> <port1> ... ]\n"
+         "Usage: mongosniff [--help] [--forward host:port] [--objcheck] [--source (NET <interface> | (FILE | DIAGLOG) <filename>)] [<port0> <port1> ... ]\n"
+         "--help          Print this help message.\n"
          "--forward       Forward all parsed request messages to mongod instance at \n"
          "                specified host:port\n"
          "--source        Source of traffic to sniff, either a network interface or a\n"
@@ -436,16 +451,16 @@ void usage() {
          "                or a file containing output from mongod's --diaglog option.\n"
          "                If no source is specified, mongosniff will attempt to sniff\n"
          "                from one of the machine's network interfaces.\n"
-         "--objcheck      Log hex representation of invalid BSON objects and nothing\n"
-         "                else.  Spurious messages about invalid objects may result\n"
+         "--objcheck      Log hex representation of invalid BSON documents and nothing\n"
+         "                else.  Spurious messages about invalid documents may result\n"
          "                when there are dropped tcp packets.\n"
          "<port0>...      These parameters are used to filter sniffing.  By default, \n"
          "                only port 27017 is sniffed.\n"
-         "--help          Print this help message.\n"
          << endl;
 }
 
-int main(int argc, char **argv) {
+int toolMain(int argc, char **argv, char** envp) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
 
     stringstream nullStream;
     nullStream.clear(ios::failbit);
@@ -455,8 +470,14 @@ int main(int argc, char **argv) {
     pcap_t *handle;
 
     struct bpf_program fp;
-    bpf_u_int32 mask;
-    bpf_u_int32 net;
+
+// PCAP_NETMASK_UNKNOWN was introduced in pcap 1.1.0, so work around earlier versions. See
+// http://anonsvn.wireshark.org/viewvc?revision=33461&view=revision for details.
+#if defined(PCAP_NETMASK_UNKNOWN)
+    bpf_u_int32 mask = PCAP_NETMASK_UNKNOWN;
+#else
+    bpf_u_int32 mask = 0;
+#endif
 
     bool source = false;
     bool replay = false;
@@ -525,6 +546,7 @@ int main(int argc, char **argv) {
             }
             cout << "found device: " << dev << endl;
         }
+        bpf_u_int32 net;
         if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
             cerr << "can't get netmask: " << errbuf << endl;
             return -1;
@@ -547,7 +569,7 @@ int main(int argc, char **argv) {
         cerr << "don't know how to handle datalink type: " << pcap_datalink( handle ) << endl;
     }
 
-    verify( pcap_compile(handle, &fp, const_cast< char * >( "tcp" ) , 0, net) != -1 );
+    verify( pcap_compile(handle, &fp, const_cast< char * >( "tcp" ) , 0, mask) != -1 );
     verify( pcap_setfilter(handle, &fp) != -1 );
 
     cout << "sniffing... ";
@@ -563,3 +585,20 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+#if defined(_WIN32)
+// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
+// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
+// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
+// and makes them available through the argv() and envp() members.  This enables toolMain()
+// to process UTF-8 encoded arguments and environment variables without regard to platform.
+int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
+    WindowsCommandLine wcl(argc, argvW, envpW);
+    int exitCode = toolMain(argc, wcl.argv(), wcl.envp());
+    mongo::quickExit(exitCode);
+}
+#else
+int main(int argc, char* argv[], char** envp) {
+    int exitCode = toolMain(argc, argv, envp);
+    mongo::quickExit(exitCode);
+}
+#endif

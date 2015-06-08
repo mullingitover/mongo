@@ -12,30 +12,41 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "db/pipeline/document_source.h"
-
-#include "db/jsobj.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression.h"
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+
     const char DocumentSourceLimit::limitName[] = "$limit";
 
-    DocumentSourceLimit::DocumentSourceLimit(
-        const intrusive_ptr<ExpressionContext> &pExpCtx):
-        DocumentSource(pExpCtx),
-        limit(0),
-        count(0) {
-    }
-
-    DocumentSourceLimit::~DocumentSourceLimit() {
-    }
+    DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext> &pExpCtx,
+                                             long long limit)
+        : DocumentSource(pExpCtx)
+        , limit(limit)
+        , count(0)
+    {}
 
     const char *DocumentSourceLimit::getSourceName() const {
         return limitName;
@@ -46,7 +57,7 @@ namespace mongo {
         DocumentSourceLimit *pLimit =
             dynamic_cast<DocumentSourceLimit *>(pNextSource.get());
 
-        /* if it's not another $skip, we can't coalesce */
+        /* if it's not another $limit, we can't coalesce */
         if (!pLimit)
             return false;
 
@@ -56,50 +67,36 @@ namespace mongo {
         return true;
     }
 
-    bool DocumentSourceLimit::eof() {
-        return pSource->eof() || count >= limit;
-    }
+    boost::optional<Document> DocumentSourceLimit::getNext() {
+        pExpCtx->checkForInterrupt();
 
-    bool DocumentSourceLimit::advance() {
-        DocumentSource::advance(); // check for interrupts
-
-        ++count;
-        if (count >= limit) {
-            pCurrent.reset();
-            return false;
+        if (++count > limit) {
+            pSource->dispose();
+            return boost::none;
         }
-        pCurrent = pSource->getCurrent();
-        return pSource->advance();
+
+        return pSource->getNext();
     }
 
-    intrusive_ptr<Document> DocumentSourceLimit::getCurrent() {
-        return pSource->getCurrent();
-    }
-
-    void DocumentSourceLimit::sourceToBson(BSONObjBuilder *pBuilder) const {
-        pBuilder->append("$limit", limit);
+    Value DocumentSourceLimit::serialize(bool explain) const {
+        return Value(DOC(getSourceName() << limit));
     }
 
     intrusive_ptr<DocumentSourceLimit> DocumentSourceLimit::create(
-        const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        intrusive_ptr<DocumentSourceLimit> pSource(
-            new DocumentSourceLimit(pExpCtx));
-        return pSource;
+            const intrusive_ptr<ExpressionContext> &pExpCtx,
+            long long limit) {
+        uassert(15958, "the limit must be positive",
+                limit > 0);
+        return new DocumentSourceLimit(pExpCtx, limit);
     }
 
     intrusive_ptr<DocumentSource> DocumentSourceLimit::createFromBson(
-        BSONElement *pBsonElement,
-        const intrusive_ptr<ExpressionContext> &pExpCtx) {
+            BSONElement elem,
+            const intrusive_ptr<ExpressionContext> &pExpCtx) {
         uassert(15957, "the limit must be specified as a number",
-                pBsonElement->isNumber());
+                elem.isNumber());
 
-        intrusive_ptr<DocumentSourceLimit> pLimit(
-            DocumentSourceLimit::create(pExpCtx));
-
-        pLimit->limit = (int)pBsonElement->numberLong();
-        uassert(15958, "the limit must be positive",
-                pLimit->limit > 0);
-
-        return pLimit;
+        long long limit = elem.numberLong();
+        return DocumentSourceLimit::create(pExpCtx, limit);
     }
 }

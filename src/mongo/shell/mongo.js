@@ -8,17 +8,17 @@ if ( typeof Mongo == "undefined" ){
 }
 
 if ( ! Mongo.prototype ){
-    throw "Mongo.prototype not defined";
+    throw Error("Mongo.prototype not defined");
 }
 
 if ( ! Mongo.prototype.find )
-    Mongo.prototype.find = function( ns , query , fields , limit , skip , batchSize , options ){ throw "find not implemented"; }
+    Mongo.prototype.find = function( ns , query , fields , limit , skip , batchSize , options ){ throw Error("find not implemented"); }
 if ( ! Mongo.prototype.insert )
-    Mongo.prototype.insert = function( ns , obj ){ throw "insert not implemented"; }
+    Mongo.prototype.insert = function( ns , obj ){ throw Error("insert not implemented"); }
 if ( ! Mongo.prototype.remove )
-    Mongo.prototype.remove = function( ns , pattern ){ throw "remove not implemented;" }
+    Mongo.prototype.remove = function( ns , pattern ){ throw Error("remove not implemented"); }
 if ( ! Mongo.prototype.update )
-    Mongo.prototype.update = function( ns , query , obj , upsert ){ throw "update not implemented;" }
+    Mongo.prototype.update = function( ns , query , obj , upsert ){ throw Error("update not implemented"); }
 
 if ( typeof mongoInject == "function" ){
     mongoInject( Mongo.prototype );
@@ -34,8 +34,15 @@ Mongo.prototype.getSlaveOk = function() {
 }
 
 Mongo.prototype.getDB = function( name ){
-    if (jsTest.options().keyFile && ((typeof this.authenticated == 'undefined') || !this.authenticated)) {
+    if ((jsTest.options().keyFile) &&
+         ((typeof this.authenticated == 'undefined') || !this.authenticated)) {
         jsTest.authenticate(this)
+    }
+    // There is a weird issue where typeof(db._name) !== "string" when the db name
+    // is created from objects returned from native C++ methods.
+    // This hack ensures that the db._name is always a string.
+    if (typeof(name) === "object") {
+        name = name.toString();
     }
     return new DB( this , name );
 }
@@ -43,7 +50,7 @@ Mongo.prototype.getDB = function( name ){
 Mongo.prototype.getDBs = function(){
     var res = this.getDB( "admin" ).runCommand( { "listDatabases" : 1 } );
     if ( ! res.ok )
-        throw "listDatabases failed:" + tojson( res );
+        throw Error( "listDatabases failed:" + tojson( res ) );
     return res;
 }
 
@@ -51,8 +58,41 @@ Mongo.prototype.adminCommand = function( cmd ){
     return this.getDB( "admin" ).runCommand( cmd );
 }
 
-Mongo.prototype.setLogLevel = function( logLevel ){
-    return this.adminCommand({ setParameter : 1, logLevel : logLevel })
+/**
+ * Returns all log components and current verbosity values
+ */
+Mongo.prototype.getLogComponents = function() {
+    var res = this.adminCommand({ getParameter:1, logComponentVerbosity:1 });
+    if (!res.ok)
+        throw Error( "getLogComponents failed:" + tojson(res));
+    return res.logComponentVerbosity;
+}
+
+/**
+ * Accepts optional second argument "component",
+ * string of form "storage.journaling"
+ */
+Mongo.prototype.setLogLevel = function(logLevel, component) {
+    componentNames = [];
+    if (typeof component === "string") {
+        componentNames = component.split(".");
+    }
+    else if (component !== undefined) {
+        throw Error( "setLogLevel component must be a string:" + tojson(component));
+    }
+    var vDoc = { verbosity: logLevel };
+
+    // nest vDoc
+    for (var key,obj; componentNames.length > 0;) {
+        obj = {};
+        key = componentNames.pop();
+        obj[ key ] = vDoc;
+        vDoc = obj;
+    }
+    var res = this.adminCommand({ setParameter : 1, logComponentVerbosity : vDoc });
+    if (!res.ok)
+        throw Error( "setLogLevel failed:" + tojson(res));
+    return res;
 }
 
 Mongo.prototype.getDBNames = function(){
@@ -66,7 +106,7 @@ Mongo.prototype.getDBNames = function(){
 Mongo.prototype.getCollection = function(ns){
     var idx = ns.indexOf( "." );
     if ( idx < 0 ) 
-        throw "need . in ns";
+        throw Error("need . in ns");
     var db = ns.substring( 0 , idx );
     var c = ns.substring( idx + 1 );
     return this.getDB( db ).getCollection( c );
@@ -77,26 +117,221 @@ Mongo.prototype.toString = function(){
 }
 Mongo.prototype.tojson = Mongo.prototype.toString;
 
-connect = function( url , user , pass ){
-    chatty( "connecting to: " + url )
+/**
+ * Sets the read preference.
+ *
+ * @param mode {string} read preference mode to use. Pass null to disable read
+ *     preference.
+ * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
+ *     Note that this object only keeps a shallow copy of this array.
+ */
+Mongo.prototype.setReadPref = function (mode, tagSet) {
+    if ((this._readPrefMode === "primary") &&
+        (typeof(tagSet) !== "undefined") &&
+        (Object.keys(tagSet).length > 0)) {
+        // we allow empty arrays/objects or no tagSet for compatibility reasons
+        throw Error("Can not supply tagSet with readPref mode primary");
+    }
+    this._setReadPrefUnsafe(mode, tagSet);
+};
 
-    if ( user && ! pass )
-        throw "you specified a user and not a password.  either you need a password, or you're using the old connect api";
+// Set readPref without validating. Exposed so we can test the server's readPref validation.
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
+    this._readPrefMode = mode;
+    this._readPrefTagSet = tagSet;
+};
 
-    var idx = url.lastIndexOf( "/" );
-    
-    var db;
-    
-    if ( idx < 0 )
-        db = new Mongo().getDB( url );
-    else 
-        db = new Mongo( url.substring( 0 , idx ) ).getDB( url.substring( idx + 1 ) );
-    
-    if ( user && pass ){
-        if ( ! db.auth( user , pass ) ){
-            throw "couldn't login";
+Mongo.prototype.getReadPrefMode = function () {
+    return this._readPrefMode;
+};
+
+Mongo.prototype.getReadPrefTagSet = function () {
+    return this._readPrefTagSet;
+};
+
+// Returns a readPreference object of the type expected by mongos.
+Mongo.prototype.getReadPref = function () {
+    var obj = {}, mode, tagSet;
+    if (typeof(mode = this.getReadPrefMode()) === "string") {
+        obj.mode = mode;
+    }
+    else {
+        return null;
+    }
+    // Server Selection Spec: - if readPref mode is "primary" then the tags field MUST
+    // be absent. Ensured by setReadPref.
+    if (Array.isArray(tagSet = this.getReadPrefTagSet())) {
+        obj.tags = tagSet;
+    }
+
+    return obj;
+};
+
+connect = function(url, user, pass) {
+    if (user && !pass)
+        throw Error("you specified a user and not a password.  " +
+                    "either you need a password, or you're using the old connect api");
+
+    // Validate connection string "url" as "hostName:portNumber/databaseName"
+    //                                  or "hostName/databaseName"
+    //                                  or "databaseName"
+    // hostName may be an IPv6 address (with colons), in which case ":portNumber" is required
+    //
+    var urlType = typeof url;
+    if (urlType == "undefined") {
+        throw Error("Missing connection string");
+    }
+    if (urlType != "string") {
+        throw Error("Incorrect type \"" + urlType +
+                    "\" for connection string \"" + tojson(url) + "\"");
+    }
+    url = url.trim();
+    if (0 == url.length) {
+        throw Error("Empty connection string");
+    }
+    var colon = url.lastIndexOf(":");
+    var slash = url.lastIndexOf("/");
+    if (0 == colon || 0 == slash) {
+        throw Error("Missing host name in connection string \"" + url + "\"");
+    }
+    if (colon == slash - 1 || colon == url.length - 1) {
+        throw Error("Missing port number in connection string \"" + url + "\"");
+    }
+    if (colon != -1 && colon < slash) {
+        var portNumber = url.substring(colon + 1, slash);
+        if (portNumber.length > 5 || !/^\d*$/.test(portNumber) || parseInt(portNumber) > 65535) {
+            throw Error("Invalid port number \"" + portNumber +
+                        "\" in connection string \"" + url + "\"");
         }
     }
-    
+    if (slash == url.length - 1) {
+        throw Error("Missing database name in connection string \"" + url + "\"");
+    }
+
+    chatty("connecting to: " + url)
+    var db;
+    if (slash == -1)
+        db = new Mongo().getDB(url);
+    else 
+        db = new Mongo(url.substring(0, slash)).getDB(url.substring(slash + 1));
+
+    if (user && pass) {
+        if (!db.auth(user, pass)) {
+            throw Error("couldn't login");
+        }
+    }
     return db;
 }
+
+/** deprecated, use writeMode below
+ * 
+ */
+Mongo.prototype.useWriteCommands = function() {
+	return (this.writeMode() != "legacy");
+}
+
+Mongo.prototype.forceWriteMode = function( mode ) {
+    this._writeMode = mode;
+}
+
+Mongo.prototype.hasWriteCommands = function() {
+    if ( !('_hasWriteCommands' in this) ) {
+        var isMaster = this.getDB("admin").runCommand({ isMaster : 1 });
+        this._hasWriteCommands = (isMaster.ok && 
+                                  'minWireVersion' in isMaster &&
+                                  isMaster.minWireVersion <= 2 && 
+                                  2 <= isMaster.maxWireVersion );
+    }
+    
+    return this._hasWriteCommands;
+}
+
+Mongo.prototype.hasExplainCommand = function() {
+    if ( !('_hasExplainCommand' in this) ) {
+        var isMaster = this.getDB("admin").runCommand({ isMaster : 1 });
+        this._hasExplainCommand = (isMaster.ok &&
+                                   'minWireVersion' in isMaster &&
+                                   isMaster.minWireVersion <= 3 &&
+                                   3 <= isMaster.maxWireVersion );
+    }
+
+    return this._hasExplainCommand;
+}
+
+/**
+ * {String} Returns the current mode set. Will be commands/legacy/compatibility
+ * 
+ * Sends isMaster to determine if the connection is capable of using bulk write operations, and
+ * caches the result.
+ */
+
+Mongo.prototype.writeMode = function() {
+
+    if ( '_writeMode' in this ) {
+        return this._writeMode;
+    }
+
+    // get default from shell params
+    if ( _writeMode )
+        this._writeMode = _writeMode();
+    
+    // can't use "commands" mode unless server version is good.
+    if ( this.hasWriteCommands() ) {
+        // good with whatever is already set
+    }
+    else if ( this._writeMode == "commands" ) {
+        print("Cannot use commands write mode, degrading to compatibility mode");
+        this._writeMode = "compatibility";
+    }
+    
+    return this._writeMode;
+};
+
+//
+// Whether to use find command versus OP_QUERY style find.
+//
+
+Mongo.prototype.useFindCommand = function() {
+    return (this.readMode() === "commands");
+}
+
+Mongo.prototype.readMode = function() {
+    if ("_readMode" in this) {
+        // We already have determined our read mode. Just return it.
+        return this._readMode;
+    }
+
+    // Determine read mode based on shell params.
+    //
+    // TODO: Detect what to use based on wire protocol version.
+    if (_readMode) {
+        this._readMode = _readMode();
+    }
+    else {
+        this._readMode = "compatibility";
+    }
+
+    return this._readMode;
+}
+
+//
+// Write Concern can be set at the connection level, and is used for all write operations unless
+// overridden at the collection level.
+//
+
+Mongo.prototype.setWriteConcern = function( wc ) {
+    if ( wc instanceof WriteConcern ) {
+        this._writeConcern = wc;
+    }
+    else {
+        this._writeConcern = new WriteConcern( wc );
+    }
+};
+
+Mongo.prototype.getWriteConcern = function() {
+    return this._writeConcern;
+};
+
+Mongo.prototype.unsetWriteConcern = function() {
+    delete this._writeConcern;
+};

@@ -1,42 +1,55 @@
-// BSONElement
+// bsonelement.h
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
+#include <cmath>
+#include <string.h> // strlen
+#include <string>
 #include <vector>
-#include <string.h>
-#include "util/builder.h"
-#include "bsontypes.h"
-#include "oid.h"
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/platform/cstdint.h"
 
 namespace mongo {
-    class OpTime;
     class BSONObj;
     class BSONElement;
     class BSONObjBuilder;
-}
+    class Timestamp;
 
-namespace bson {
-    typedef mongo::BSONElement be;
-    typedef mongo::BSONObj bo;
-    typedef mongo::BSONObjBuilder bob;
-}
-
-namespace mongo {
+    typedef BSONElement be;
+    typedef BSONObj bo;
+    typedef BSONObjBuilder bob;
 
     /* l and r MUST have same type when called: check that first. */
     int compareElementValues(const BSONElement& l, const BSONElement& r);
@@ -57,12 +70,15 @@ namespace mongo {
     */
     class BSONElement {
     public:
-        /** These functions, which start with a capital letter, throw a UserException if the
+        /** These functions, which start with a capital letter, throw a MsgAssertionException if the
             element is not of the required type. Example:
 
             std::string foo = obj["foo"].String(); // std::exception if not a std::string type or DNE
         */
-        std::string String()        const { return chk(mongo::String).valuestr(); }
+        std::string String()        const { return chk(mongo::String).str(); }
+        const StringData checkAndGetStringData() const {
+            return chk(mongo::String).valueStringData();
+        }
         Date_t Date()               const { return chk(mongo::Date).date(); }
         double Number()             const { return chk(isNumber()).number(); }
         double Double()             const { return chk(NumberDouble)._numberDouble(); }
@@ -71,15 +87,15 @@ namespace mongo {
         bool Bool()                 const { return chk(mongo::Bool).boolean(); }
         std::vector<BSONElement> Array() const; // see implementation for detailed comments
         mongo::OID OID()            const { return chk(jstOID).__oid(); }
-        void Null()                 const { chk(isNull()); } // throw UserException if not null
-        void OK()                   const { chk(ok()); }     // throw UserException if element DNE
+        void Null()                 const { chk(isNull()); } // throw MsgAssertionException if not null
+        void OK()                   const { chk(ok()); }     // throw MsgAssertionException if element DNE
 
-	/** @return the embedded object associated with this field.
-            Note the returned object is a reference to within the parent bson object. If that 
-	    object is out of scope, this pointer will no longer be valid. Call getOwned() on the 
-	    returned BSONObj if you need your own copy.
-	    throws UserException if the element is not of type object.
-	*/
+        /** @return the embedded object associated with this field.
+            Note the returned object is a reference to within the parent bson object. If that
+            object is out of scope, this pointer will no longer be valid. Call getOwned() on the
+            returned BSONObj if you need your own copy.
+            throws UserException if the element is not of type object.
+        */
         BSONObj Obj()               const;
 
         /** populate v with the value of the element.  If type does not match, throw exception.
@@ -99,24 +115,37 @@ namespace mongo {
         */
         bool ok() const { return !eoo(); }
 
+        /**
+         * True if this element has a value (ie not EOO).
+         *
+         * Makes it easier to check for a field's existence and use it:
+         * if (auto elem = myObj["foo"]) {
+         *     // Use elem
+         * }
+         * else {
+         *     // default behavior
+         * }
+         */
+        explicit operator bool() const { return ok(); }
+
         std::string toString( bool includeFieldName = true, bool full=false) const;
-        void toString(StringBuilder& s, bool includeFieldName = true, bool full=false) const;
+        void toString(StringBuilder& s, bool includeFieldName = true, bool full=false, int depth=0) const;
         std::string jsonString( JsonStringFormat format, bool includeFieldNames = true, int pretty = 0 ) const;
         operator std::string() const { return toString(); }
 
         /** Returns the type of the element */
-        BSONType type() const { return (BSONType) *reinterpret_cast< const signed char * >(data); }
+        BSONType type() const {
+            const signed char typeByte = ConstDataView(data).read<signed char>();
+            return static_cast<BSONType>(typeByte);
+        }
 
         /** retrieve a field within this element
             throws exception if *this is not an embedded object
         */
         BSONElement operator[] (const std::string& field) const;
 
-        /** returns the tyoe of the element fixed for the main type
-            the main purpose is numbers.  any numeric type will return NumberDouble
-            Note: if the order changes, indexes have to be re-built or than can be corruption
-        */
-        int canonicalType() const;
+        /** See canonicalizeBSONType in bsontypes.h */
+        int canonicalType() const { return canonicalizeBSONType(type()); }
 
         /** Indicates if it is the end-of-object element, which is present at the end of
             every BSON object.
@@ -133,7 +162,7 @@ namespace mongo {
         BSONObj wrap() const;
 
         /** Wrap this element up as a singleton object with a new name. */
-        BSONObj wrap( const char* newName) const;
+        BSONObj wrap( StringData newName) const;
 
         /** field name of the element.  e.g., for
             name : "Joe"
@@ -142,6 +171,19 @@ namespace mongo {
         const char * fieldName() const {
             if ( eoo() ) return ""; // no fieldname for it.
             return data + 1;
+        }
+
+        /**
+         * NOTE: size includes the NULL terminator.
+         */
+        int fieldNameSize() const {
+            if ( fieldNameSize_ == -1 )
+                fieldNameSize_ = (int)strlen( fieldName() ) + 1;
+            return fieldNameSize_;
+        }
+
+        const StringData fieldNameStringData() const {
+            return StringData(fieldName(), eoo() ? 0 : fieldNameSize() - 1);
         }
 
         /** raw data of the element's value (so be careful). */
@@ -169,7 +211,8 @@ namespace mongo {
             @see Bool(), trueValue()
         */
         Date_t date() const {
-            return *reinterpret_cast< const Date_t* >( value() );
+            return Date_t::fromMillisSinceEpoch(
+                    ConstDataView(value()).read<LittleEndian<long long>>());
         }
 
         /** Convert the value to boolean, regardless of its type, in a javascript-like fashion
@@ -184,16 +227,34 @@ namespace mongo {
         bool isNumber() const;
 
         /** Return double value for this field. MUST be NumberDouble type. */
-        double _numberDouble() const {return *reinterpret_cast< const double* >( value() ); }
+        double _numberDouble() const {
+            return ConstDataView(value()).read<LittleEndian<double>>();
+        }
+
         /** Return int value for this field. MUST be NumberInt type. */
-        int _numberInt() const {return *reinterpret_cast< const int* >( value() ); }
+        int _numberInt() const {
+            return ConstDataView(value()).read<LittleEndian<int>>();
+        }
+
         /** Return long long value for this field. MUST be NumberLong type. */
-        long long _numberLong() const {return *reinterpret_cast< const long long* >( value() ); }
+        long long _numberLong() const {
+            return ConstDataView(value()).read<LittleEndian<long long>>();
+        }
 
         /** Retrieve int value for the element safely.  Zero returned if not a number. */
         int numberInt() const;
-        /** Retrieve long value for the element safely.  Zero returned if not a number. */
+        /** Retrieve long value for the element safely.  Zero returned if not a number.
+         *  Behavior is not defined for double values that are NaNs, or too large/small
+         *  to be represented by long longs */
         long long numberLong() const;
+
+        /** Like numberLong() but with well-defined behavior for doubles that
+         *  are NaNs, or too large/small to be represented as long longs.
+         *  NaNs -> 0
+         *  very large doubles -> LLONG_MAX
+         *  very small doubles -> LLONG_MIN  */
+        long long safeNumberLong() const;
+
         /** Retrieve the numeric value of the element.  If not of a numeric type, returns 0.
             Note: casts to double, data loss may occur with large (>52 bit) NumberLong values.
         */
@@ -205,24 +266,26 @@ namespace mongo {
 
         /** Retrieve the object ID stored in the object.
             You must ensure the element is of type jstOID first. */
-        const mongo::OID &__oid() const { return *reinterpret_cast< const mongo::OID* >( value() ); }
+        mongo::OID __oid() const {
+            return OID::from(value());
+        }
 
         /** True if element is null. */
         bool isNull() const {
             return type() == jstNULL;
         }
 
-        /** Size (length) of a string element.
-            You must assure of type String first.  
-            @return string size including terminating null
+        /** Size (length) of a std::string element.
+            You must assure of type std::string first.
+            @return std::string size including terminating null
         */
         int valuestrsize() const {
-            return *reinterpret_cast< const int* >( value() );
+            return ConstDataView(value()).read<LittleEndian<int>>();
         }
 
         // for objects the size *includes* the size of the size field
-        int objsize() const {
-            return *reinterpret_cast< const int* >( value() );
+        size_t objsize() const {
+            return ConstDataView(value()).read<LittleEndian<uint32_t>>();
         }
 
         /** Get a string's value.  Also gives you start of the real data for an embedded object.
@@ -232,23 +295,56 @@ namespace mongo {
             return value() + 4;
         }
 
-        /** Get the string value of the element.  If not a string returns "". */
+        /** Get the std::string value of the element.  If not a std::string returns "". */
         const char *valuestrsafe() const {
             return type() == mongo::String ? valuestr() : "";
         }
-        /** Get the string value of the element.  If not a string returns "". */
+        /** Get the std::string value of the element.  If not a std::string returns "". */
         std::string str() const {
             return type() == mongo::String ? std::string(valuestr(), valuestrsize()-1) : std::string();
         }
 
+        /**
+         * Returns a StringData pointing into this element's data.  Does not validate that the
+         * element is actually of type String.
+         */
+        const StringData valueStringData() const {
+            return StringData(valuestr(), valuestrsize() - 1);
+        }
+
         /** Get javascript code of a CodeWScope data element. */
         const char * codeWScopeCode() const {
-            return value() + 8;
+            massert( 16177 , "not codeWScope" , type() == CodeWScope );
+            return value() + 4 + 4; //two ints precede code (see BSON spec)
         }
-        /** Get the scope SavedContext of a CodeWScope data element. */
-        const char * codeWScopeScopeData() const {
-            // TODO fix
+
+        /** Get length of the code part of the CodeWScope object
+         *  This INCLUDES the null char at the end */
+        int codeWScopeCodeLen() const {
+            massert( 16178 , "not codeWScope" , type() == CodeWScope );
+            return ConstDataView(value() + 4).read<LittleEndian<int>>();
+        }
+
+        /** Get the scope SavedContext of a CodeWScope data element.
+         *
+         *  This function is DEPRECATED, since it can error if there are
+         *  null chars in the codeWScopeCode. However, some existing indexes
+         *  may be based on an incorrect ordering derived from this function,
+         *  so it may still need to be used in certain cases.
+         *   */
+        const char * codeWScopeScopeDataUnsafe() const {
+            //This can error if there are null chars in the codeWScopeCode
             return codeWScopeCode() + strlen( codeWScopeCode() ) + 1;
+        }
+
+        /* Get the scope SavedContext of a CodeWScope data element.
+         *
+         * This is the corrected version of codeWScopeScopeDataUnsafe(),
+         * but note that existing uses might rely on the behavior of
+         * that function so be careful in choosing which version to use.
+         */
+        const char * codeWScopeScopeData() const {
+            return codeWScopeCode() + codeWScopeCodeLen();
         }
 
         /** Get the embedded object this element holds. */
@@ -286,7 +382,7 @@ namespace mongo {
             return (BinDataType)c;
         }
 
-        /** Retrieve the regex string for a Regex element */
+        /** Retrieve the regex std::string for a Regex element */
         const char *regex() const {
             verify(type() == RegEx);
             return value();
@@ -319,6 +415,15 @@ namespace mongo {
         */
         int woCompare( const BSONElement &e, bool considerFieldName = true ) const;
 
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const BSONElement& elem) const;
+        };
+
         const char * rawdata() const { return data; }
 
         /** 0 == Equality, just not defined yet */
@@ -326,9 +431,6 @@ namespace mongo {
 
         /** Constructs an empty element */
         BSONElement();
-
-        /** Check that data is internally consistent. */
-        void validate() const;
 
         /** True if this element may contain subobjects. */
         bool mayEncapsulate() const {
@@ -353,12 +455,24 @@ namespace mongo {
             }
         }
 
+        Timestamp timestamp() const {
+            if( type() == mongo::Date || type() == bsonTimestamp ) {
+                return Timestamp(
+                    ConstDataView(value()).read<LittleEndian<unsigned long long>>().value);
+            }
+            return Timestamp();
+        }
+
         Date_t timestampTime() const {
-            unsigned long long t = ((unsigned int*)(value() + 4 ))[0];
-            return t * 1000;
+            unsigned long long t = ConstDataView(value() + 4).read<LittleEndian<unsigned int>>();
+            return Date_t::fromMillisSinceEpoch(t * 1000);
         }
         unsigned int timestampInc() const {
-            return ((unsigned int*)(value() ))[0];
+            return ConstDataView(value()).read<LittleEndian<unsigned int>>();
+        }
+
+        unsigned long long timestampValue() const {
+            return ConstDataView(value()).read<LittleEndian<unsigned long long>>();
         }
 
         const char * dbrefNS() const {
@@ -366,11 +480,11 @@ namespace mongo {
             return value() + 4;
         }
 
-        const mongo::OID& dbrefOID() const {
+        const mongo::OID dbrefOID() const {
             uassert( 10064 ,  "not a dbref" , type() == DBRef );
             const char * start = value();
-            start += 4 + *reinterpret_cast< const int* >( start );
-            return *reinterpret_cast< const mongo::OID* >( start );
+            start += 4 + ConstDataView(start).read<LittleEndian<int>>();
+            return mongo::OID::from(start);
         }
 
         /** this does not use fieldName in the comparison, just the value */
@@ -391,8 +505,8 @@ namespace mongo {
                 totalSize = -1;
                 fieldNameSize_ = -1;
                 if ( maxLen != -1 ) {
-                    int size = (int) strnlen( fieldName(), maxLen - 1 );
-                    uassert( 10333 ,  "Invalid field name", size != -1 );
+                    size_t size = strnlen( fieldName(), maxLen - 1 );
+                    uassert( 10333 ,  "Invalid field name", size < size_t(maxLen - 1) );
                     fieldNameSize_ = size + 1;
                 }
             }
@@ -407,17 +521,27 @@ namespace mongo {
             }
         }
 
+        struct FieldNameSizeTag {}; // For disambiguation with ctor taking 'maxLen' above.
+
+        /** Construct a BSONElement where you already know the length of the name. The value
+         *  passed here includes the null terminator. The data pointed to by 'd' must not
+         *  represent an EOO. You may pass -1 to indicate that you don't actually know the
+         *  size.
+         */
+        BSONElement(const char* d, int fieldNameSize, FieldNameSizeTag)
+            : data(d)
+            , fieldNameSize_(fieldNameSize) // internal size includes null terminator
+            , totalSize(-1) {
+        }
+
         std::string _asCode() const;
-        OpTime _opTime() const;
+
+        template<typename T> bool coerce( T* out ) const;
 
     private:
         const char *data;
         mutable int fieldNameSize_; // cached value
-        int fieldNameSize() const {
-            if ( fieldNameSize_ == -1 )
-                fieldNameSize_ = (int)strlen( fieldName() ) + 1;
-            return fieldNameSize_;
-        }
+
         mutable int totalSize; /* caches the computed size */
 
         friend class BSONObjIterator;
@@ -439,60 +563,15 @@ namespace mongo {
         }
     };
 
-
-    inline int BSONElement::canonicalType() const {
-        BSONType t = type();
-        switch ( t ) {
-        case MinKey:
-        case MaxKey:
-            return t;
-        case EOO:
-        case Undefined:
-            return 0;
-        case jstNULL:
-            return 5;
-        case NumberDouble:
-        case NumberInt:
-        case NumberLong:
-            return 10;
-        case mongo::String:
-        case Symbol:
-            return 15;
-        case Object:
-            return 20;
-        case mongo::Array:
-            return 25;
-        case BinData:
-            return 30;
-        case jstOID:
-            return 35;
-        case mongo::Bool:
-            return 40;
-        case mongo::Date:
-        case Timestamp:
-            return 45;
-        case RegEx:
-            return 50;
-        case DBRef:
-            return 55;
-        case Code:
-            return 60;
-        case CodeWScope:
-            return 65;
-        default:
-            verify(0);
-            return -1;
-        }
-    }
-
     inline bool BSONElement::trueValue() const {
+        // NOTE Behavior changes must be replicated in Value::coerceToBool().
         switch( type() ) {
         case NumberLong:
-            return *reinterpret_cast< const long long* >( value() ) != 0;
+            return _numberLong() != 0;
         case NumberDouble:
-            return *reinterpret_cast< const double* >( value() ) != 0;
+            return _numberDouble() != 0;
         case NumberInt:
-            return *reinterpret_cast< const int* >( value() ) != 0;
+            return _numberInt() != 0;
         case mongo::Bool:
             return boolean();
         case EOO:
@@ -538,9 +617,9 @@ namespace mongo {
         case NumberDouble:
             return _numberDouble();
         case NumberInt:
-            return *reinterpret_cast< const int* >( value() );
+            return _numberInt();
         case NumberLong:
-            return (double) *reinterpret_cast< const long long* >( value() );
+            return _numberLong();
         default:
             return 0;
         }
@@ -574,11 +653,38 @@ namespace mongo {
         }
     }
 
+    /** Like numberLong() but with well-defined behavior for doubles that
+     *  are NaNs, or too large/small to be represented as long longs.
+     *  NaNs -> 0
+     *  very large doubles -> LLONG_MAX
+     *  very small doubles -> LLONG_MIN  */
+    inline long long BSONElement::safeNumberLong() const {
+        double d;
+        switch( type() ) {
+        case NumberDouble:
+            d = numberDouble();
+            if ( std::isnan( d ) ){
+                return 0;
+            }
+            if ( d > (double) std::numeric_limits<long long>::max() ){
+                return std::numeric_limits<long long>::max();
+            }
+            if ( d < std::numeric_limits<long long>::min() ){
+                return std::numeric_limits<long long>::min();
+            }
+        default:
+            return numberLong();
+        }
+    }
+
     inline BSONElement::BSONElement() {
-        static char z = 0;
-        data = &z;
+        static const char kEooElement[] = "";
+        data = kEooElement;
         fieldNameSize_ = 0;
         totalSize = 1;
     }
+
+    // TODO(SERVER-14596): move to a better place; take a StringData.
+    std::string escape( const std::string& s , bool escape_slash=false);
 
 }

@@ -1,8 +1,10 @@
+// This test fails when run with authentication because benchRun with auth is broken: SERVER-6388
 numShards = 3
 s = new ShardingTest( "parallel" , numShards , 2 , 2 , { sync : true } );
 s.setBalancer( false )
 
 s.adminCommand( { enablesharding : "test" } );
+s.ensurePrimaryShard('test', 'shard0001');
 s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } ); 
 
 db = s.getDB( "test" );
@@ -15,10 +17,10 @@ for ( i=0; i<N; i+=(N/12) ) {
 }
 
 s.setBalancer( true )
+var bulk = db.foo.initializeUnorderedBulkOp();
 for ( i=0; i<N; i++ )
-    db.foo.insert( { _id : i } )
-db.getLastError();
-
+    bulk.insert({ _id: i });
+assert.writeOK(bulk.execute());
 
 doCommand = function( dbname , cmd ) {
     x = benchRun( { ops : [ { op : "findOne" , ns : dbname + ".$cmd" , query : cmd } ] , 

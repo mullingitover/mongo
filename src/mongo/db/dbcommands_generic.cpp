@@ -1,6 +1,7 @@
 /** @file dbcommands_generic.cpp commands suited for any mongo server (both mongod, mongos) */
 
 /**
+*    Copyright (C) 2012 10gen Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -13,255 +14,106 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
-#include "ops/query.h"
-#include "pdfile.h"
-#include "jsobj.h"
-#include "../bson/util/builder.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
+
 #include <time.h>
-#include "introspect.h"
-#include "btree.h"
-#include "../util/lruishmap.h"
-#include "../util/md5.hpp"
-#include "../util/processinfo.h"
-#include "json.h"
-#include "repl.h"
-#include "repl_block.h"
-#include "replutil.h"
-#include "commands.h"
-#include "db.h"
-#include "instance.h"
-#include "lasterror.h"
-#include "security.h"
-#include "../scripting/engine.h"
-#include "stats/counters.h"
-#include "background.h"
-#include "../util/version.h"
-#include "../util/ramlog.h"
-#include "repl/multicmd.h"
-#include "server.h"
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/dbclient_rs.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/background.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/shutdown.h"
+#include "mongo/db/db.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/introspect.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/json.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/log_process_details.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
+#include "mongo/util/md5.hpp"
+#include "mongo/util/ntservice.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/ramlog.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
-#if 0
-    namespace cloud {
-        SimpleMutex mtx("cloud");
-        Guarded< vector<string>, mtx > ips;
-        bool startedThread = false;
-
-        void thread() { 
-            bson::bo cmd;
-            while( 1 ) {
-                list<Target> L;
-                {
-                    SimpleMutex::scoped_lock lk(mtx);
-                    if( ips.ref(lk).empty() )
-                        continue;
-                    for( unsigned i = 0; i < ips.ref(lk).size(); i++ ) { 
-                        L.push_back( Target(ips.ref(lk)[i]) );
-                    }
-                }
-
-
-                /** repoll as machines might be down on the first lookup (only if not found previously) */
-                sleepsecs(6); 
-            }
-        }
-    }
-
-    class CmdCloud : public Command {
-    public:
-        CmdCloud() : Command( "cloud" ) { }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual void help( stringstream &help ) const {
-            help << "internal command facilitating running in certain cloud computing environments";
-        }
-        bool run(const string& dbname, BSONObj& obj, int options, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            if( !obj.hasElement("servers") ) { 
-                vector<string> ips;
-                obj["servers"].Obj().Vals(ips);
-                {
-                    SimpleMutex::scoped_lock lk(cloud::mtx);
-                    cloud::ips.ref(lk).swap(ips);
-                    if( !cloud::startedThread ) {
-                        cloud::startedThread = true;
-                        boost::thread thr(cloud::thread);
-                    }
-                }
-            }
-            return true;
-        }
-    } cmdCloud;
-#endif
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class CmdBuildInfo : public Command {
     public:
         CmdBuildInfo() : Command( "buildInfo", true, "buildinfo" ) {}
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
-        virtual bool requiresAuth() { return false; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
         virtual void help( stringstream &help ) const {
             help << "get version #, etc.\n";
             help << "{ buildinfo:1 }";
         }
-        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            result << "version" << versionString << "gitVersion" << gitVersion() << "sysInfo" << sysInfo();
-            result << "versionArray" << versionArray;
-            result << "bits" << ( sizeof( int* ) == 4 ? 32 : 64 );
-            result.appendBool( "debug" , debug );
-            result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
-            return true;
+
+        bool run(OperationContext* txn, const std::string& dbname,
+                 BSONObj& jsobj,
+                 int, // options
+                 std::string& errmsg,
+                 BSONObjBuilder& result) {
+        appendBuildInfo(result);
+        appendStorageEngineList(&result);
+        return true;
+
         }
+
     } cmdBuildInfo;
 
-    /** experimental. either remove or add support in repl sets also.  in a repl set, getting this setting from the
-        repl set config could make sense.
-        */
-    unsigned replApplyBatchSize = 1;
-
-    class CmdGet : public Command {
-    public:
-        CmdGet() : Command( "getParameter" ) { }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual void help( stringstream &help ) const {
-            help << "get administrative option(s)\nexample:\n";
-            help << "{ getParameter:1, notablescan:1 }\n";
-            help << "supported so far:\n";
-            help << "  quiet\n";
-            help << "  notablescan\n";
-            help << "  logLevel\n";
-            help << "  syncdelay\n";
-            help << "{ getParameter:'*' } to get everything\n";
-        }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            bool all = *cmdObj.firstElement().valuestrsafe() == '*';
-
-            int before = result.len();
-
-            if( all || cmdObj.hasElement("quiet") ) {
-                result.append("quiet", cmdLine.quiet );
-            }
-            if( all || cmdObj.hasElement("notablescan") ) {
-                result.append("notablescan", cmdLine.noTableScan);
-            }
-            if( all || cmdObj.hasElement("logLevel") ) {
-                result.append("logLevel", logLevel);
-            }
-            if( all || cmdObj.hasElement("syncdelay") ) {
-                result.append("syncdelay", cmdLine.syncdelay);
-            }
-            if( all || cmdObj.hasElement("replApplyBatchSize") ) {
-                result.append("replApplyBatchSize", replApplyBatchSize);
-            }
-
-            if ( before == result.len() ) {
-                errmsg = "no option found to get";
-                return false;
-            }
-            return true;
-        }
-    } cmdGet;
-
-    // tempish
-    bool setParmsMongodSpecific(const string& dbname, BSONObj& cmdObj, string& errmsg, BSONObjBuilder& result, bool fromRepl );
-
-    class CmdSet : public Command {
-    public:
-        CmdSet() : Command( "setParameter" ) { }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual void help( stringstream &help ) const {
-            help << "set administrative option(s)\n";
-            help << "{ setParameter:1, <param>:<value> }\n";
-            help << "supported so far:\n";
-            help << "  journalCommitInterval\n";
-            help << "  logLevel\n";
-            help << "  notablescan\n";
-            help << "  quiet\n";
-            help << "  syncdelay\n";
-        }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            int s = 0;
-            bool found = setParmsMongodSpecific(dbname, cmdObj, errmsg, result, fromRepl);
-            if( cmdObj.hasElement("journalCommitInterval") ) { 
-                if( !cmdLine.dur ) { 
-                    errmsg = "journaling is off";
-                    return false;
-                }
-                int x = (int) cmdObj["journalCommitInterval"].Number();
-                verify( x > 1 && x < 500 );
-                cmdLine.journalCommitInterval = x;
-                log() << "setParameter journalCommitInterval=" << x << endl;
-                s++;
-            }
-            if( cmdObj.hasElement("notablescan") ) {
-                verify( !cmdLine.isMongos() );
-                if( s == 0 )
-                    result.append("was", cmdLine.noTableScan);
-                cmdLine.noTableScan = cmdObj["notablescan"].Bool();
-                s++;
-            }
-            if( cmdObj.hasElement("quiet") ) {
-                if( s == 0 )
-                    result.append("was", cmdLine.quiet );
-                cmdLine.quiet = cmdObj["quiet"].Bool();
-                s++;
-            }
-            if( cmdObj.hasElement("syncdelay") ) {
-                verify( !cmdLine.isMongos() );
-                if( s == 0 )
-                    result.append("was", cmdLine.syncdelay );
-                cmdLine.syncdelay = cmdObj["syncdelay"].Number();
-                s++;
-            }
-            if( cmdObj.hasElement( "logLevel" ) ) {
-                if( s == 0 )
-                    result.append("was", logLevel );
-                logLevel = cmdObj["logLevel"].numberInt();
-                s++;
-            }
-            if( cmdObj.hasElement( "replApplyBatchSize" ) ) {
-                if( s == 0 )
-                    result.append("was", replApplyBatchSize );
-                BSONElement e = cmdObj["replApplyBatchSize"];
-                ParameterValidator * v = ParameterValidator::get( e.fieldName() );
-                verify( v );
-                if ( ! v->isValid( e , errmsg ) )
-                    return false;
-                replApplyBatchSize = e.numberInt();
-                s++;
-            }
-            if( cmdObj.hasElement( "traceExceptions" ) ) {
-                if( s == 0 ) result.append( "was", DBException::traceExceptions );
-                DBException::traceExceptions = cmdObj["traceExceptions"].Bool();
-                s++;
-            }
-
-            if( s == 0 && !found ) {
-                errmsg = "no option found to set, use help:true to see options ";
-                return false;
-            }
-
-            return true;
-        }
-    } cmdSet;
 
     class PingCommand : public Command {
     public:
         PingCommand() : Command( "ping" ) {}
         virtual bool slaveOk() const { return true; }
         virtual void help( stringstream &help ) const { help << "a way to check that the server is alive. responds immediately even if server is in a db lock."; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool requiresAuth() { return false; }
-        virtual bool run(const string& badns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
+        virtual bool run(OperationContext* txn,
+                         const string& badns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             // IMPORTANT: Don't put anything in here that might lock db - including authentication
             return true;
         }
@@ -272,9 +124,16 @@ namespace mongo {
         FeaturesCmd() : Command( "features", true ) {}
         void help(stringstream& h) const { h << "return build level feature settings"; }
         virtual bool slaveOk() const { return true; }
-        virtual bool readOnly() { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             if ( globalScriptEngine ) {
                 BSONObjBuilder bb( result.subobjStart( "js" ) );
                 result.append( "utf8" , globalScriptEngine->utf8Ok() );
@@ -297,13 +156,24 @@ namespace mongo {
             return true;
         }
 
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
 
         virtual void help( stringstream& help ) const {
             help << "returns information about the daemon's host";
         }
-
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::hostInfo);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ProcessInfo p;
             BSONObjBuilder bSys, bOs;
 
@@ -330,12 +200,26 @@ namespace mongo {
     class LogRotateCmd : public Command {
     public:
         LogRotateCmd() : Command( "logRotate" ) {}
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            rotateLogs();
-            return 1;
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::logRotate);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
+            bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
+            if (didRotate)
+                logProcessDetailsForLogRotate();
+            return didRotate;
         }
 
     } logRotateCmd;
@@ -344,12 +228,20 @@ namespace mongo {
     public:
         virtual void help( stringstream &help ) const { help << "get a list of all db commands"; }
         ListCommandsCmd() : Command( "listCommands", false ) {}
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
-        virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             BSONObjBuilder b( result.subobjStart( "commands" ) );
-            for ( map<string,Command*>::iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
+            for ( CommandMap::const_iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
                 Command * c = i->second;
 
                 // don't show oldnames
@@ -363,7 +255,6 @@ namespace mongo {
                     c->help( help );
                     temp.append( "help" , help.str() );
                 }
-                temp.append( "lockType" , c->locktype() );
                 temp.append( "slaveOk" , c->slaveOk() );
                 temp.append( "adminOnly" , c->adminOnly() );
                 //optionally indicates that the command can be forced to run on a slave/secondary
@@ -377,17 +268,48 @@ namespace mongo {
 
     } listCommandsCmd;
 
-    bool CmdShutdown::shutdownHelper() {
-        Client * c = currentClient.get();
-        if ( c ) {
-            c->shutdown();
+    namespace {
+        MONGO_FP_DECLARE(crashOnShutdown);
+
+        int* volatile illegalAddress;
+    }  // namespace
+
+    void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
+        const BSONObj& cmdObj,
+        std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::shutdown);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+
+    void CmdShutdown::shutdownHelper() {
+        MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
+            const std::string crashHow = crashBlock.getData()["how"].str();
+            if (crashHow == "fault") {
+                ++*illegalAddress;
+            }
+            ::abort();
         }
 
-        log() << "terminating, shutdown command received" << endl;
+        log() << "terminating, shutdown command received";
 
-        dbexit( EXIT_CLEAN , "shutdown called" , true ); // this never returns
-        verify(0);
-        return true;
+#if defined(_WIN32)
+        // Signal the ServiceMain thread to shutdown.
+        if(ntservice::shouldStartService()) {
+            signalShutdown();
+
+            // Client expects us to abruptly close the socket as part of exiting
+            // so this function is not allowed to return.
+            // The ServiceMain thread will quit for us so just sleep until it does.
+            while (true)
+                sleepsecs(60); // Loop forever
+        }
+        else
+#endif
+        {
+            exitCleanly(EXIT_CLEAN); // this never returns
+            invariant(false);
+        }
     }
 
     /* for testing purposes only */
@@ -396,45 +318,57 @@ namespace mongo {
         virtual void help( stringstream& help ) const {
             help << "for testing purposes only.  forces a user assertion exception";
         }
-        virtual bool logTheOp() {
-            return false;
-        }
         virtual bool slaveOk() const {
             return true;
         }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
         CmdForceError() : Command("forceerror") {}
-        bool run(const string& dbnamne, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            uassert( 10038 , "forced error", false);
-            return true;
+        bool run(OperationContext* txn,
+                 const string& dbnamne,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
+            LastError::get(cc()).setLastError(10038, "forced error");
+            return false;
         }
     } cmdForceError;
-
-    class AvailableQueryOptions : public Command {
-    public:
-        AvailableQueryOptions() : Command( "availableQueryOptions" , false , "availablequeryoptions" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            result << "options" << QueryOption_AllSupported;
-            return true;
-        }
-    } availableQueryOptionsCmd;
 
     class GetLogCmd : public Command {
     public:
         GetLogCmd() : Command( "getLog" ){}
 
         virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool adminOnly() const { return true; }
-
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::getLog);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
         virtual void help( stringstream& help ) const {
             help << "{ getLog : '*' }  OR { getLog : 'global' }";
         }
 
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string p = cmdObj.firstElement().String();
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
+            BSONElement val = cmdObj.firstElement();
+            if (val.type() != String) {
+                return appendCommandStatus(result, Status(ErrorCodes::TypeMismatch, str::stream()
+                    << "Argument to getLog must be of type String; found "
+                    << val.toString(false) << " of type " << typeName(val.type())));
+            }
+
+            string p = val.String();
             if ( p == "*" ) {
                 vector<string> names;
                 RamLog::getNames( names );
@@ -447,23 +381,50 @@ namespace mongo {
                 result.appendArray( "names" , arr.arr() );
             }
             else {
-                RamLog* rl = RamLog::get( p );
-                if ( ! rl ) {
+                RamLog* ramlog = RamLog::getIfExists(p);
+                if ( ! ramlog ) {
                     errmsg = str::stream() << "no RamLog named: " << p;
                     return false;
                 }
-                
-                vector<const char*> lines;
-                rl->get( lines );
-                
+                RamLog::LineIterator rl(ramlog);
+
+                result.appendNumber( "totalLinesWritten", rl.getTotalLinesWritten() );
+
                 BSONArrayBuilder arr( result.subarrayStart( "log" ) );
-                for ( unsigned i=0; i<lines.size(); i++ )
-                    arr.append( lines[i] );
+                while (rl.more())
+                    arr.append(rl.next());
                 arr.done();
             }
             return true;
         }
 
     } getLogCmd;
+
+    class CmdGetCmdLineOpts : Command {
+    public:
+        CmdGetCmdLineOpts(): Command("getCmdLineOpts") {}
+        void help(stringstream& h) const { h << "get argv"; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool adminOnly() const { return true; }
+        virtual bool slaveOk() const { return true; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::getCmdLineOpts);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
+            result.append("argv", serverGlobalParams.argvArray);
+            result.append("parsed", serverGlobalParams.parsedOpts);
+            return true;
+        }
+
+    } cmdGetCmdLineOpts;
 
 }

@@ -13,15 +13,28 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "../../pch.h"
-#include "../jsobj.h"
-#include "../../util/net/message.h"
-#include "../../util/processinfo.h"
-#include "../../util/concurrency/spin_lock.h"
+#include "mongo/platform/basic.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/net/message.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
 
@@ -33,103 +46,41 @@ namespace mongo {
     public:
 
         OpCounters();
-        void incInsertInWriteLock(int n) { _insert.x += n; }
-        void gotInsert() { _insert++; }
-        void gotQuery() { _query++; }
-        void gotUpdate() { _update++; }
-        void gotDelete() { _delete++; }
-        void gotGetMore() { _getmore++; }
-        void gotCommand() { _command++; }
+        void incInsertInWriteLock(int n);
+        void gotInsert();
+        void gotQuery();
+        void gotUpdate();
+        void gotDelete();
+        void gotGetMore();
+        void gotCommand();
 
         void gotOp( int op , bool isCommand );
 
-        BSONObj getObj();
+        BSONObj getObj() const;
+        
+        // thse are used by snmp, and other things, do not remove
+        const AtomicUInt32 * getInsert() const { return &_insert; }
+        const AtomicUInt32 * getQuery() const { return &_query; }
+        const AtomicUInt32 * getUpdate() const { return &_update; }
+        const AtomicUInt32 * getDelete() const { return &_delete; }
+        const AtomicUInt32 * getGetMore() const { return &_getmore; }
+        const AtomicUInt32 * getCommand() const { return &_command; }
 
     private:
-
+        void _checkWrap();
+        
         // todo: there will be a lot of cache line contention on these.  need to do something 
         //       else eventually.
-        AtomicUInt _insert;
-        AtomicUInt _query;
-        AtomicUInt _update;
-        AtomicUInt _delete;
-        AtomicUInt _getmore;
-        AtomicUInt _command;
+        AtomicUInt32 _insert;
+        AtomicUInt32 _query;
+        AtomicUInt32 _update;
+        AtomicUInt32 _delete;
+        AtomicUInt32 _getmore;
+        AtomicUInt32 _command;
     };
 
     extern OpCounters globalOpCounters;
     extern OpCounters replOpCounters;
-
-
-    class IndexCounters {
-    public:
-        IndexCounters();
-
-        // used without a mutex intentionally (can race)
-        void btree( char * node ) {
-            if ( ! _memSupported )
-                return;
-            if ( _sampling++ % _samplingrate )
-                return;
-            btree( _pi.blockInMemory( node ) );
-        }
-
-        void btree( bool memHit ) {
-            if ( memHit )
-                _btreeMemHits++;
-            else
-                _btreeMemMisses++;
-            _btreeAccesses++;
-        }
-        void btreeHit() { _btreeMemHits++; _btreeAccesses++; }
-        void btreeMiss() { _btreeMemMisses++; _btreeAccesses++; }
-
-        void append( BSONObjBuilder& b );
-
-    private:
-        ProcessInfo _pi;
-        bool _memSupported;
-
-        int _sampling;
-        int _samplingrate;
-
-        int _resets;
-        long long _maxAllowed;
-
-        long long _btreeMemMisses;
-        long long _btreeMemHits;
-        long long _btreeAccesses;
-    };
-
-    extern IndexCounters globalIndexCounters;
-
-    class FlushCounters {
-    public:
-        FlushCounters();
-
-        void flushed(int ms);
-
-        void append( BSONObjBuilder& b );
-
-    private:
-        long long _total_time;
-        long long _flushes;
-        int _last_time;
-        Date_t _last;
-    };
-
-    extern FlushCounters globalFlushCounters;
-
-
-    class GenericCounter {
-    public:
-        GenericCounter() : _mutex("GenericCounter") { }
-        void hit( const string& name , int count=0 );
-        BSONObj getObj();
-    private:
-        map<string,long long> _counts; // TODO: replace with thread safe map
-        mongo::mutex _mutex;
-    };
 
     class NetworkCounter {
     public:

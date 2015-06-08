@@ -17,7 +17,6 @@ for( i = 0; i < 3; ++i ) {
     m.getDB( a ).c.save( {} );
     a += "a";
 }
-m.getDB(a).getLastError();
 
 //print("\n\n\n DB NAMES MASTER:");
 //printjson(m.getDBNames());
@@ -39,9 +38,15 @@ function countHave(){
 
 assert.soon( 
     function() { 
-        var c = countHave();
-        debug( "count: " + c ); 
-        return c == 3; } 
+        try {
+            var c = countHave();
+            debug( "count: " + c );
+            return c == 3;
+        } catch (e) {
+            printjson(e);
+            return false;
+        }
+    }
 );
 
 //printjson(s.getDBNames());

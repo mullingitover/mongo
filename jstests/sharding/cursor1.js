@@ -9,6 +9,7 @@ s.config.settings.find().forEach( printjson )
 
 // create a sharded 'test.foo', for the moment with just one chunk
 s.adminCommand( { enablesharding: "test" } );
+s.ensurePrimaryShard('test', 'shard0001');
 s.adminCommand( { shardcollection: "test.foo", key: { _id: 1 } } ) 
 
 db = s.getDB( "test" );
@@ -16,10 +17,11 @@ primary = s.getServer( "test" ).getDB( "test" );
 secondary = s.getOther( primary ).getDB( "test" );
 
 numObjs = 10;
-for (i=0; i < numObjs; i++){                                                                                                  
-    db.foo.insert({_id: i}); 
-} 
-db.getLastError();
+var bulk = db.foo.initializeUnorderedBulkOp();
+for (i=0; i < numObjs; i++){
+    bulk.insert({ _id: i });
+}
+assert.writeOK(bulk.execute());
 assert.eq( 1, s.config.chunks.count() , "test requires collection to have one chunk initially" );
 
 // we'll split the collection in two and move the second chunk while three cursors are open
@@ -52,7 +54,7 @@ printjson( before )
 sleep( 6000 )
 assert( cur.next() , "T3" )
 assert( cur.next() , "T4" );
-sleep( 22000 )
+sleep( 24000 )
 assert.throws( function(){ cur.next(); } , null , "T5" )
 after = db.runCommand( { "cursorInfo" : 1 , "setTimeout" : 10000 } ) // 10 seconds
 gc(); gc()

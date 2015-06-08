@@ -1,5 +1,3 @@
-//@file balance.cpp
-
 /**
 *    Copyright (C) 2008 10gen Inc.
 *
@@ -14,231 +12,469 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include "../db/jsobj.h"
-#include "../db/cmdline.h"
+#include "mongo/platform/basic.h"
 
-#include "../client/distlock.h"
+#include "mongo/s/balance.h"
+
+#include <algorithm>
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/client/dbclientcursor.h"
-
-#include "balance.h"
-#include "server.h"
-#include "shard.h"
-#include "config.h"
-#include "chunk.h"
-#include "grid.h"
+#include "mongo/db/client.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/balancer_policy.h"
+#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_actionlog.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_settings.h"
+#include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/config.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/type_mongos.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
+
+    MONGO_FP_DECLARE(skipBalanceRound);
+
     Balancer balancer;
 
-    Balancer::Balancer() : _balancedLastTime(0), _policy( new BalancerPolicy() ) {}
+    Balancer::Balancer()
+        : _balancedLastTime(0),
+          _policy(new BalancerPolicy()) {
 
-    Balancer::~Balancer() {
     }
 
-    int Balancer::_moveChunks( const vector<CandidateChunkPtr>* candidateChunks ) {
+    Balancer::~Balancer() = default;
+
+    int Balancer::_moveChunks(const vector<shared_ptr<MigrateInfo>>& candidateChunks,
+                              const WriteConcernOptions* writeConcern,
+                              bool waitForDelete)
+    {
         int movedCount = 0;
 
-        for ( vector<CandidateChunkPtr>::const_iterator it = candidateChunks->begin(); it != candidateChunks->end(); ++it ) {
-            const CandidateChunk& chunkInfo = *it->get();
+        for (const auto& migrateInfo : candidateChunks) {
+            // If the balancer was disabled since we started this round, don't start new chunks
+            // moves.
+            const auto balSettingsResult =
+                grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
 
-            DBConfigPtr cfg = grid.getDBConfig( chunkInfo.ns );
-            verify( cfg );
+            const bool isBalSettingsAbsent =
+                balSettingsResult.getStatus() == ErrorCodes::NoSuchKey;
 
-            ChunkManagerPtr cm = cfg->getChunkManager( chunkInfo.ns );
-            verify( cm );
+            if (!balSettingsResult.isOK() && !isBalSettingsAbsent) {
+                warning() << balSettingsResult.getStatus();
+                return movedCount;
+            }
 
-            const BSONObj& chunkToMove = chunkInfo.chunk;
-            ChunkPtr c = cm->findChunk( chunkToMove["min"].Obj() );
-            if ( c->getMin().woCompare( chunkToMove["min"].Obj() ) || c->getMax().woCompare( chunkToMove["max"].Obj() ) ) {
-                // likely a split happened somewhere
-                cm = cfg->getChunkManager( chunkInfo.ns , true /* reload */);
-                verify( cm );
+            const SettingsType& balancerConfig = isBalSettingsAbsent ?
+                SettingsType{} : balSettingsResult.getValue();
 
-                c = cm->findChunk( chunkToMove["min"].Obj() );
-                if ( c->getMin().woCompare( chunkToMove["min"].Obj() ) || c->getMax().woCompare( chunkToMove["max"].Obj() ) ) {
-                    log() << "chunk mismatch after reload, ignoring will retry issue cm: "
-                          << c->getMin() << " min: " << chunkToMove["min"].Obj() << endl;
+            if ((!isBalSettingsAbsent && !grid.shouldBalance(balancerConfig)) ||
+                 MONGO_FAIL_POINT(skipBalanceRound)) {
+                LOG(1) << "Stopping balancing round early as balancing was disabled";
+                return movedCount;
+            }
+
+            // Changes to metadata, borked metadata, and connectivity problems between shards
+            // should cause us to abort this chunk move, but shouldn't cause us to abort the entire
+            // round of chunks.
+            //
+            // TODO(spencer): We probably *should* abort the whole round on issues communicating
+            // with the config servers, but its impossible to distinguish those types of failures
+            // at the moment.
+            //
+            // TODO: Handle all these things more cleanly, since they're expected problems
+
+            const NamespaceString nss(migrateInfo->ns);
+
+            try {
+                auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+                fassert(28628, status.getStatus());
+
+                shared_ptr<DBConfig> cfg = status.getValue();
+
+                // NOTE: We purposely do not reload metadata here, since _doBalanceRound already
+                // tried to do so once.
+                shared_ptr<ChunkManager> cm = cfg->getChunkManager(migrateInfo->ns);
+                invariant(cm);
+
+                ChunkPtr c = cm->findIntersectingChunk(migrateInfo->chunk.min);
+
+                if (c->getMin().woCompare(migrateInfo->chunk.min) ||
+                        c->getMax().woCompare(migrateInfo->chunk.max)) {
+
+                    // Likely a split happened somewhere, so force reload the chunk manager
+                    cm = cfg->getChunkManager(migrateInfo->ns, true);
+                    invariant(cm);
+
+                    c = cm->findIntersectingChunk(migrateInfo->chunk.min);
+
+                    if (c->getMin().woCompare(migrateInfo->chunk.min) ||
+                            c->getMax().woCompare(migrateInfo->chunk.max)) {
+
+                        log() << "chunk mismatch after reload, ignoring will retry issue "
+                              << migrateInfo->chunk.toString();
+
+                        continue;
+                    }
+                }
+
+                BSONObj res;
+                if (c->moveAndCommit(Shard::make(migrateInfo->to),
+                                     Chunk::MaxChunkSize,
+                                     writeConcern,
+                                     waitForDelete,
+                                     0, /* maxTimeMS */
+                                     res)) {
+
+                    movedCount++;
                     continue;
                 }
-            }
 
-            BSONObj res;
-            if ( c->moveAndCommit( Shard::make( chunkInfo.to ) , Chunk::MaxChunkSize , res ) ) {
-                movedCount++;
-                continue;
-            }
+                // The move requires acquiring the collection metadata's lock, which can fail.
+                log() << "balancer move failed: " << res
+                      << " from: " << migrateInfo->from
+                      << " to: " << migrateInfo->to
+                      << " chunk: " << migrateInfo->chunk;
 
-            // the move requires acquiring the collection metadata's lock, which can fail
-            log() << "balancer move failed: " << res << " from: " << chunkInfo.from << " to: " << chunkInfo.to
-                  << " chunk: " << chunkToMove << endl;
+                if (res["chunkTooBig"].trueValue()) {
+                    // Reload just to be safe
+                    cm = cfg->getChunkManager(migrateInfo->ns);
+                    invariant(cm);
 
-            if ( res["chunkTooBig"].trueValue() ) {
-                // reload just to be safe
-                cm = cfg->getChunkManager( chunkInfo.ns );
-                verify( cm );
-                c = cm->findChunk( chunkToMove["min"].Obj() );
-                
-                log() << "forcing a split because migrate failed for size reasons" << endl;
-                
-                res = BSONObj();
-                c->singleSplit( true , res );
-                log() << "forced split results: " << res << endl;
-                
-                if ( ! res["ok"].trueValue() ) {
-                    log() << "marking chunk as jumbo: " << c->toString() << endl;
-                    c->markAsJumbo();
-                    // we increment moveCount so we do another round right away
-                    movedCount++;
+                    c = cm->findIntersectingChunk(migrateInfo->chunk.min);
+
+                    log() << "performing a split because migrate failed for size reasons";
+
+                    Status status = c->split(Chunk::normal, NULL, NULL);
+                    log() << "split results: " << status;
+
+                    if (!status.isOK()) {
+                        log() << "marking chunk as jumbo: " << c->toString();
+
+                        c->markAsJumbo();
+
+                        // We increment moveCount so we do another round right away
+                        movedCount++;
+                    }
                 }
-
+            }
+            catch (const DBException& ex) {
+                warning() << "could not move chunk " << migrateInfo->chunk.toString()
+                          << ", continuing balancing round" << causedBy(ex);
             }
         }
 
         return movedCount;
     }
 
-    void Balancer::_ping( DBClientBase& conn, bool waiting ) {
-        WriteConcern w = conn.getWriteConcern();
-        conn.setWriteConcern( W_NONE );
+    void Balancer::_ping(bool waiting) {
+        grid.catalogManager()->update(
+                        MongosType::ConfigNS,
+                        BSON(MongosType::name(_myid)),
+                        BSON("$set" << BSON(MongosType::ping(jsTime()) <<
+                                            MongosType::up(static_cast<int>(time(0) - _started)) <<
+                                            MongosType::waiting(waiting) <<
+                                            MongosType::mongoVersion(versionString))),
+                        true,
+                        false,
+                        NULL);
+    }
 
-        conn.update( ShardNS::mongos ,
-                     BSON( "_id" << _myid ) ,
-                     BSON( "$set" << BSON( "ping" << DATENOW << "up" << (int)(time(0)-_started)
-                                        << "waiting" << waiting ) ) ,
-                     true );
+     /* 
+     * Builds the details object for the actionlog.
+     * Current formats for detail are:
+     * Success: {
+     *           "candidateChunks" : ,
+     *           "chunksMoved" : ,
+     *           "executionTimeMillis" : ,
+     *           "errorOccured" : false
+     *          }
+     * Failure: {
+     *           "executionTimeMillis" : ,
+     *           "errmsg" : ,
+     *           "errorOccured" : true
+     *          }
+     * @param didError, did this round end in an error?
+     * @param executionTime, the time this round took to run
+     * @param candidateChunks, the number of chunks identified to be moved
+     * @param chunksMoved, the number of chunks moved
+     * @param errmsg, the error message for this round
+     */
 
-        conn.setWriteConcern( w);
+    static BSONObj _buildDetails( bool didError, int executionTime,
+            int candidateChunks, int chunksMoved, const std::string& errmsg ) {
+
+        BSONObjBuilder builder;
+        builder.append("executionTimeMillis", executionTime);
+        builder.append("errorOccured", didError);
+
+        if ( didError ) {
+            builder.append("errmsg", errmsg);
+        } else {
+            builder.append("candidateChunks", candidateChunks);
+            builder.append("chunksMoved", chunksMoved);
+        }
+        return builder.obj();
     }
 
     bool Balancer::_checkOIDs() {
-        vector<Shard> all;
-        Shard::getAllShards( all );
+        vector<ShardId> all;
+        grid.shardRegistry()->getAllShardIds(&all);
 
-        map<int,Shard> oids;
+        // map of OID machine ID => shardId
+        map<int, string> oids;
 
-        for ( vector<Shard>::iterator i=all.begin(); i!=all.end(); ++i ) {
-            Shard s = *i;
-            BSONObj f = s.runCommand( "admin" , "features" );
+        for (const ShardId& shardId : all) {
+            const auto& s = grid.shardRegistry()->findIfExists(shardId);
+            if (!s) {
+                continue;
+            }
+
+            BSONObj f = s->runCommand("admin", "features");
             if ( f["oidMachine"].isNumber() ) {
                 int x = f["oidMachine"].numberInt();
-                if ( oids.count(x) == 0 ) {
-                    oids[x] = s;
+                if (oids.count(x) == 0) {
+                    oids[x] = shardId;
                 }
                 else {
-                    log() << "error: 2 machines have " << x << " as oid machine piece " << s.toString() << " and " << oids[x].toString() << endl;
-                    s.runCommand( "admin" , BSON( "features" << 1 << "oidReset" << 1 ) );
-                    oids[x].runCommand( "admin" , BSON( "features" << 1 << "oidReset" << 1 ) );
+                    log() << "error: 2 machines have " << x
+                          << " as oid machine piece: " << shardId
+                          << " and " << oids[x];
+                    s->runCommand("admin", BSON("features" << 1 << "oidReset" << 1));
+
+                    const auto& otherShard = grid.shardRegistry()->findIfExists(oids[x]);
+                    if (otherShard) {
+                        otherShard->runCommand("admin", BSON("features" << 1 << "oidReset" << 1));
+                    }
                     return false;
                 }
             }
             else {
-                log() << "warning: oidMachine not set on: " << s.toString() << endl;
+                log() << "warning: oidMachine not set on: " << s->toString();
             }
         }
         return true;
     }
+    
+    /**
+     * Occasionally prints a log message with shard versions if the versions are not the same
+     * in the cluster.
+     */
+    void warnOnMultiVersion( const ShardInfoMap& shardInfo ) {
 
-    void Balancer::_doBalanceRound( DBClientBase& conn, vector<CandidateChunkPtr>* candidateChunks ) {
-        verify( candidateChunks );
-
-        //
-        // 1. Check whether there is any sharded collection to be balanced by querying
-        // the ShardsNS::collections collection
-        //
-
-        auto_ptr<DBClientCursor> cursor = conn.query( ShardNS::collection , BSONObj() );
-        vector< string > collections;
-        while ( cursor->more() ) {
-            BSONObj col = cursor->nextSafe();
-
-            // sharded collections will have a shard "key".
-            if ( ! col["key"].eoo() && ! col["noBalance"].trueValue() ){
-                collections.push_back( col["_id"].String() );
+        bool isMultiVersion = false;
+        for ( ShardInfoMap::const_iterator i = shardInfo.begin(); i != shardInfo.end(); ++i ) {
+            if ( !isSameMajorVersion( i->second.getMongoVersion().c_str() ) ) {
+                isMultiVersion = true;
+                break;
             }
-            else if( col["noBalance"].trueValue() ){
-                LOG(1) << "not balancing collection " << col["_id"].String() << ", explicitly disabled" << endl;
-            }
-
         }
-        cursor.reset();
 
-        if ( collections.empty() ) {
-            LOG(1) << "no collections to balance" << endl;
+        // If we're all the same version, don't message
+        if ( !isMultiVersion ) return;
+
+        warning() << "multiVersion cluster detected, my version is " << versionString;
+        for ( ShardInfoMap::const_iterator i = shardInfo.begin(); i != shardInfo.end(); ++i ) {
+            log() << i->first << " is at version " << i->second.getMongoVersion();
+        }        
+    }
+
+    void Balancer::_doBalanceRound(vector<shared_ptr<MigrateInfo>>* candidateChunks) {
+        invariant(candidateChunks);
+
+        vector<CollectionType> collections;
+        Status collsStatus = grid.catalogManager()->getCollections(nullptr, &collections);
+        if (!collsStatus.isOK()) {
+            warning() << "Failed to retrieve the set of collections during balancing round "
+                      << collsStatus;
             return;
         }
 
-        //
-        // 2. Get a list of all the shards that are participating in this balance round
-        // along with any maximum allowed quotas and current utilization. We get the
-        // latter by issuing db.serverStatus() (mem.mapped) to all shards.
+        if (collections.empty()) {
+            LOG(1) << "no collections to balance";
+            return;
+        }
+
+        // Get a list of all the shards that are participating in this balance round along with any
+        // maximum allowed quotas and current utilization. We get the latter by issuing
+        // db.serverStatus() (mem.mapped) to all shards.
         //
         // TODO: skip unresponsive shards and mark information as stale.
-        //
-
-        vector<Shard> allShards;
-        Shard::getAllShards( allShards );
-        if ( allShards.size() < 2) {
-            LOG(1) << "can't balance without more active shards" << endl;
+        ShardInfoMap shardInfo;
+        Status loadStatus = DistributionStatus::populateShardInfoMap(&shardInfo);
+        if (!loadStatus.isOK()) {
+            warning() << "failed to load shard metadata" << causedBy(loadStatus);
             return;
         }
 
-        map< string, BSONObj > shardLimitsMap;
-        for ( vector<Shard>::const_iterator it = allShards.begin(); it != allShards.end(); ++it ) {
-            const Shard& s = *it;
-            ShardStatus status = s.getStatus();
-
-            BSONObj limitsObj = BSON( ShardFields::maxSize( s.getMaxSize() ) <<
-                                      LimitsFields::currSize( status.mapped() ) <<
-                                      ShardFields::draining( s.isDraining() )  <<
-                                      LimitsFields::hasOpsQueued( status.hasOpsQueued() )
-                                    );
-
-            shardLimitsMap[ s.getName() ] = limitsObj;
+        if (shardInfo.size() < 2) {
+            LOG(1) << "can't balance without more active shards";
+            return;
         }
+        
+        OCCASIONALLY warnOnMultiVersion( shardInfo );
 
-        //
-        // 3. For each collection, check if the balancing policy recommends moving anything around.
-        //
+        // For each collection, check if the balancing policy recommends moving anything around.
+        for (const auto& coll : collections) {
+            // Skip collections for which balancing is disabled
+            const NamespaceString& ns = coll.getNs();
 
-        for (vector<string>::const_iterator it = collections.begin(); it != collections.end(); ++it ) {
-            const string& ns = *it;
-
-            map< string,vector<BSONObj> > shardToChunksMap;
-            cursor = conn.query( ShardNS::chunk , QUERY( "ns" << ns ).sort( "min" ) );
-            while ( cursor->more() ) {
-                BSONObj chunk = cursor->nextSafe();
-                if ( chunk["jumbo"].trueValue() )
-                    continue;
-                vector<BSONObj>& chunks = shardToChunksMap[chunk["shard"].String()];
-                chunks.push_back( chunk.getOwned() );
+            if (!coll.getAllowBalance()) {
+                LOG(1) << "Not balancing collection " << ns << "; explicitly disabled.";
+                continue;
             }
-            cursor.reset();
+
+            std::vector<ChunkType> allNsChunks;
+            grid.catalogManager()->getChunks(Query(BSON(ChunkType::ns(ns)))
+                                                .sort(ChunkType::min()),
+                                             0, // all chunks
+                                             &allNsChunks);
+
+            set<BSONObj> allChunkMinimums;
+            map<string, vector<ChunkType>> shardToChunksMap;
+
+            for (const ChunkType& chunk : allNsChunks) {
+                allChunkMinimums.insert(chunk.getMin().getOwned());
+
+                vector<ChunkType>& chunksList = shardToChunksMap[chunk.getShard()];
+                chunksList.push_back(chunk);
+            }
 
             if (shardToChunksMap.empty()) {
                 LOG(1) << "skipping empty collection (" << ns << ")";
                 continue;
             }
 
-            for ( vector<Shard>::iterator i=allShards.begin(); i!=allShards.end(); ++i ) {
-                // this just makes sure there is an entry in shardToChunksMap for every shard
-                Shard s = *i;
-                shardToChunksMap[s.getName()].size();
+            for (ShardInfoMap::const_iterator i = shardInfo.begin(); i != shardInfo.end(); ++i) {
+                // This loop just makes sure there is an entry in shardToChunksMap for every shard
+                shardToChunksMap[i->first];
             }
 
-            CandidateChunk* p = _policy->balance( ns , shardLimitsMap , shardToChunksMap , _balancedLastTime );
-            if ( p ) candidateChunks->push_back( CandidateChunkPtr( p ) );
+            DistributionStatus status(shardInfo, shardToChunksMap);
+
+            // TODO: TagRange contains all the information from TagsType except for the namespace,
+            //       so maybe the two can be merged at some point in order to avoid the
+            //       transformation below.
+            vector<TagRange> ranges;
+
+            {
+                vector<TagsType> collectionTags;
+                uassertStatusOK(grid.catalogManager()->getTagsForCollection(ns.toString(),
+                                                                            &collectionTags));
+                for (const auto& tt : collectionTags) {
+                    ranges.push_back(TagRange(tt.getMinKey().getOwned(),
+                                              tt.getMaxKey().getOwned(),
+                                              tt.getTag()));
+                    uassert(16356,
+                            str::stream() << "tag ranges not valid for: " << ns.toString(),
+                            status.addTagRange(ranges.back()));
+                }
+            }
+
+            auto statusGetDb = grid.catalogCache()->getDatabase(ns.db().toString());
+            if (!statusGetDb.isOK()) {
+                warning() << "could not load db config to balance collection [" << ns << "]: "
+                          << statusGetDb.getStatus();
+                continue;
+            }
+
+            shared_ptr<DBConfig> cfg = statusGetDb.getValue();
+
+            // This line reloads the chunk manager once if this process doesn't know the collection
+            // is sharded yet.
+            shared_ptr<ChunkManager> cm = cfg->getChunkManagerIfExists(ns, true);
+            if (!cm) {
+                warning() << "could not load chunks to balance " << ns << " collection";
+                continue;
+            }
+
+            // Loop through tags to make sure no chunk spans tags. Split on tag min for all chunks.
+            bool didAnySplits = false;
+
+            for (const TagRange& range : ranges) {
+                BSONObj min =
+                    cm->getShardKeyPattern().getKeyPattern().extendRangeBound(range.min, false);
+
+                if (allChunkMinimums.count(min) > 0) {
+                    continue;
+                }
+
+                didAnySplits = true;
+
+                log() << "ns: " << ns << " need to split on " << min
+                      << " because there is a range there";
+
+                ChunkPtr c = cm->findIntersectingChunk(min);
+
+                vector<BSONObj> splitPoints;
+                splitPoints.push_back( min );
+
+                Status status = c->multiSplit(splitPoints, NULL);
+                if (!status.isOK()) {
+                    error() << "split failed: " << status;
+                }
+                else {
+                    LOG(1) << "split worked";
+                }
+
+                break;
+            }
+
+            if (didAnySplits) {
+                // State change, just wait till next round
+                continue;
+            }
+
+            shared_ptr<MigrateInfo> migrateInfo(_policy->balance(ns, status, _balancedLastTime));
+            if (migrateInfo) {
+                candidateChunks->push_back(migrateInfo);
+            }
         }
     }
 
     bool Balancer::_init() {
         try {
-
-            log() << "about to contact config servers and shards" << endl;
+            log() << "about to contact config servers and shards";
 
             // contact the config server and refresh shard information
             // checks that each shard is indeed a different process (no hostname mixup)
@@ -247,117 +483,167 @@ namespace mongo {
             Shard::reloadShardInfo();
             _checkOIDs();
 
-            log() << "config servers and shards contacted successfully" << endl;
+            log() << "config servers and shards contacted successfully";
 
             StringBuilder buf;
-            buf << getHostNameCached() << ":" << cmdLine.port;
+            buf << getHostNameCached() << ":" << serverGlobalParams.port;
             _myid = buf.str();
             _started = time(0);
 
-            log() << "balancer id: " << _myid << " started at " << time_t_to_String_short(_started) << endl;
+            log() << "balancer id: " << _myid << " started";
 
             return true;
 
         }
         catch ( std::exception& e ) {
-            warning() << "could not initialize balancer, please check that all shards and config servers are up: " << e.what() << endl;
+            warning() << "could not initialize balancer, please check that all shards and config servers are up: " << e.what();
             return false;
 
         }
     }
 
     void Balancer::run() {
+        Client::initThread("Balancer");
 
-        // this is the body of a BackgroundJob so if we throw here we're basically ending the balancer thread prematurely
-        while ( ! inShutdown() ) {
-
-            if ( ! _init() ) {
-                log() << "will retry to initialize balancer in one minute" << endl;
-                sleepsecs( 60 );
+        // This is the body of a BackgroundJob so if we throw here we're basically ending the
+        // balancer thread prematurely.
+        while (!inShutdown()) {
+            if (!_init()) {
+                log() << "will retry to initialize balancer in one minute";
+                sleepsecs(60);
                 continue;
             }
 
             break;
         }
 
-        // getConnectioString and dist lock constructor does not throw, which is what we expect on while
-        // on the balancer thread
-        ConnectionString config = configServer.getConnectionString();
-        DistributedLock balanceLock( config , "balancer" );
+        const int sleepTime = 10;
 
-        while ( ! inShutdown() ) {
+        while (!inShutdown()) {
+            Timer balanceRoundTimer;
+            ActionLogType actionLog;
+
+            actionLog.setServer(getHostNameCached());
+            actionLog.setWhat("balancer.round");
 
             try {
-                
-                ScopedDbConnection conn( config );
-                
                 // ping has to be first so we keep things in the config server in sync
-                _ping( conn.conn() );
+                _ping();
 
-                // now make sure we should even be running
-                if ( ! grid.shouldBalance() ) {
-                    LOG(1) << "skipping balancing round because balancing is disabled" << endl;
-
-                    // Ping again so scripts can determine if we're active without waiting
-                    _ping( conn.conn(), true );
-
-                    conn.done();
-                    
-                    sleepsecs( 30 );
-                    continue;
-                }
-                
-                uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
+                BSONObj balancerResult;
 
                 // use fresh shard state
                 Shard::reloadShardInfo();
-                    
+
                 // refresh chunk size (even though another balancer might be active)
                 Chunk::refreshChunkSize();
 
+                auto balSettingsResult =
+                    grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
+                const bool isBalSettingsAbsent =
+                    balSettingsResult.getStatus() == ErrorCodes::NoSuchKey;
+                if (!balSettingsResult.isOK() && !isBalSettingsAbsent) {
+                    warning() << balSettingsResult.getStatus();
+                    return;
+                }
+                const SettingsType& balancerConfig = isBalSettingsAbsent ?
+                    SettingsType{} : balSettingsResult.getValue();
+
+                // now make sure we should even be running
+                if ((!isBalSettingsAbsent && !grid.shouldBalance(balancerConfig)) ||
+                    MONGO_FAIL_POINT(skipBalanceRound)) {
+
+                    LOG(1) << "skipping balancing round because balancing is disabled";
+
+                    // Ping again so scripts can determine if we're active without waiting
+                    _ping( true );
+
+                    sleepsecs( sleepTime );
+                    continue;
+                }
+
+                uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
+
                 {
-                    dist_lock_try lk( &balanceLock , "doing balance round" );
-                    if ( ! lk.got() ) {
-                        LOG(1) << "skipping balancing round because another balancer is active" << endl;
+                    auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                            "balancer", "doing balance round");
+
+                    if (!scopedDistLock.isOK()) {
+                        LOG(1) << "skipping balancing round"
+                               << causedBy(scopedDistLock.getStatus());
 
                         // Ping again so scripts can determine if we're active without waiting
-                        _ping( conn.conn(), true );
+                        _ping( true );
 
-                        conn.done();
-                        
-                        sleepsecs( 30 ); // no need to wake up soon
+                        sleepsecs( sleepTime ); // no need to wake up soon
                         continue;
                     }
-                    
-                    LOG(1) << "*** start balancing round" << endl;
 
-                    vector<CandidateChunkPtr> candidateChunks;
-                    _doBalanceRound( conn.conn() , &candidateChunks );
+                    const bool waitForDelete = (balancerConfig.isWaitForDeleteSet() ?
+                            balancerConfig.getWaitForDelete() : false);
+
+                    std::unique_ptr<WriteConcernOptions> writeConcern;
+                    if (balancerConfig.isKeySet()) { // if balancer doc exists.
+                        writeConcern = std::move(balancerConfig.getWriteConcern());
+                    }
+
+                    LOG(1) << "*** start balancing round. "
+                           << "waitForDelete: " << waitForDelete
+                           << ", secondaryThrottle: "
+                           << (writeConcern.get() ? writeConcern->toBSON().toString() : "default")
+                          ;
+
+                    vector<shared_ptr<MigrateInfo>> candidateChunks;
+                    _doBalanceRound(&candidateChunks);
+
                     if ( candidateChunks.size() == 0 ) {
-                        LOG(1) << "no need to move any chunk" << endl;
+                        LOG(1) << "no need to move any chunk";
                         _balancedLastTime = 0;
                     }
                     else {
-                        _balancedLastTime = _moveChunks( &candidateChunks );
+                        _balancedLastTime = _moveChunks(candidateChunks,
+                                                        writeConcern.get(),
+                                                        waitForDelete);
                     }
-                    
-                    LOG(1) << "*** end of balancing round" << endl;
+
+                    actionLog.setDetails(
+                        _buildDetails(false,
+                                      balanceRoundTimer.millis(),
+                                      static_cast<int>(candidateChunks.size()),
+                                      _balancedLastTime,
+                                      ""));
+                    actionLog.setTime(jsTime());
+
+                    grid.catalogManager()->logAction(actionLog);
+
+                    LOG(1) << "*** end of balancing round";
                 }
 
                 // Ping again so scripts can determine if we're active without waiting
-                _ping( conn.conn(), true );
-                
-                conn.done();
+                _ping(true);
 
-                sleepsecs( _balancedLastTime ? 5 : 10 );
+                sleepsecs(_balancedLastTime ? sleepTime / 10 : sleepTime);
             }
             catch ( std::exception& e ) {
-                log() << "caught exception while doing balance: " << e.what() << endl;
+                log() << "caught exception while doing balance: " << e.what();
 
                 // Just to match the opening statement if in log level 1
-                LOG(1) << "*** End of balancing round" << endl;
+                LOG(1) << "*** End of balancing round";
 
-                sleepsecs( 30 ); // sleep a fair amount b/c of error
+                // This round failed, tell the world!
+                actionLog.setDetails(
+                    _buildDetails(true,
+                                  balanceRoundTimer.millis(),
+                                  0,
+                                  0,
+                                  e.what()));
+                actionLog.setTime(jsTime());
+
+                grid.catalogManager()->logAction(actionLog);
+
+                // Sleep a fair amount before retrying because of the error
+                sleepsecs(sleepTime);
+
                 continue;
             }
         }
