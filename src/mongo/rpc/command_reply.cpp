@@ -31,54 +31,56 @@
 #include "mongo/rpc/command_reply.h"
 
 #include <tuple>
+#include <utility>
 
 #include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_type_validated.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 namespace rpc {
 
-    CommandReply::CommandReply(const Message* message)
-        : _message(message) {
+CommandReply::CommandReply(const Message* message) : _message(message) {
+    const char* begin = _message->singleData().data();
+    std::size_t length = _message->singleData().dataLen();
 
-        const char* begin = _message->singleData().data();
-        std::size_t length = _message->singleData().dataLen();
+    // This check failing would normally be operation fatal, but we expect it to have been
+    // done earlier in the network layer, so we make it an invariant.
+    invariant(length <= MaxMessageSizeBytes);
 
-        // This check failing would normally be operation fatal, but we expect it to have been
-        // done earlier in the network layer, so we make it an invariant.
-        invariant(length <= MaxMessageSizeBytes);
+    const char* messageEnd = begin + length;
+    ConstDataRangeCursor cur(begin, messageEnd);
 
-        const char* messageEnd = begin + length;
-        ConstDataRangeCursor cur(begin, messageEnd);
+    _commandReply = uassertStatusOK(cur.readAndAdvance<Validated<BSONObj>>()).val;
+    _metadata = uassertStatusOK(cur.readAndAdvance<Validated<BSONObj>>()).val;
+    _outputDocs = DocumentRange(cur.data(), messageEnd);
+}
 
-        // TODO(amidvidy): we don't currently handle BSON validation.
-        // we will eventually have to thread serverGlobalParams.objcheck through here
-        // similarly to DbMessage::nextJsObj
-        uassertStatusOK(cur.readAndAdvance<BSONObj>(&_metadata));
-        uassertStatusOK(cur.readAndAdvance<BSONObj>(&_commandReply));
-        _outputDocs = DocumentRange(cur.data(), messageEnd);
-    }
+const BSONObj& CommandReply::getMetadata() const {
+    return _metadata;
+}
 
-    const BSONObj& CommandReply::getMetadata() const {
-        return _metadata;
-    }
+const BSONObj& CommandReply::getCommandReply() const {
+    return _commandReply;
+}
 
-    const BSONObj& CommandReply::getCommandReply() const {
-        return _commandReply;
-    }
+DocumentRange CommandReply::getOutputDocs() const {
+    return _outputDocs;
+}
 
-    DocumentRange CommandReply::getOutputDocs() const {
-        return  _outputDocs;
-    }
+Protocol CommandReply::getProtocol() const {
+    return rpc::Protocol::kOpCommandV1;
+}
 
-    bool operator==(const CommandReply& lhs, const CommandReply& rhs) {
-        return std::tie(lhs._metadata, lhs._commandReply, lhs._outputDocs) ==
-               std::tie(rhs._metadata, rhs._commandReply, rhs._outputDocs);
-    }
+bool operator==(const CommandReply& lhs, const CommandReply& rhs) {
+    return std::tie(lhs._metadata, lhs._commandReply, lhs._outputDocs) ==
+        std::tie(rhs._metadata, rhs._commandReply, rhs._outputDocs);
+}
 
-    bool operator!=(const CommandReply& lhs, const CommandReply& rhs) {
-        return !(lhs == rhs);
-    }
+bool operator!=(const CommandReply& lhs, const CommandReply& rhs) {
+    return !(lhs == rhs);
+}
 
 }  // namespace rpc
 }  // namespace mongo

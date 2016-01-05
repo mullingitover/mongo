@@ -31,73 +31,74 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/document_range.h"
+#include "mongo/rpc/protocol.h"
 #include "mongo/rpc/request_interface.h"
 
 namespace mongo {
-    class Message;
+class Message;
 
 namespace rpc {
 
+/**
+ * An immutable view of an OP_COMMAND message. The underlying bytes are owned
+ * by a mongo::Message, which must outlive any Reply instances created from it.
+ */
+class CommandRequest : public RequestInterface {
+public:
     /**
-     * An immutable view of an OP_COMMAND message. The underlying bytes are owned
-     * by a mongo::Message, which must outlive any Reply instances created from it.
-     *
-     * TODO: BSON validation. See SERVER-18167 for details.
+     * Construct a Request from a Message. Underlying message MUST outlive the Request.
+     * Required fields are parsed eagerly, inputDocs are parsed lazily.
      */
-    class CommandRequest : public RequestInterface {
-    public:
-        /**
-         * Construct a Request from a Message. Underlying message MUST outlive the Request.
-         * Required fields are parsed eagerly, inputDocs are parsed lazily.
-         */
-        explicit CommandRequest(const Message* message);
+    explicit CommandRequest(const Message* message);
 
-        ~CommandRequest() = default;
+    ~CommandRequest() = default;
 
-        /**
-         * The database that the command is to be executed on.
-         */
-        StringData getDatabase() const final;
+    /**
+     * The database that the command is to be executed on.
+     */
+    StringData getDatabase() const final;
 
-        /**
-         * The name of the command to execute.
-         */
-        StringData getCommandName() const final;
+    /**
+     * The name of the command to execute.
+     */
+    StringData getCommandName() const final;
 
-        /**
-         * The metadata associated with the command request. This is information that is
-         * independent of any specific command, i.e. auditing information.
-         */
-        const BSONObj& getMetadata() const final;
+    /**
+     * The metadata associated with the command request. This is information that is
+     * independent of any specific command, i.e. auditing information.
+     */
+    const BSONObj& getMetadata() const final;
 
-        /**
-         * The arguments to the command - this is passed to the command's run() method.
-         */
-        const BSONObj& getCommandArgs() const final;
+    /**
+     * The arguments to the command - this is passed to the command's run() method.
+     */
+    const BSONObj& getCommandArgs() const final;
 
-        /**
-         * A variable number of BSON documents to pass to the command. It is valid for
-         * the returned range to be empty.
-         *
-         * Example usage:
-         *
-         * for (auto&& doc : req.getInputDocs()) {
-         *    ... do stuff with doc
-         * }
-         */
-        DocumentRange getInputDocs() const final;
+    /**
+     * A variable number of BSON documents to pass to the command. It is valid for
+     * the returned range to be empty.
+     *
+     * Example usage:
+     *
+     * for (auto&& doc : req.getInputDocs()) {
+     *    ... do stuff with doc
+     * }
+     */
+    DocumentRange getInputDocs() const final;
 
-        friend bool operator==(const CommandRequest& lhs, const CommandRequest& rhs);
-        friend bool operator!=(const CommandRequest& lhs, const CommandRequest& rhs);
+    Protocol getProtocol() const final;
 
-    private:
-        const Message* _message;
-        StringData _database;
-        StringData _commandName;
-        BSONObj _metadata;
-        BSONObj _commandArgs;
-        DocumentRange _inputDocs;
-    };
+    friend bool operator==(const CommandRequest& lhs, const CommandRequest& rhs);
+    friend bool operator!=(const CommandRequest& lhs, const CommandRequest& rhs);
+
+private:
+    const Message* _message;
+    StringData _database;
+    StringData _commandName;
+    BSONObj _commandArgs;
+    BSONObj _metadata;
+    DocumentRange _inputDocs;
+};
 
 }  // namespace rpc
 }  // namespace mongo

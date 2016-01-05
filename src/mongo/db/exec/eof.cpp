@@ -31,57 +31,39 @@
 #include "mongo/db/exec/eof.h"
 
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    using std::vector;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
 
-    // static
-    const char* EOFStage::kStageType = "EOF";
+// static
+const char* EOFStage::kStageType = "EOF";
 
-    EOFStage::EOFStage() : _commonStats(kStageType) { }
+EOFStage::EOFStage(OperationContext* opCtx) : PlanStage(kStageType, opCtx) {}
 
-    EOFStage::~EOFStage() { }
+EOFStage::~EOFStage() {}
 
-    bool EOFStage::isEOF() {
-        return true;
-    }
+bool EOFStage::isEOF() {
+    return true;
+}
 
-    PlanStage::StageState EOFStage::work(WorkingSetID* out) {
-        ++_commonStats.works;
-        // Adds the amount of time taken by work() to executionTimeMillis.
-        ScopedTimer timer(&_commonStats.executionTimeMillis);
-        return PlanStage::IS_EOF;
-    }
+PlanStage::StageState EOFStage::work(WorkingSetID* out) {
+    ++_commonStats.works;
+    // Adds the amount of time taken by work() to executionTimeMillis.
+    ScopedTimer timer(&_commonStats.executionTimeMillis);
+    return PlanStage::IS_EOF;
+}
 
-    void EOFStage::saveState() {
-        ++_commonStats.yields;
-    }
+unique_ptr<PlanStageStats> EOFStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    return make_unique<PlanStageStats>(_commonStats, STAGE_EOF);
+}
 
-    void EOFStage::restoreState(OperationContext* opCtx) {
-        ++_commonStats.unyields;
-    }
-
-    void EOFStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-        ++_commonStats.invalidates;
-    }
-
-    vector<PlanStage*> EOFStage::getChildren() const {
-        vector<PlanStage*> empty;
-        return empty;
-    }
-
-    PlanStageStats* EOFStage::getStats() {
-        _commonStats.isEOF = isEOF();
-        return new PlanStageStats(_commonStats, STAGE_EOF);
-    }
-
-    const CommonStats* EOFStage::getCommonStats() const {
-        return &_commonStats;
-    }
-
-    const SpecificStats* EOFStage::getSpecificStats() const {
-        return nullptr;
-    }
+const SpecificStats* EOFStage::getSpecificStats() const {
+    return nullptr;
+}
 
 }  // namespace mongo

@@ -28,72 +28,91 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread.hpp>
+#include <deque>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/sync_source_feedback.h"
+#include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
 
 namespace mongo {
 namespace repl {
 
-    class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExternalState {
-        MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateImpl);
-    public:
+class SnapshotThread;
 
-        ReplicationCoordinatorExternalStateImpl();
-        virtual ~ReplicationCoordinatorExternalStateImpl();
-        virtual void startThreads();
-        virtual void startMasterSlave(OperationContext* txn);
-        virtual void shutdown();
-        virtual void initiateOplog(OperationContext* txn);
-        virtual void forwardSlaveProgress();
-        virtual OID ensureMe(OperationContext* txn);
-        virtual bool isSelf(const HostAndPort& host);
-        virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
-        virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
-        virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* txn);
-        virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
-        virtual void setGlobalTimestamp(const Timestamp& newTime);
-        virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
-        virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
-        virtual void closeConnections();
-        virtual void killAllUserOperations(OperationContext* txn);
-        virtual void clearShardingState();
-        virtual void signalApplierToChooseNewSyncSource();
-        virtual OperationContext* createOperationContext(const std::string& threadName);
-        virtual void dropAllTempCollections(OperationContext* txn);
+class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExternalState {
+    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateImpl);
 
-        std::string getNextOpContextThreadName();
+public:
+    ReplicationCoordinatorExternalStateImpl();
+    virtual ~ReplicationCoordinatorExternalStateImpl();
+    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startMasterSlave(OperationContext* txn);
+    virtual void shutdown();
+    virtual Status initializeReplSetStorage(OperationContext* txn,
+                                            const BSONObj& config,
+                                            bool updateReplOpTime);
+    virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
+    virtual void forwardSlaveProgress();
+    virtual OID ensureMe(OperationContext* txn);
+    virtual bool isSelf(const HostAndPort& host);
+    virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
+    virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
+    virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* txn);
+    virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
+    virtual void setGlobalTimestamp(const Timestamp& newTime);
+    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
+    virtual void cleanUpLastApplyBatch(OperationContext* txn);
+    virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
+    virtual void closeConnections();
+    virtual void killAllUserOperations(OperationContext* txn);
+    virtual void clearShardingState();
+    virtual void recoverShardingState(OperationContext* txn);
+    virtual void signalApplierToChooseNewSyncSource();
+    virtual void signalApplierToCancelFetcher();
+    virtual OperationContext* createOperationContext(const std::string& threadName);
+    virtual void dropAllTempCollections(OperationContext* txn);
+    void dropAllSnapshots() final;
+    void updateCommittedSnapshot(SnapshotName newCommitPoint) final;
+    void forceSnapshotCreation() final;
+    virtual bool snapshotsEnabled() const;
+    virtual void notifyOplogMetadataWaiters();
+    virtual double getElectionTimeoutOffsetLimitFraction() const;
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
 
-    private:
-        // Guards starting threads and setting _startedThreads
-        boost::mutex _threadMutex;
+    std::string getNextOpContextThreadName();
 
-        // True when the threads have been started
-        bool _startedThreads;
+private:
+    // Guards starting threads and setting _startedThreads
+    stdx::mutex _threadMutex;
 
-        // The SyncSourceFeedback class is responsible for sending replSetUpdatePosition commands
-        // for forwarding replication progress information upstream when there is chained
-        // replication.
-        SyncSourceFeedback _syncSourceFeedback;
+    // True when the threads have been started
+    bool _startedThreads;
 
-        // Thread running SyncSourceFeedback::run().
-        boost::scoped_ptr<boost::thread> _syncSourceFeedbackThread;
+    // The SyncSourceFeedback class is responsible for sending replSetUpdatePosition commands
+    // for forwarding replication progress information upstream when there is chained
+    // replication.
+    SyncSourceFeedback _syncSourceFeedback;
 
-        // Thread running runSyncThread().
-        boost::scoped_ptr<boost::thread> _applierThread;
+    // Thread running SyncSourceFeedback::run().
+    std::unique_ptr<stdx::thread> _syncSourceFeedbackThread;
 
-        // Thread running BackgroundSync::producerThread().
-        boost::scoped_ptr<boost::thread> _producerThread;
+    // Thread running runSyncThread().
+    std::unique_ptr<stdx::thread> _applierThread;
 
-        // Mutex guarding the _nextThreadId value to prevent concurrent incrementing.
-        boost::mutex _nextThreadIdMutex;
-        // Number used to uniquely name threads.
-        long long _nextThreadId;
-    };
+    // Thread running BackgroundSync::producerThread().
+    std::unique_ptr<stdx::thread> _producerThread;
 
-} // namespace repl
-} // namespace mongo
+    // Mutex guarding the _nextThreadId value to prevent concurrent incrementing.
+    stdx::mutex _nextThreadIdMutex;
+    // Number used to uniquely name threads.
+    long long _nextThreadId;
+
+    std::unique_ptr<SnapshotThread> _snapshotThread;
+};
+
+}  // namespace repl
+}  // namespace mongo

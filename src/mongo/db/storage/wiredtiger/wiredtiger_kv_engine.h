@@ -34,125 +34,147 @@
 #include <set>
 #include <string>
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
-
 #include <wiredtiger.h>
 
 #include "mongo/bson/ordering.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
 
-    class WiredTigerSessionCache;
-    class WiredTigerSizeStorer;
+class WiredTigerSessionCache;
+class WiredTigerSizeStorer;
 
-    class WiredTigerKVEngine : public KVEngine {
-    public:
-        WiredTigerKVEngine( const std::string& path,
-                            const std::string& extraOpenOptions = "",
-                            bool durable = true,
-                            bool repair = false );
-        virtual ~WiredTigerKVEngine();
+class WiredTigerKVEngine final : public KVEngine {
+public:
+    WiredTigerKVEngine(const std::string& canonicalName,
+                       const std::string& path,
+                       const std::string& extraOpenOptions,
+                       size_t cacheSizeGB,
+                       bool durable,
+                       bool ephemeral,
+                       bool repair);
+    virtual ~WiredTigerKVEngine();
 
-        void setRecordStoreExtraOptions( const std::string& options );
-        void setSortedDataInterfaceExtraOptions( const std::string& options );
+    void setRecordStoreExtraOptions(const std::string& options);
+    void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-        virtual bool supportsDocLocking() const;
+    virtual bool supportsDocLocking() const;
 
-        virtual bool supportsDirectoryPerDB() const;
+    virtual bool supportsDirectoryPerDB() const;
 
-        virtual bool isDurable() const { return _durable; }
+    virtual bool isDurable() const {
+        return _durable;
+    }
 
-        virtual RecoveryUnit* newRecoveryUnit();
+    virtual bool isEphemeral() {
+        return _ephemeral;
+    }
 
-        virtual Status createRecordStore( OperationContext* opCtx,
-                                          StringData ns,
-                                          StringData ident,
-                                          const CollectionOptions& options );
+    virtual RecoveryUnit* newRecoveryUnit();
 
-        virtual RecordStore* getRecordStore( OperationContext* opCtx,
-                                             StringData ns,
+    virtual Status createRecordStore(OperationContext* opCtx,
+                                     StringData ns,
+                                     StringData ident,
+                                     const CollectionOptions& options);
+
+    virtual RecordStore* getRecordStore(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options);
+
+    virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const CollectionOptions& options );
+                                             const IndexDescriptor* desc);
 
-        virtual Status createSortedDataInterface( OperationContext* opCtx,
-                                                  StringData ident,
-                                                  const IndexDescriptor* desc );
+    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
+                                                        StringData ident,
+                                                        const IndexDescriptor* desc);
 
-        virtual SortedDataInterface* getSortedDataInterface( OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc );
+    virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
-        virtual Status dropIdent( OperationContext* opCtx,
-                                  StringData ident );
+    virtual Status okToRename(OperationContext* opCtx,
+                              StringData fromNS,
+                              StringData toNS,
+                              StringData ident,
+                              const RecordStore* originalRecordStore) const;
 
-        virtual Status okToRename( OperationContext* opCtx,
-                                   StringData fromNS,
-                                   StringData toNS,
-                                   StringData ident,
-                                   const RecordStore* originalRecordStore ) const;
+    virtual int flushAllFiles(bool sync);
 
-        virtual int flushAllFiles( bool sync );
+    virtual Status beginBackup(OperationContext* txn);
 
-        virtual int64_t getIdentSize( OperationContext* opCtx,
-                                      StringData ident );
+    virtual void endBackup(OperationContext* txn);
 
-        virtual Status repairIdent( OperationContext* opCtx,
-                                    StringData ident );
+    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
-        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const;
+    virtual Status repairIdent(OperationContext* opCtx, StringData ident);
 
-        std::vector<std::string> getAllIdents( OperationContext* opCtx ) const;
+    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const;
 
-        virtual void cleanShutdown();
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
-        // wiredtiger specific
-        // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
-        // held by this class
-        int reconfigure(const char* str);
+    virtual void cleanShutdown();
 
-        WT_CONNECTION* getConnection() { return _conn; }
-        void dropAllQueued();
-        bool haveDropsQueued() const;
+    SnapshotManager* getSnapshotManager() const final {
+        return &_sessionCache->snapshotManager();
+    }
 
-        void syncSizeInfo(bool sync) const;
+    // wiredtiger specific
+    // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
+    // held by this class
+    int reconfigure(const char* str);
 
-        /**
-         * Initializes a background job to remove excess documents in the oplog collections.
-         * This applies to the capped collections in the local.oplog.* namespaces (specifically
-         * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
-         * Returns true if a background job is running for the namespace.
-         */
-        static bool initRsOplogBackgroundThread(StringData ns);
+    WT_CONNECTION* getConnection() {
+        return _conn;
+    }
+    void dropAllQueued();
+    bool haveDropsQueued() const;
 
-    private:
+    void syncSizeInfo(bool sync) const;
 
-        Status _salvageIfNeeded(const char* uri);
-        void _checkIdentPath( StringData ident );
+    /**
+     * Initializes a background job to remove excess documents in the oplog collections.
+     * This applies to the capped collections in the local.oplog.* namespaces (specifically
+     * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+     * Returns true if a background job is running for the namespace.
+     */
+    static bool initRsOplogBackgroundThread(StringData ns);
 
-        bool _hasUri(WT_SESSION* session, const std::string& uri) const;
+private:
+    class WiredTigerJournalFlusher;
 
-        std::string _uri( StringData ident ) const;
-        bool _drop( StringData ident );
+    Status _salvageIfNeeded(const char* uri);
+    void _checkIdentPath(StringData ident);
 
-        WT_CONNECTION* _conn;
-        WT_EVENT_HANDLER _eventHandler;
-        boost::scoped_ptr<WiredTigerSessionCache> _sessionCache;
-        std::string _path;
-        bool _durable;
+    bool _hasUri(WT_SESSION* session, const std::string& uri) const;
 
-        std::string _rsOptions;
-        std::string _indexOptions;
+    std::string _uri(StringData ident) const;
+    bool _drop(StringData ident);
 
-        std::set<std::string> _identToDrop;
-        mutable boost::mutex _identToDropMutex;
+    WT_CONNECTION* _conn;
+    WT_EVENT_HANDLER _eventHandler;
+    std::unique_ptr<WiredTigerSessionCache> _sessionCache;
+    std::string _canonicalName;
+    std::string _path;
 
-        boost::scoped_ptr<WiredTigerSizeStorer> _sizeStorer;
-        std::string _sizeStorerUri;
-        mutable ElapsedTracker _sizeStorerSyncTracker;
-    };
+    bool _durable;
+    bool _ephemeral;
+    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;
 
+    std::string _rsOptions;
+    std::string _indexOptions;
+
+    std::set<std::string> _identToDrop;
+    mutable stdx::mutex _identToDropMutex;
+
+    std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
+    std::string _sizeStorerUri;
+    mutable ElapsedTracker _sizeStorerSyncTracker;
+
+    mutable Date_t _previousCheckedDropsQueued;
+
+    std::unique_ptr<WiredTigerSession> _backupSession;
+};
 }

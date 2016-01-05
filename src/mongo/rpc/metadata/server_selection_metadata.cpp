@@ -43,247 +43,308 @@
 namespace mongo {
 namespace rpc {
 
+
 namespace {
 
-    const char kSecondaryOkFieldName[] = "$secondaryOk";
-    const char kReadPreferenceFieldName[] = "$readPreference";
+// Symbolic constant for the "$secondaryOk" metadata field. This field should be of boolean or
+// numeric type, and is treated as a boolean.
+const char kSecondaryOkFieldName[] = "$secondaryOk";
 
-    const char kQueryOptionsFieldName[] = "$queryOptions";
+// Symbolic constant for the "$readPreference" metadata field. The field should be of Object type
+// when present.
+const char kReadPreferenceFieldName[] = "$readPreference";
 
-    const char kDollarQueryWrapper[] = "$query";
-    const char kQueryWrapper[] = "query";
+const char kQueryOptionsFieldName[] = "$queryOptions";
 
-    /**
-     * Utility to unwrap a '$query' or 'query' wrapped command object. The first element of the
-     * return value indicates whether the command was unwrapped, and the second element is either
-     * the unwrapped command (if it was wrapped), or the original command if it was not.
-     */
-    std::tuple<bool, BSONObj> unwrapCommand(const BSONObj& maybeWrapped) {
-        const auto firstElFieldName = maybeWrapped.firstElementFieldName();
-        if ((firstElFieldName == StringData(kDollarQueryWrapper)) ||
-            (firstElFieldName == StringData(kQueryWrapper))) {
-            // TODO: do we need getOwned here?
-            return std::make_tuple(true, maybeWrapped.firstElement().embeddedObject());
-        }
+const char kDollarQueryWrapper[] = "$query";
+const char kQueryWrapper[] = "query";
+
+/**
+ * Utility to unwrap a '$query' or 'query' wrapped command object. The first element of the
+ * returned tuple indicates whether the command was unwrapped, and the second element is either
+ * the unwrapped command (if it was wrapped), or the original command if it was not.
+ */
+StatusWith<std::tuple<bool, BSONObj>> unwrapCommand(const BSONObj& maybeWrapped) {
+    const auto firstElFieldName = maybeWrapped.firstElementFieldName();
+
+    if ((firstElFieldName != StringData(kDollarQueryWrapper)) &&
+        (firstElFieldName != StringData(kQueryWrapper))) {
         return std::make_tuple(false, maybeWrapped);
     }
 
-    /**
-     * Reads a top-level $readPreference field from a wrapped command.
-     */
-    Status extractWrappedReadPreference(const BSONObj& wrappedCommand,
-                                        BSONObjBuilder* metadataBob) {
-        BSONElement readPrefEl;
-        auto rpExtractStatus = bsonExtractTypedField(wrappedCommand,
-                                                     kReadPreferenceFieldName,
-                                                     mongo::Object,
-                                                     &readPrefEl);
-        if (rpExtractStatus.isOK()) {
-            metadataBob->append(readPrefEl);
-        }
-        else if (rpExtractStatus != ErrorCodes::NoSuchKey) {
-            return rpExtractStatus;
-        }
+    BSONElement inner;
+    auto extractStatus =
+        bsonExtractTypedField(maybeWrapped, firstElFieldName, mongo::Object, &inner);
 
-        return Status::OK();
+    if (!extractStatus.isOK()) {
+        return extractStatus;
     }
 
-    /**
-     * Reads a $readPreference from a $queryOptions subobject, if it exists, and writes it to
-     * metadataBob. Writes out the original command excluding the $queryOptions subobject.
-     */
-    Status extractUnwrappedReadPreference(const BSONObj& unwrappedCommand,
-                                          BSONObjBuilder* commandBob,
-                                          BSONObjBuilder* metadataBob) {
-        BSONElement queryOptionsEl;
-        BSONElement readPrefEl;
+    return std::make_tuple(true, inner.Obj());
+}
 
-        auto queryOptionsExtractStatus = bsonExtractTypedField(unwrappedCommand,
-                                                               kQueryOptionsFieldName,
-                                                               mongo::Object,
-                                                               &queryOptionsEl);
-
-        // If there is no queryOptions subobject, we write out the command and return.
-        if (queryOptionsExtractStatus == ErrorCodes::NoSuchKey) {
-            commandBob->appendElements(unwrappedCommand);
-            return Status::OK();
-        }
-        else if (!queryOptionsExtractStatus.isOK()) {
-            return queryOptionsExtractStatus;
-        }
-
-        // Write out the command excluding the $queryOptions field.
-        for (const auto& elem : unwrappedCommand) {
-            if (elem.fieldNameStringData() != kQueryOptionsFieldName) {
-                commandBob->append(elem);
-            }
-        }
-
-        auto rpExtractStatus = bsonExtractTypedField(queryOptionsEl.embeddedObject(),
-                                                     kReadPreferenceFieldName,
-                                                     mongo::Object,
-                                                     &readPrefEl);
-
-        // If there is a $queryOptions field, we expect there to be a $readPreference.
-        if (!rpExtractStatus.isOK()) {
-            return rpExtractStatus;
-        }
-
+/**
+ * Reads a top-level $readPreference field from a wrapped command.
+ */
+Status extractWrappedReadPreference(const BSONObj& wrappedCommand, BSONObjBuilder* metadataBob) {
+    BSONElement readPrefEl;
+    auto rpExtractStatus =
+        bsonExtractTypedField(wrappedCommand, kReadPreferenceFieldName, mongo::Object, &readPrefEl);
+    if (rpExtractStatus.isOK()) {
         metadataBob->append(readPrefEl);
-        return Status::OK();
+    } else if (rpExtractStatus != ErrorCodes::NoSuchKey) {
+        return rpExtractStatus;
     }
+
+    return Status::OK();
+}
+
+/**
+ * Reads a $readPreference from a $queryOptions subobject, if it exists, and writes it to
+ * metadataBob. Writes out the original command excluding the $queryOptions subobject.
+ */
+Status extractUnwrappedReadPreference(const BSONObj& unwrappedCommand,
+                                      BSONObjBuilder* commandBob,
+                                      BSONObjBuilder* metadataBob) {
+    BSONElement queryOptionsEl;
+    BSONElement readPrefEl;
+
+    auto queryOptionsExtractStatus = bsonExtractTypedField(
+        unwrappedCommand, kQueryOptionsFieldName, mongo::Object, &queryOptionsEl);
+
+    // If there is no queryOptions subobject, we write out the command and return.
+    if (queryOptionsExtractStatus == ErrorCodes::NoSuchKey) {
+        commandBob->appendElements(unwrappedCommand);
+        return Status::OK();
+    } else if (!queryOptionsExtractStatus.isOK()) {
+        return queryOptionsExtractStatus;
+    }
+
+    // Write out the command excluding the $queryOptions field.
+    for (const auto& elem : unwrappedCommand) {
+        if (elem.fieldNameStringData() != kQueryOptionsFieldName) {
+            commandBob->append(elem);
+        }
+    }
+
+    auto rpExtractStatus = bsonExtractTypedField(
+        queryOptionsEl.embeddedObject(), kReadPreferenceFieldName, mongo::Object, &readPrefEl);
+
+    // If there is a $queryOptions field, we expect there to be a $readPreference.
+    if (!rpExtractStatus.isOK()) {
+        return rpExtractStatus;
+    }
+
+    metadataBob->append(readPrefEl);
+    return Status::OK();
+}
 
 }  // namespace
 
-    const OperationContext::Decoration<ServerSelectionMetadata> ServerSelectionMetadata::get =
-        OperationContext::declareDecoration<ServerSelectionMetadata>();
+const OperationContext::Decoration<ServerSelectionMetadata> ServerSelectionMetadata::get =
+    OperationContext::declareDecoration<ServerSelectionMetadata>();
 
-    ServerSelectionMetadata::ServerSelectionMetadata(
-        bool secondaryOk,
-        boost::optional<ReadPreferenceSetting> readPreference
-    )
-        : _secondaryOk(secondaryOk)
-        , _readPreference(std::move(readPreference))
-    {}
+ServerSelectionMetadata::ServerSelectionMetadata(
+    bool secondaryOk, boost::optional<ReadPreferenceSetting> readPreference)
+    : _secondaryOk(secondaryOk), _readPreference(std::move(readPreference)) {}
 
-    StatusWith<ServerSelectionMetadata>
-    ServerSelectionMetadata::readFromMetadata(const BSONObj& metadata) {
-        auto secondaryOkField = metadata.getField(kSecondaryOkFieldName);
+StatusWith<ServerSelectionMetadata> ServerSelectionMetadata::readFromMetadata(
+    const BSONObj& metadataObj) {
+    return readFromMetadata(metadataObj.getField(fieldName()));
+}
 
-        bool secondaryOk = !secondaryOkField.eoo();
+StatusWith<ServerSelectionMetadata> ServerSelectionMetadata::readFromMetadata(
+    const BSONElement& metadataElem) {
+    if (metadataElem.eoo()) {
+        return ServerSelectionMetadata{};
+    } else if (metadataElem.type() != mongo::Object) {
+        return {ErrorCodes::TypeMismatch,
+                str::stream() << "ServerSelectionMetadata element has incorrect type: expected"
+                              << mongo::Object << " but got " << metadataElem.type()};
+    }
 
-        boost::optional<ReadPreferenceSetting> readPreference;
-        BSONElement rpElem;
-        auto readPrefExtractStatus = bsonExtractTypedField(metadata,
-                                                           kReadPreferenceFieldName,
-                                                           mongo::Object,
-                                                           &rpElem);
-
-        if (readPrefExtractStatus == ErrorCodes::NoSuchKey) {
-            // Do nothing, it's valid to have no ReadPreference
-        }
-        else if (!readPrefExtractStatus.isOK()) {
-            return readPrefExtractStatus;
-        }
-        else {
-            // We have a read preference in the metadata object.
-            auto parsedRps = ReadPreferenceSetting::fromBSON(rpElem.Obj());
+    bool secondaryOk = false;
+    boost::optional<ReadPreferenceSetting> readPreference;
+    BSONElement rpElem;
+    for (const auto& ssmElem : metadataElem.Obj()) {
+        auto ssmElemFieldName = ssmElem.fieldNameStringData();
+        if (ssmElemFieldName == kSecondaryOkFieldName) {
+            secondaryOk = ssmElem.trueValue();
+        } else if (ssmElemFieldName == kReadPreferenceFieldName) {
+            if (ssmElem.type() != mongo::Object) {
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream() << "ReadPreference has incorrect type: expected"
+                                            << mongo::Object << "but got" << metadataElem.type());
+            }
+            auto parsedRps = ReadPreferenceSetting::fromBSON(ssmElem.Obj());
             if (!parsedRps.isOK()) {
                 return parsedRps.getStatus();
             }
             readPreference.emplace(std::move(parsedRps.getValue()));
         }
-
-        return ServerSelectionMetadata(secondaryOk, std::move(readPreference));
     }
 
-    Status ServerSelectionMetadata::writeToMetadata(const ServerSelectionMetadata& ss,
-                                                    BSONObjBuilder* metadataBob) {
-        if (ss.isSecondaryOk()) {
-            metadataBob->append(kSecondaryOkFieldName, 1);
-        }
+    return ServerSelectionMetadata(secondaryOk, std::move(readPreference));
+}
 
-        if (ss.getReadPreference()) {
-            metadataBob->append(kReadPreferenceFieldName, ss.getReadPreference()->toBSON());
-        }
+Status ServerSelectionMetadata::writeToMetadata(BSONObjBuilder* metadataBob) const {
+    BSONObjBuilder ssmBob;
+    if (isSecondaryOk()) {
+        ssmBob.append(kSecondaryOkFieldName, 1);
+    }
 
+    if (getReadPreference()) {
+        ssmBob.append(kReadPreferenceFieldName, getReadPreference()->toBSON());
+    }
+
+    auto ssm = ssmBob.done();
+    if (!ssm.isEmpty()) {
+        metadataBob->append(fieldName(), ssm);
+    }
+
+    return Status::OK();
+}
+
+BSONObj ServerSelectionMetadata::toBSON() const {
+    BSONObjBuilder bob;
+    writeToMetadata(&bob);
+    return bob.obj();
+}
+
+Status ServerSelectionMetadata::downconvert(const BSONObj& command,
+                                            const BSONObj& metadata,
+                                            BSONObjBuilder* legacyCommand,
+                                            int* legacyQueryFlags) {
+    auto ssmElem = metadata.getField(fieldName());
+    if (ssmElem.eoo()) {
+        // slaveOk is false by default.
+        *legacyQueryFlags &= ~mongo::QueryOption_SlaveOk;
+        legacyCommand->appendElements(command);
         return Status::OK();
+    } else if (ssmElem.type() != mongo::Object) {
+        return {
+            ErrorCodes::TypeMismatch,
+            str::stream() << "ServerSelectionMetadata metadata element must be an object, but got "
+                          << typeName(ssmElem.type())};
     }
 
-    Status ServerSelectionMetadata::downconvert(const BSONObj& command,
-                                                const BSONObj& metadata,
-                                                BSONObjBuilder* legacyCommand,
-                                                int* legacyQueryFlags) {
+    auto ssmObj = ssmElem.Obj();
+    BSONElement secondaryOkElem;
+    BSONElement readPreferenceElem;
 
-        BSONElement secondaryOkElem = metadata.getField(kSecondaryOkFieldName);
-        BSONElement readPrefElem = metadata.getField(kReadPreferenceFieldName);
-
-        if (!secondaryOkElem.eoo()) {
-            *legacyQueryFlags |= mongo::QueryOption_SlaveOk;
+    for (auto&& el : ssmObj) {
+        auto fname = el.fieldNameStringData();
+        if (fname == kSecondaryOkFieldName) {
+            secondaryOkElem = std::move(el);
+        } else if (fname == kReadPreferenceFieldName) {
+            readPreferenceElem = std::move(el);
         }
-        else {
-            *legacyQueryFlags &= ~mongo::QueryOption_SlaveOk;
-        }
-
-        if (!readPrefElem.eoo()) {
-            // Use 'query' to wrap query, then append read preference.
-
-            // NOTE(amidvidy): Oddly, the _isSecondaryQuery implementation in dbclient_rs does
-            // not unwrap the query properly - it only checks for 'query', and not
-            // '$query'. We should probably standardize on one - drivers use '$query',
-            // and the shell uses 'query'. See SERVER-18705 for details.
-
-            // TODO: this may need to use the $queryOptions hack on mongos.
-            legacyCommand->append(kQueryWrapper, command);
-            legacyCommand->append(readPrefElem);
-        }
-        else {
-            legacyCommand->appendElements(command);
-        }
-
-        return Status::OK();
     }
 
-    Status ServerSelectionMetadata::upconvert(const BSONObj& legacyCommand,
-                                              const int legacyQueryFlags,
-                                              BSONObjBuilder* commandBob,
-                                              BSONObjBuilder* metadataBob) {
+    if (!secondaryOkElem.eoo() && secondaryOkElem.trueValue()) {
+        *legacyQueryFlags |= mongo::QueryOption_SlaveOk;
+    } else {
+        *legacyQueryFlags &= ~mongo::QueryOption_SlaveOk;
+    }
 
-        // The secondaryOK option is equivalent to the slaveOk bit being set on legacy commands.
-        if (legacyQueryFlags & QueryOption_SlaveOk) {
-            metadataBob->append(kSecondaryOkFieldName, 1);
+    if (!readPreferenceElem.eoo()) {
+        // Use 'query' to wrap query, then append read preference.
+
+        // NOTE(amidvidy): Oddly, the _isSecondaryQuery implementation in dbclient_rs does
+        // not unwrap the query properly - it only checks for 'query', and not
+        // '$query'. We should probably standardize on one - drivers use '$query',
+        // and the shell uses 'query'. See SERVER-18705 for details.
+
+        // TODO: this may need to use the $queryOptions hack on mongos.
+        legacyCommand->append(kQueryWrapper, command);
+        legacyCommand->append(readPreferenceElem);
+    } else {
+        legacyCommand->appendElements(command);
+    }
+
+    return Status::OK();
+}
+
+Status ServerSelectionMetadata::upconvert(const BSONObj& legacyCommand,
+                                          const int legacyQueryFlags,
+                                          BSONObjBuilder* commandBob,
+                                          BSONObjBuilder* metadataBob) {
+    // The secondaryOK option is equivalent to the slaveOk bit being set on legacy commands.
+    BSONObjBuilder ssmBob;
+    if (legacyQueryFlags & QueryOption_SlaveOk) {
+        ssmBob.append(kSecondaryOkFieldName, 1);
+    }
+
+    // First we need to check if we have a wrapped command. That is, a command of the form
+    // {'$query': { 'commandName': 1, ...}, '$someOption': 5, ....}. Curiously, the field name
+    // of the wrapped query can be either '$query', or 'query'.
+    auto swUnwrapped = unwrapCommand(legacyCommand);
+    if (!swUnwrapped.isOK()) {
+        return swUnwrapped.getStatus();
+    }
+
+    BSONObj maybeUnwrapped;
+    bool wasWrapped;
+    std::tie(wasWrapped, maybeUnwrapped) = swUnwrapped.getValue();
+
+    if (wasWrapped) {
+        // Check if legacyCommand has an invalid $maxTimeMS option.
+        // TODO: Move this check elsewhere when we handle upconverting/downconverting maxTimeMS.
+        if (legacyCommand.hasField("$maxTimeMS")) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "cannot use $maxTimeMS query option with "
+                          "commands; use maxTimeMS command option "
+                          "instead");
         }
 
-        // First we need to check if we have a wrapped command. That is, a command of the form
-        // {'$query': { 'commandName': 1, ...}, '$someOption': 5, ....}. Curiously, the field name
-        // of the wrapped query can be either '$query', or 'query'.
-        BSONObj maybeUnwrapped;
-        bool wasWrapped;
-        std::tie(wasWrapped, maybeUnwrapped) = unwrapCommand(legacyCommand);
+        // If the command was wrapped, we can write out the upconverted command now, as there
+        // is nothing else we need to remove from it.
+        commandBob->appendElements(maybeUnwrapped);
 
-        if (wasWrapped) {
-            // Check if legacyCommand has an invalid $maxTimeMS option.
-            // TODO: Move this check elsewhere when we handle upconverting/downconverting maxTimeMS.
-            if (legacyCommand.hasField("$maxTimeMS")) {
-                return Status(ErrorCodes::InvalidOptions,
-                              "cannot use $maxTimeMS query option with "
-                              "commands; use maxTimeMS command option "
-                              "instead");
-            }
-
-            // If the command was wrapped, we can write out the upconverted command now, as there
-            // is nothing else we need to remove from it.
-            commandBob->appendElements(maybeUnwrapped);
-
-            return extractWrappedReadPreference(legacyCommand, metadataBob);
+        auto status = extractWrappedReadPreference(legacyCommand, &ssmBob);
+        if (!status.isOK()) {
+            return status;
         }
-
+    } else {
         // If the command was not wrapped, we need to check for a readPreference sent by mongos
         // on the $queryOptions field of the command. If it is set, we remove it from the
         // upconverted command, so we need to pass the command builder along.
-        return extractUnwrappedReadPreference(maybeUnwrapped, commandBob, metadataBob);
+
+        auto status = extractUnwrappedReadPreference(maybeUnwrapped, commandBob, &ssmBob);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
-    bool ServerSelectionMetadata::isSecondaryOk() const {
-        return _secondaryOk;
+    auto ssm = ssmBob.done();
+    if (!ssm.isEmpty()) {
+        metadataBob->append(fieldName(), ssm);
     }
+    return Status::OK();
+}
 
-    const boost::optional<ReadPreferenceSetting>&
-    ServerSelectionMetadata::getReadPreference() const {
-        return _readPreference;
-    }
+bool ServerSelectionMetadata::isSecondaryOk() const {
+    return _secondaryOk;
+}
+
+const boost::optional<ReadPreferenceSetting>& ServerSelectionMetadata::getReadPreference() const {
+    return _readPreference;
+}
+
+bool ServerSelectionMetadata::canRunOnSecondary() const {
+    return _secondaryOk ||
+        (_readPreference && (_readPreference->pref != ReadPreference::PrimaryOnly));
+}
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
-    ServerSelectionMetadata::ServerSelectionMetadata(ServerSelectionMetadata&& ssm)
-        : _secondaryOk(ssm._secondaryOk)
-        , _readPreference(std::move(ssm._readPreference))
-    {}
+ServerSelectionMetadata::ServerSelectionMetadata(ServerSelectionMetadata&& ssm)
+    : _secondaryOk(ssm._secondaryOk), _readPreference(std::move(ssm._readPreference)) {}
 
-    ServerSelectionMetadata& ServerSelectionMetadata::operator=(ServerSelectionMetadata&& ssm) {
-        _secondaryOk = ssm._secondaryOk;
-        _readPreference = std::move(ssm._readPreference);
-        return *this;
-    }
+ServerSelectionMetadata& ServerSelectionMetadata::operator=(ServerSelectionMetadata&& ssm) {
+    _secondaryOk = ssm._secondaryOk;
+    _readPreference = std::move(ssm._readPreference);
+    return *this;
+}
 #endif
 
 }  // rpc

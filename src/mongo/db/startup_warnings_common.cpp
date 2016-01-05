@@ -35,55 +35,76 @@
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
+#include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-    //
-    // system warnings
-    //
-    void logCommonStartupWarnings() {
-        // each message adds a leading and a trailing newline
+//
+// system warnings
+//
+void logCommonStartupWarnings(const ServerGlobalParams& serverParams) {
+    // each message adds a leading and a trailing newline
 
-        bool warned = false;
-        {
-            const char * foo = strchr(versionString , '.') + 1;
-            int bar = atoi(foo);
-            if ((2 * (bar / 2)) != bar) {
-                log() << startupWarningsLog;
-                log() << "** NOTE: This is a development version (" << versionString
-                      << ") of MongoDB." << startupWarningsLog;
-                log() << "**       Not recommended for production." << startupWarningsLog;
-                warned = true;
-            }
-        }
-
-#if defined(_WIN32) && !defined(_WIN64)
-        // Warn user that they are running a 32-bit app on 64-bit Windows
-        BOOL wow64Process;
-        BOOL retWow64 = IsWow64Process(GetCurrentProcess(), &wow64Process);
-        if (retWow64 && wow64Process) {
-            log() << "** NOTE: This is a 32-bit MongoDB binary running on a 64-bit operating"
-                    << startupWarningsLog;
-            log() << "**      system. Switch to a 64-bit build of MongoDB to"
-                    << startupWarningsLog;
-            log() << "**      support larger databases." << startupWarningsLog;
+    bool warned = false;
+    {
+        const char* foo = strchr(versionString, '.') + 1;
+        int bar = atoi(foo);
+        if ((2 * (bar / 2)) != bar) {
+            log() << startupWarningsLog;
+            log() << "** NOTE: This is a development version (" << versionString << ") of MongoDB."
+                  << startupWarningsLog;
+            log() << "**       Not recommended for production." << startupWarningsLog;
             warned = true;
         }
+    }
+
+    if ((serverParams.isAuthEnabled ||
+         serverParams.clusterAuthMode.load() != ServerGlobalParams::ClusterAuthMode_undefined) &&
+        (serverParams.rest || serverParams.isHttpInterfaceEnabled || serverParams.jsonp)) {
+        log() << startupWarningsLog;
+        log()
+            << "** WARNING: The server is started with the web server interface and access control."
+            << startupWarningsLog;
+        log() << "**          The web interfaces (rest, httpinterface and/or jsonp) are insecure "
+              << startupWarningsLog;
+        log() << "**          and should be disabled unless required for backward compatibility."
+              << startupWarningsLog;
+        warned = true;
+    }
+
+    const bool is32bit = sizeof(int*) == 4;
+    if (is32bit) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This 32-bit MongoDB binary is deprecated" << startupWarningsLog;
+        warned = true;
+    }
+
+#if defined(_WIN32) && !defined(_WIN64)
+    // Warn user that they are running a 32-bit app on 64-bit Windows
+    BOOL wow64Process;
+    BOOL retWow64 = IsWow64Process(GetCurrentProcess(), &wow64Process);
+    if (retWow64 && wow64Process) {
+        log() << "** NOTE: This is a 32-bit MongoDB binary running on a 64-bit operating"
+              << startupWarningsLog;
+        log() << "**      system. Switch to a 64-bit build of MongoDB to" << startupWarningsLog;
+        log() << "**      support larger databases." << startupWarningsLog;
+        warned = true;
+    }
 #endif
 
 #if !defined(_WIN32)
-        if (getuid() == 0) {
-            log() << "** WARNING: You are running this process as the root user, "
-                  << "which is not recommended." << startupWarningsLog;
-            warned = true;
-        }
+    if (getuid() == 0) {
+        log() << "** WARNING: You are running this process as the root user, "
+              << "which is not recommended." << startupWarningsLog;
+        warned = true;
+    }
 #endif
 
-        if (warned) {
-            log() << startupWarningsLog;
-        }
+    if (warned) {
+        log() << startupWarningsLog;
     }
-} // namespace mongo
+}
+}  // namespace mongo

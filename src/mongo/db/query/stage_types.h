@@ -30,72 +30,84 @@
 
 namespace mongo {
 
-    /**
-     * These map to implementations of the PlanStage interface, all of which live in db/exec/
-     */
-    enum StageType {
-        STAGE_AND_HASH,
-        STAGE_AND_SORTED,
-        STAGE_CACHED_PLAN,
-        STAGE_COLLSCAN,
+/**
+ * These map to implementations of the PlanStage interface, all of which live in db/exec/
+ */
+enum StageType {
+    STAGE_AND_HASH,
+    STAGE_AND_SORTED,
+    STAGE_CACHED_PLAN,
+    STAGE_COLLSCAN,
 
-        // This stage sits at the root of the query tree and counts up the number of results
-        // returned by its child.
-        STAGE_COUNT,
+    // This stage sits at the root of the query tree and counts up the number of results
+    // returned by its child.
+    STAGE_COUNT,
 
-        // If we're running a .count(), the query is fully covered by one ixscan, and the ixscan is
-        // from one key to another, we can just skip through the keys without bothering to examine
-        // them.
-        STAGE_COUNT_SCAN,
+    // If we're running a .count(), the query is fully covered by one ixscan, and the ixscan is
+    // from one key to another, we can just skip through the keys without bothering to examine
+    // them.
+    STAGE_COUNT_SCAN,
 
-        STAGE_DELETE,
+    STAGE_DELETE,
 
-        // If we're running a distinct, we only care about one value for each key.  The distinct
-        // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
-        STAGE_DISTINCT_SCAN,
+    // If we're running a distinct, we only care about one value for each key.  The distinct
+    // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
+    STAGE_DISTINCT_SCAN,
 
-        // Dummy stage used for receiving notifications of deletions during chunk migration.
-        STAGE_NOTIFY_DELETE,
+    // Dummy stage used for receiving notifications of deletions during chunk migration.
+    STAGE_NOTIFY_DELETE,
 
-        STAGE_EOF,
+    STAGE_ENSURE_SORTED,
 
-        // This is more of an "internal-only" stage where we try to keep docs that were mutated
-        // during query execution.
-        STAGE_KEEP_MUTATIONS,
+    STAGE_EOF,
 
-        STAGE_FETCH,
+    // This is more of an "internal-only" stage where we try to keep docs that were mutated
+    // during query execution.
+    STAGE_KEEP_MUTATIONS,
 
-        // The two $geoNear impls imply a fetch+sort and must be stages.
-        STAGE_GEO_NEAR_2D,
-        STAGE_GEO_NEAR_2DSPHERE,
+    STAGE_FETCH,
 
-        STAGE_GROUP,
+    // The two $geoNear impls imply a fetch+sort and must be stages.
+    STAGE_GEO_NEAR_2D,
+    STAGE_GEO_NEAR_2DSPHERE,
 
-        STAGE_IDHACK,
-        STAGE_IXSCAN,
-        STAGE_LIMIT,
+    STAGE_GROUP,
 
-        // Implements parallelCollectionScan.
-        STAGE_MULTI_ITERATOR,
+    STAGE_IDHACK,
 
-        STAGE_MULTI_PLAN,
-        STAGE_OPLOG_START,
-        STAGE_OR,
-        STAGE_PROJECTION,
+    // Simple wrapper to iterate a SortedDataInterface::Cursor.
+    STAGE_INDEX_ITERATOR,
 
-        // Stage for running aggregation pipelines.
-        STAGE_PIPELINE_PROXY,
+    STAGE_IXSCAN,
+    STAGE_LIMIT,
 
-        STAGE_QUEUED_DATA,
-        STAGE_SHARDING_FILTER,
-        STAGE_SKIP,
-        STAGE_SORT,
-        STAGE_SORT_MERGE,
-        STAGE_SUBPLAN,
-        STAGE_TEXT,
-        STAGE_UNKNOWN,
+    // Implements parallelCollectionScan.
+    STAGE_MULTI_ITERATOR,
 
-        STAGE_UPDATE,
-    };
+    STAGE_MULTI_PLAN,
+    STAGE_OPLOG_START,
+    STAGE_OR,
+    STAGE_PROJECTION,
+
+    // Stage for running aggregation pipelines.
+    STAGE_PIPELINE_PROXY,
+
+    STAGE_QUEUED_DATA,
+    STAGE_SHARDING_FILTER,
+    STAGE_SKIP,
+    STAGE_SORT,
+    STAGE_SORT_KEY_GENERATOR,
+    STAGE_SORT_MERGE,
+    STAGE_SUBPLAN,
+
+    // Stages for running text search.
+    STAGE_TEXT,
+    STAGE_TEXT_OR,
+    STAGE_TEXT_MATCH,
+
+    STAGE_UNKNOWN,
+
+    STAGE_UPDATE,
+};
 
 }  // namespace mongo

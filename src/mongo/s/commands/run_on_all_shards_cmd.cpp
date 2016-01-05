@@ -35,147 +35,138 @@
 #include <list>
 #include <set>
 
-#include <boost/shared_ptr.hpp>
-
 #include "mongo/db/jsobj.h"
-#include "mongo/client/parallel.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    RunOnAllShardsCommand::RunOnAllShardsCommand(const char* name,
-                                                 const char* oldName,
-                                                 bool useShardConn)
-        : Command(name, false, oldName)
-        , _useShardConn(useShardConn)
-    {}
+RunOnAllShardsCommand::RunOnAllShardsCommand(const char* name,
+                                             const char* oldName,
+                                             bool useShardConn,
+                                             bool implicitCreateDb)
+    : Command(name, false, oldName),
+      _useShardConn(useShardConn),
+      _implicitCreateDb(implicitCreateDb) {}
 
-    void RunOnAllShardsCommand::aggregateResults(const std::vector<ShardAndReply>& results,
-                                                 BSONObjBuilder& output)
-    {}
+void RunOnAllShardsCommand::aggregateResults(const std::vector<ShardAndReply>& results,
+                                             BSONObjBuilder& output) {}
 
-    BSONObj RunOnAllShardsCommand::specialErrorHandler(const std::string& server,
-                                                       const std::string& db,
-                                                       const BSONObj& cmdObj,
-                                                       const BSONObj& originalResult) const {
-        return originalResult;
+BSONObj RunOnAllShardsCommand::specialErrorHandler(const std::string& server,
+                                                   const std::string& db,
+                                                   const BSONObj& cmdObj,
+                                                   const BSONObj& originalResult) const {
+    return originalResult;
+}
+
+void RunOnAllShardsCommand::getShardIds(OperationContext* txn,
+                                        const std::string& db,
+                                        BSONObj& cmdObj,
+                                        std::vector<ShardId>& shardIds) {
+    grid.shardRegistry()->getAllShardIds(&shardIds);
+}
+
+bool RunOnAllShardsCommand::run(OperationContext* txn,
+                                const std::string& dbName,
+                                BSONObj& cmdObj,
+                                int options,
+                                std::string& errmsg,
+                                BSONObjBuilder& output) {
+    LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
+
+    if (_implicitCreateDb) {
+        uassertStatusOK(grid.implicitCreateDb(txn, dbName));
     }
 
-    void RunOnAllShardsCommand::getShards(const std::string& db,
-                                          BSONObj& cmdObj,
-                                          std::set<Shard>& shards) {
-        std::vector<ShardId> shardIds;
-        grid.shardRegistry()->getAllShardIds(&shardIds);
-        for (const ShardId& shardId : shardIds) {
-            const auto& shard = grid.shardRegistry()->findIfExists(shardId);
-            if (shard) {
-                shards.insert(*shard);
-            }
+    std::vector<ShardId> shardIds;
+    getShardIds(txn, dbName, cmdObj, shardIds);
+
+    std::list<std::shared_ptr<Future::CommandResult>> futures;
+    for (const ShardId& shardId : shardIds) {
+        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
+        if (!shard) {
+            continue;
         }
+
+        futures.push_back(Future::spawnCommand(
+            shard->getConnString().toString(), dbName, cmdObj, 0, NULL, _useShardConn));
     }
 
-    bool RunOnAllShardsCommand::run(OperationContext* txn,
-                                    const std::string& dbName,
-                                    BSONObj& cmdObj,
-                                    int options,
-                                    std::string& errmsg,
-                                    BSONObjBuilder& output) {
+    std::vector<ShardAndReply> results;
+    BSONObjBuilder subobj(output.subobjStart("raw"));
+    BSONObjBuilder errors;
+    int commonErrCode = -1;
 
-        LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
-        std::set<Shard> shards;
-        getShards(dbName, cmdObj, shards);
+    std::list<std::shared_ptr<Future::CommandResult>>::iterator futuresit;
+    std::vector<ShardId>::const_iterator shardIdsIt;
+    // We iterate over the set of shard ids and their corresponding futures in parallel.
+    // TODO: replace with zip iterator if we ever decide to use one from Boost or elsewhere
+    for (futuresit = futures.begin(), shardIdsIt = shardIds.cbegin();
+         futuresit != futures.end() && shardIdsIt != shardIds.end();
+         ++futuresit, ++shardIdsIt) {
+        std::shared_ptr<Future::CommandResult> res = *futuresit;
 
-        // TODO: Future is deprecated, replace with commandOp()
-        std::list< boost::shared_ptr<Future::CommandResult> > futures;
-        for (std::set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++) {
-            futures.push_back( Future::spawnCommand( i->getConnString().toString(),
-                                                     dbName,
-                                                     cmdObj,
-                                                     0,
-                                                     NULL,
-                                                     _useShardConn ));
+        if (res->join(txn)) {
+            // success :)
+            BSONObj result = res->result();
+            results.emplace_back(*shardIdsIt, result);
+            subobj.append(res->getServer(), result);
+            continue;
         }
 
-        std::vector<ShardAndReply> results;
-        BSONObjBuilder subobj (output.subobjStart("raw"));
-        BSONObjBuilder errors;
-        int commonErrCode = -1;
+        BSONObj result = res->result();
 
-        std::list< boost::shared_ptr<Future::CommandResult> >::iterator futuresit;
-        std::set<Shard>::const_iterator shardsit;
-        // We iterate over the set of shards and their corresponding futures in parallel.
-        // TODO: replace with zip iterator if we ever decide to use one from Boost or elsewhere
-        for (futuresit = futures.begin(), shardsit = shards.cbegin();
-              futuresit != futures.end() && shardsit != shards.end();
-              ++futuresit, ++shardsit ) {
+        if (result["errmsg"].type() || result["code"].numberInt() != 0) {
+            result = specialErrorHandler(res->getServer(), dbName, cmdObj, result);
 
-            boost::shared_ptr<Future::CommandResult> res = *futuresit;
-
-            if ( res->join() ) {
-                // success :)
-                BSONObj result = res->result();
-                results.emplace_back( shardsit->getName(), result );
-                subobj.append( res->getServer(), result );
+            BSONElement errmsgObj = result["errmsg"];
+            if (errmsgObj.eoo() || errmsgObj.String().empty()) {
+                // it was fixed!
+                results.emplace_back(*shardIdsIt, result);
+                subobj.append(res->getServer(), result);
                 continue;
             }
-
-            BSONObj result = res->result();
-
-            if ( result["errmsg"].type() ||
-                 result["code"].numberInt() != 0 ) {
-                result = specialErrorHandler( res->getServer(), dbName, cmdObj, result );
-
-                BSONElement errmsg = result["errmsg"];
-                if ( errmsg.eoo() || errmsg.String().empty() ) {
-                    // it was fixed!
-                    results.emplace_back( shardsit->getName(), result );
-                    subobj.append( res->getServer(), result );
-                    continue;
-                }
-            }
-
-            // Handle "errmsg".
-            if( ! result["errmsg"].eoo() ){
-                errors.appendAs(result["errmsg"], res->getServer());
-            }
-            else {
-                // Can happen if message is empty, for some reason
-                errors.append( res->getServer(), str::stream() <<
-                               "result without error message returned : " << result );
-            }
-
-            // Handle "code".
-            int errCode = result["code"].numberInt();
-            if ( commonErrCode == -1 ) {
-                commonErrCode = errCode;
-            }
-            else if ( commonErrCode != errCode ) {
-                commonErrCode = 0;
-            }
-            results.emplace_back( shardsit->getName(), result );
-            subobj.append( res->getServer(), result );
         }
 
-        subobj.done();
-
-        BSONObj errobj = errors.done();
-        if (! errobj.isEmpty()) {
-            errmsg = errobj.toString(false, true);
-
-            // If every error has a code, and the code for all errors is the same, then add
-            // a top-level field "code" with this value to the output object.
-            if ( commonErrCode > 0 ) {
-                output.append( "code", commonErrCode );
-            }
-
-            return false;
+        // Handle "errmsg".
+        if (!result["errmsg"].eoo()) {
+            errors.appendAs(result["errmsg"], res->getServer());
+        } else {
+            // Can happen if message is empty, for some reason
+            errors.append(res->getServer(),
+                          str::stream() << "result without error message returned : " << result);
         }
 
-        aggregateResults(results, output);
-        return true;
+        // Handle "code".
+        int errCode = result["code"].numberInt();
+        if (commonErrCode == -1) {
+            commonErrCode = errCode;
+        } else if (commonErrCode != errCode) {
+            commonErrCode = 0;
+        }
+        results.emplace_back(*shardIdsIt, result);
+        subobj.append(res->getServer(), result);
     }
 
+    subobj.done();
+
+    BSONObj errobj = errors.done();
+    if (!errobj.isEmpty()) {
+        errmsg = errobj.toString(false, true);
+
+        // If every error has a code, and the code for all errors is the same, then add
+        // a top-level field "code" with this value to the output object.
+        if (commonErrCode > 0) {
+            output.append("code", commonErrCode);
+        }
+
+        return false;
+    }
+
+    aggregateResults(results, output);
+    return true;
+}
 }

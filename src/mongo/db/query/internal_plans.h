@@ -29,56 +29,91 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class Collection;
-    class IndexDescriptor;
-    class OperationContext;
-    class PlanExecutor;
+class BSONObj;
+class Collection;
+class IndexDescriptor;
+class OperationContext;
+class PlanStage;
+class WorkingSet;
+struct DeleteStageParams;
+
+/**
+ * The internal planner is a one-stop shop for "off-the-shelf" plans.  Most internal procedures
+ * that do not require advanced queries could be served by plans already in here.
+ */
+class InternalPlanner {
+public:
+    enum Direction {
+        FORWARD = 1,
+        BACKWARD = -1,
+    };
+
+    enum IndexScanOptions {
+        // The client is interested in the default outputs of an index scan: BSONObj of the key,
+        // RecordId of the record that's indexed.  The client does its own fetching if required.
+        IXSCAN_DEFAULT = 0,
+
+        // The client wants the fetched object and the RecordId that refers to it.  Delegating
+        // the fetch to the runner allows fetching outside of a lock.
+        IXSCAN_FETCH = 1,
+    };
 
     /**
-     * The internal planner is a one-stop shop for "off-the-shelf" plans.  Most internal procedures
-     * that do not require advanced queries could be served by plans already in here.
+     * Returns a collection scan.  Caller owns pointer.
      */
-    class InternalPlanner {
-    public:
-        enum Direction {
-            FORWARD = 1,
-            BACKWARD = -1,
-        };
+    static std::unique_ptr<PlanExecutor> collectionScan(OperationContext* txn,
+                                                        StringData ns,
+                                                        Collection* collection,
+                                                        PlanExecutor::YieldPolicy yieldPolicy,
+                                                        const Direction direction = FORWARD,
+                                                        const RecordId startLoc = RecordId());
 
-        enum IndexScanOptions {
-            // The client is interested in the default outputs of an index scan: BSONObj of the key,
-            // RecordId of the record that's indexed.  The client does its own fetching if required.
-            IXSCAN_DEFAULT = 0,
+    /**
+     * Returns an index scan.  Caller owns returned pointer.
+     */
+    static std::unique_ptr<PlanExecutor> indexScan(OperationContext* txn,
+                                                   const Collection* collection,
+                                                   const IndexDescriptor* descriptor,
+                                                   const BSONObj& startKey,
+                                                   const BSONObj& endKey,
+                                                   bool endKeyInclusive,
+                                                   PlanExecutor::YieldPolicy yieldPolicy,
+                                                   Direction direction = FORWARD,
+                                                   int options = IXSCAN_DEFAULT);
 
-            // The client wants the fetched object and the RecordId that refers to it.  Delegating
-            // the fetch to the runner allows fetching outside of a lock.
-            IXSCAN_FETCH = 1,
-        };
+    /**
+     * Returns an IXSCAN => FETCH => DELETE plan.
+     */
+    static std::unique_ptr<PlanExecutor> deleteWithIndexScan(OperationContext* txn,
+                                                             Collection* collection,
+                                                             const DeleteStageParams& params,
+                                                             const IndexDescriptor* descriptor,
+                                                             const BSONObj& startKey,
+                                                             const BSONObj& endKey,
+                                                             bool endKeyInclusive,
+                                                             PlanExecutor::YieldPolicy yieldPolicy,
+                                                             Direction direction = FORWARD);
 
-        /**
-         * Return a collection scan.  Caller owns pointer.
-         */
-        static PlanExecutor* collectionScan(OperationContext* txn,
-                                            StringData ns,
-                                            Collection* collection,
-                                            const Direction direction = FORWARD,
-                                            const RecordId startLoc = RecordId());
-
-        /**
-         * Return an index scan.  Caller owns returned pointer.
-         */
-        static PlanExecutor* indexScan(OperationContext* txn,
-                                       const Collection* collection,
-                                       const IndexDescriptor* descriptor,
-                                       const BSONObj& startKey, const BSONObj& endKey,
-                                       bool endKeyInclusive, Direction direction = FORWARD,
-                                       int options = 0);
-
-    };
+private:
+    /**
+     * Returns a plan stage that is either an index scan or an index scan with a fetch stage.
+     *
+     * Used as a helper for indexScan() and deleteWithIndexScan().
+     */
+    static std::unique_ptr<PlanStage> _indexScan(OperationContext* txn,
+                                                 WorkingSet* ws,
+                                                 const Collection* collection,
+                                                 const IndexDescriptor* descriptor,
+                                                 const BSONObj& startKey,
+                                                 const BSONObj& endKey,
+                                                 bool endKeyInclusive,
+                                                 Direction direction = FORWARD,
+                                                 int options = IXSCAN_DEFAULT);
+};
 
 }  // namespace mongo

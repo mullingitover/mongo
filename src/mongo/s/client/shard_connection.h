@@ -28,132 +28,128 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
 #include <string>
 
 #include "mongo/client/connpool.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
-    class ChunkManager;
-    typedef boost::shared_ptr<ChunkManager> ChunkManagerPtr;
+class ChunkManager;
 
-    
-    class ShardConnection : public AScopedConnection {
-    public:
-        ShardConnection(const ConnectionString& connectionString,
-                        const std::string& ns,
-                        boost::shared_ptr<ChunkManager> manager = nullptr);
+class ShardConnection : public AScopedConnection {
+public:
+    /**
+     * Instantiates a new sharded connection, which will be associated with the specified chunk
+     * manager for versioning purposes.
+     *
+     * @param connectionString Connection string for the host to use.
+     * @param ns Namespace to associate the version with.
+     * @param manager The chunk manager, which should be used for obtaining shard version
+     *  information to be set on the connection. This value can be nullptr, if the connection will
+     *  not be versioned and not associated with a namespace, in which case only the
+     *  setShardVersion command will be invoked to initialize the remote shard. Otherwise, the
+     *  chunk manager will be used to obtain the shard version to set on the connection.
+     */
+    ShardConnection(const ConnectionString& connectionString,
+                    const std::string& ns,
+                    std::shared_ptr<ChunkManager> manager = nullptr);
 
-        ~ShardConnection();
+    ~ShardConnection();
 
-        void done();
-        void kill();
+    void done();
+    void kill();
 
-        DBClientBase& conn() {
-            _finishInit();
-            verify( _conn );
-            return *_conn;
-        }
+    DBClientBase& conn() {
+        _finishInit();
+        verify(_conn);
+        return *_conn;
+    }
 
-        DBClientBase* operator->() {
-            _finishInit();
-            verify( _conn );
-            return _conn;
-        }
+    DBClientBase* operator->() {
+        _finishInit();
+        verify(_conn);
+        return _conn;
+    }
 
-        DBClientBase* get() {
-            _finishInit();
-            verify( _conn );
-            return _conn;
-        }
-
-        /**
-         * @return the connection object underneath without setting the shard version.
-         * @throws AssertionException if _conn is uninitialized.
-         */
-        DBClientBase* getRawConn() const {
-            verify( _conn );
-            return _conn;
-        }
-
-        std::string getHost() const {
-            return _cs.toString();
-        }
-
-        std::string getNS() const {
-            return _ns;
-        }
-
-        boost::shared_ptr<ChunkManager> getManager() const {
-            return _manager;
-        }
-
-        bool setVersion() {
-            _finishInit();
-            return _setVersion;
-        }
-
-        static void sync();
-
-        void donotCheckVersion() {
-            _setVersion = false;
-            _finishedInit = true;
-        }
-        
-        bool ok() const { return _conn != NULL; }
-
-        /** checks all of my thread local connections for the version of this ns */
-        static void checkMyConnectionVersions( const std::string & ns );
-
-        /**
-         * Returns all the current sharded connections to the pool.
-         * Note: This is *dangerous* if we have GLE state.
-         */
-        static void releaseMyConnections();
-
-        /**
-         * Clears all connections in the sharded pool, including connections in the
-         * thread local storage pool of the current thread.
-         */
-        static void clearPool();
-
-        /**
-         * Forgets a namespace to prevent future versioning.
-         */
-        static void forgetNS( const std::string& ns );
-
-    private:
-        void _init();
-        void _finishInit();
-
-        const ConnectionString _cs;
-        const std::string _ns;
-
-        boost::shared_ptr<ChunkManager> _manager;
-
-        bool _finishedInit;
-
-        DBClientBase* _conn;
-        bool _setVersion;
-    };
-
+    DBClientBase* get() {
+        _finishInit();
+        verify(_conn);
+        return _conn;
+    }
 
     /**
-     * Sends the setShardVersion command on the specified connection.
+     * @return the connection object underneath without setting the shard version.
+     * @throws AssertionException if _conn is uninitialized.
      */
-    bool setShardVersion(DBClientBase & conn,
-                         const std::string& ns,
-                         const std::string& configServerPrimary,
-                         ChunkVersion version,
-                         ChunkManager* manager,
-                         bool authoritative,
-                         BSONObj& result);
+    DBClientBase* getRawConn() const {
+        verify(_conn);
+        return _conn;
+    }
 
+    std::string getHost() const {
+        return _cs.toString();
+    }
 
-    typedef boost::shared_ptr<ShardConnection> ShardConnectionPtr;
+    std::string getNS() const {
+        return _ns;
+    }
 
-    extern DBConnectionPool shardConnectionPool;
+    std::shared_ptr<ChunkManager> getManager() const {
+        return _manager;
+    }
 
-} // namespace mongo
+    bool setVersion() {
+        _finishInit();
+        return _setVersion;
+    }
+
+    static void sync();
+
+    void donotCheckVersion() {
+        _setVersion = false;
+        _finishedInit = true;
+    }
+
+    bool ok() const {
+        return _conn != NULL;
+    }
+
+    /** checks all of my thread local connections for the version of this ns */
+    static void checkMyConnectionVersions(OperationContext* txn, const std::string& ns);
+
+    /**
+     * Returns all the current sharded connections to the pool.
+     * Note: This is *dangerous* if we have GLE state.
+     */
+    static void releaseMyConnections();
+
+    /**
+     * Clears all connections in the sharded pool, including connections in the
+     * thread local storage pool of the current thread.
+     */
+    static void clearPool();
+
+    /**
+     * Forgets a namespace to prevent future versioning.
+     */
+    static void forgetNS(const std::string& ns);
+
+private:
+    void _finishInit();
+
+    const ConnectionString _cs;
+    const std::string _ns;
+    const std::shared_ptr<ChunkManager> _manager;
+
+    bool _finishedInit;
+
+    DBClientBase* _conn;
+    bool _setVersion;
+};
+
+typedef std::shared_ptr<ChunkManager> ChunkManagerPtr;
+typedef std::shared_ptr<ShardConnection> ShardConnectionPtr;
+
+extern DBConnectionPool shardConnectionPool;
+
+}  // namespace mongo

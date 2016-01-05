@@ -30,105 +30,113 @@
 
 #include "mongo/db/exec/pipeline_proxy.h"
 
-#include <boost/shared_ptr.hpp>
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using boost::shared_ptr;
-    using std::vector;
+using boost::intrusive_ptr;
+using std::shared_ptr;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
 
-    PipelineProxyStage::PipelineProxyStage(intrusive_ptr<Pipeline> pipeline,
-                                           const boost::shared_ptr<PlanExecutor>& child,
-                                           WorkingSet* ws)
-        : _pipeline(pipeline)
-        , _includeMetaData(_pipeline->getContext()->inShard) // send metadata to merger
-        , _childExec(child)
-        , _ws(ws)
-    {}
+const char* PipelineProxyStage::kStageType = "PIPELINE_PROXY";
 
-    PlanStage::StageState PipelineProxyStage::work(WorkingSetID* out) {
-        if (!out) {
-            return PlanStage::FAILURE;
+PipelineProxyStage::PipelineProxyStage(OperationContext* opCtx,
+                                       intrusive_ptr<Pipeline> pipeline,
+                                       const std::shared_ptr<PlanExecutor>& child,
+                                       WorkingSet* ws)
+    : PlanStage(kStageType, opCtx),
+      _pipeline(pipeline),
+      _includeMetaData(_pipeline->getContext()->inShard),  // send metadata to merger
+      _childExec(child),
+      _ws(ws) {}
+
+PlanStage::StageState PipelineProxyStage::work(WorkingSetID* out) {
+    if (!out) {
+        return PlanStage::FAILURE;
+    }
+
+    if (!_stash.empty()) {
+        *out = _ws->allocate();
+        WorkingSetMember* member = _ws->get(*out);
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
+        _stash.pop_back();
+        member->transitionToOwnedObj();
+        return PlanStage::ADVANCED;
+    }
+
+    if (boost::optional<BSONObj> next = getNextBson()) {
+        *out = _ws->allocate();
+        WorkingSetMember* member = _ws->get(*out);
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
+        member->transitionToOwnedObj();
+        return PlanStage::ADVANCED;
+    }
+
+    return PlanStage::IS_EOF;
+}
+
+bool PipelineProxyStage::isEOF() {
+    if (!_stash.empty())
+        return false;
+
+    if (boost::optional<BSONObj> next = getNextBson()) {
+        _stash.push_back(*next);
+        return false;
+    }
+
+    return true;
+}
+
+void PipelineProxyStage::doInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type) {
+    // propagate to child executor if still in use
+    if (std::shared_ptr<PlanExecutor> exec = _childExec.lock()) {
+        exec->invalidate(txn, dl, type);
+    }
+}
+
+void PipelineProxyStage::doDetachFromOperationContext() {
+    _pipeline->getContext()->opCtx = NULL;
+    if (auto child = getChildExecutor()) {
+        child->detachFromOperationContext();
+    }
+}
+
+void PipelineProxyStage::doReattachToOperationContext() {
+    invariant(_pipeline->getContext()->opCtx == NULL);
+    _pipeline->getContext()->opCtx = getOpCtx();
+    if (auto child = getChildExecutor()) {
+        child->reattachToOperationContext(getOpCtx());
+    }
+}
+
+unique_ptr<PlanStageStats> PipelineProxyStage::getStats() {
+    unique_ptr<PlanStageStats> ret =
+        make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
+    ret->specific = make_unique<CollectionScanStats>();
+    return ret;
+}
+
+boost::optional<BSONObj> PipelineProxyStage::getNextBson() {
+    if (boost::optional<Document> next = _pipeline->output()->getNext()) {
+        if (_includeMetaData) {
+            return next->toBsonWithMetaData();
+        } else {
+            return next->toBson();
         }
-
-        if (!_stash.empty()) {
-            *out = _ws->allocate();
-            WorkingSetMember* member = _ws->get(*out);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
-            _stash.pop_back();
-            member->state = WorkingSetMember::OWNED_OBJ;
-            return PlanStage::ADVANCED;
-        }
-
-        if (boost::optional<BSONObj> next = getNextBson()) {
-            *out = _ws->allocate();
-            WorkingSetMember* member = _ws->get(*out);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
-            member->state = WorkingSetMember::OWNED_OBJ;
-            return PlanStage::ADVANCED;
-        }
-
-        return PlanStage::IS_EOF;
     }
 
-    bool PipelineProxyStage::isEOF() {
-        if (!_stash.empty())
-            return false;
+    return boost::none;
+}
 
-        if (boost::optional<BSONObj> next = getNextBson()) {
-            _stash.push_back(*next);
-            return false;
-        }
+shared_ptr<PlanExecutor> PipelineProxyStage::getChildExecutor() {
+    return _childExec.lock();
+}
 
-        return true;
-    }
-
-    void PipelineProxyStage::invalidate(OperationContext* txn,
-                                        const RecordId& dl,
-                                        InvalidationType type) {
-        // propagate to child executor if still in use
-        if (boost::shared_ptr<PlanExecutor> exec = _childExec.lock()) {
-            exec->invalidate(txn, dl, type);
-        }
-    }
-
-    void PipelineProxyStage::saveState() {
-        _pipeline->getContext()->opCtx = NULL;
-    }
-
-    void PipelineProxyStage::restoreState(OperationContext* opCtx) {
-        invariant(_pipeline->getContext()->opCtx == NULL);
-        _pipeline->getContext()->opCtx = opCtx;
-    }
-
-    void PipelineProxyStage::pushBack(const BSONObj& obj) {
-        _stash.push_back(obj);
-    }
-
-    vector<PlanStage*> PipelineProxyStage::getChildren() const {
-        vector<PlanStage*> empty;
-        return empty;
-    }
-
-    boost::optional<BSONObj> PipelineProxyStage::getNextBson() {
-        if (boost::optional<Document> next = _pipeline->output()->getNext()) {
-            if (_includeMetaData) {
-                return next->toBsonWithMetaData();
-            }
-            else {
-                return next->toBson();
-            }
-        }
-
-        return boost::none;
-    }
-
-    shared_ptr<PlanExecutor> PipelineProxyStage::getChildExecutor() {
-        return _childExec.lock();
-    }
-
-} // namespace mongo
+}  // namespace mongo

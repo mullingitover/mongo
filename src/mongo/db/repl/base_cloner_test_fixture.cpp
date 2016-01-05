@@ -30,248 +30,226 @@
 
 #include "mongo/db/repl/base_cloner_test_fixture.h"
 
-#include <boost/thread.hpp>
 #include <memory>
 
+#include "mongo/stdx/thread.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 namespace repl {
 
-    const HostAndPort BaseClonerTest::target("localhost", -1);
-    const NamespaceString BaseClonerTest::nss("db.coll");
-    const BSONObj BaseClonerTest::idIndexSpec =
-        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << "_id_" << "ns" << nss.ns());
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 
-    Status BaseClonerTest::getDetectableErrorStatus() {
-        return Status(ErrorCodes::InternalError, "Not mutated");
-    }
+const HostAndPort BaseClonerTest::target("localhost", -1);
+const NamespaceString BaseClonerTest::nss("db.coll");
+const BSONObj BaseClonerTest::idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
+                                                     << "_id_"
+                                                     << "ns" << nss.ns());
 
-    // static
-    BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
-                                                    const std::string& ns,
-                                                    const BSONArray& docs,
-                                                    const char* batchFieldName) {
-        return BSON("cursor" << BSON("id" << cursorId <<
-                                     "ns" << ns <<
-                                     batchFieldName << docs) <<
-                    "ok" << 1);
-    }
+// static
+BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
+                                             const std::string& ns,
+                                             const BSONArray& docs,
+                                             const char* batchFieldName) {
+    return BSON("cursor" << BSON("id" << cursorId << "ns" << ns << batchFieldName << docs) << "ok"
+                         << 1);
+}
 
-    // static
-    BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
-                                                    const BSONArray& docs,
-                                                    const char* batchFieldName) {
-        return createCursorResponse(cursorId, nss.toString(), docs, batchFieldName);
-    }
+// static
+BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
+                                             const BSONArray& docs,
+                                             const char* batchFieldName) {
+    return createCursorResponse(cursorId, nss.toString(), docs, batchFieldName);
+}
 
-    // static
-    BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
-                                                    const BSONArray& docs) {
-        return createCursorResponse(cursorId, docs, "firstBatch");
-    }
+// static
+BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId, const BSONArray& docs) {
+    return createCursorResponse(cursorId, docs, "firstBatch");
+}
 
-    // static
-    BSONObj BaseClonerTest::createListCollectionsResponse(CursorId cursorId,
-                                                             const BSONArray& colls,
-                                                             const char* fieldName) {
-        return createCursorResponse(cursorId, "test.$cmd.listCollections.coll", colls, fieldName);
-    }
+// static
+BSONObj BaseClonerTest::createListCollectionsResponse(CursorId cursorId,
+                                                      const BSONArray& colls,
+                                                      const char* fieldName) {
+    return createCursorResponse(cursorId, "test.$cmd.listCollections.coll", colls, fieldName);
+}
 
-    // static
-    BSONObj BaseClonerTest::createListCollectionsResponse(CursorId cursorId,
-                                                             const BSONArray& colls) {
-        return createListCollectionsResponse(cursorId, colls, "firstBatch");
-    }
+// static
+BSONObj BaseClonerTest::createListCollectionsResponse(CursorId cursorId, const BSONArray& colls) {
+    return createListCollectionsResponse(cursorId, colls, "firstBatch");
+}
 
-    // static
-    BSONObj BaseClonerTest::createListIndexesResponse(CursorId cursorId,
-                                                         const BSONArray& specs,
-                                                         const char* batchFieldName) {
-        return createCursorResponse(cursorId, "test.$cmd.listIndexes.coll", specs, batchFieldName);
-    }
+// static
+BSONObj BaseClonerTest::createListIndexesResponse(CursorId cursorId,
+                                                  const BSONArray& specs,
+                                                  const char* batchFieldName) {
+    return createCursorResponse(cursorId, "test.$cmd.listIndexes.coll", specs, batchFieldName);
+}
 
-    // static
-    BSONObj BaseClonerTest::createListIndexesResponse(CursorId cursorId,
-                                                         const BSONArray& specs) {
-        return createListIndexesResponse(cursorId, specs, "firstBatch");
-    }
+// static
+BSONObj BaseClonerTest::createListIndexesResponse(CursorId cursorId, const BSONArray& specs) {
+    return createListIndexesResponse(cursorId, specs, "firstBatch");
+}
 
-    BaseClonerTest::BaseClonerTest()
-        : _mutex(),
-          _setStatusCondition(),
-          _status(getDetectableErrorStatus()) { }
+BaseClonerTest::BaseClonerTest()
+    : _mutex(), _setStatusCondition(), _status(getDetectableErrorStatus()) {}
 
-    void BaseClonerTest::setUp() {
-        ReplicationExecutorTest::setUp();
-        clear();
-        launchExecutorThread();
-        storageInterface.reset(new ClonerStorageInterfaceMock());
-    }
+void BaseClonerTest::setUp() {
+    ReplicationExecutorTest::setUp();
+    clear();
+    launchExecutorThread();
+    storageInterface.reset(new ClonerStorageInterfaceMock());
+}
 
-    void BaseClonerTest::tearDown() {
-        ReplicationExecutorTest::tearDown();
-        storageInterface.reset();
-    }
+void BaseClonerTest::tearDown() {
+    ReplicationExecutorTest::tearDown();
+    storageInterface.reset();
+}
 
-    void BaseClonerTest::clear() {
-        _status = getDetectableErrorStatus();
-    }
+void BaseClonerTest::clear() {
+    _status = getDetectableErrorStatus();
+}
 
-    void BaseClonerTest::setStatus(const Status& status) {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        _status = status;
-        _setStatusCondition.notify_all();
-    }
+void BaseClonerTest::setStatus(const Status& status) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _status = status;
+    _setStatusCondition.notify_all();
+}
 
-    const Status& BaseClonerTest::getStatus() const {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        return _status;
-    }
+const Status& BaseClonerTest::getStatus() const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    return _status;
+}
 
-    void BaseClonerTest::waitForStatus() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        if (_status == getDetectableErrorStatus()) {
-            try {
-                _setStatusCondition.wait_for(lk, Milliseconds(1000));
-            }
-            catch (const boost::thread_interrupted&) {
-            }
+void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi, const BSONObj& obj) {
+    auto net = getNet();
+    Milliseconds millis(0);
+    RemoteCommandResponse response(obj, BSONObj(), millis);
+    ReplicationExecutor::ResponseStatus responseStatus(response);
+    net->scheduleResponse(noi, net->now(), responseStatus);
+}
 
-        }
-    }
+void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi,
+                                             ErrorCodes::Error code,
+                                             const std::string& reason) {
+    auto net = getNet();
+    ReplicationExecutor::ResponseStatus responseStatus(code, reason);
+    net->scheduleResponse(noi, net->now(), responseStatus);
+}
 
-    void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi,
-                                                    const BSONObj& obj) {
-        auto net = getNet();
-        Milliseconds millis(0);
-        RemoteCommandResponse response(obj, millis);
-        ReplicationExecutor::ResponseStatus responseStatus(response);
-        net->scheduleResponse(noi, net->now(), responseStatus);
-    }
+void BaseClonerTest::scheduleNetworkResponse(const BSONObj& obj) {
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    scheduleNetworkResponse(getNet()->getNextReadyRequest(), obj);
+}
 
-    void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi,
-                                                    ErrorCodes::Error code,
-                                                    const std::string& reason) {
-        auto net = getNet();
-        ReplicationExecutor::ResponseStatus responseStatus(code, reason);
-        net->scheduleResponse(noi, net->now(), responseStatus);
-    }
+void BaseClonerTest::scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    scheduleNetworkResponse(getNet()->getNextReadyRequest(), code, reason);
+}
 
-    void BaseClonerTest::scheduleNetworkResponse(const BSONObj& obj) {
-        ASSERT_TRUE(getNet()->hasReadyRequests());
-        scheduleNetworkResponse(getNet()->getNextReadyRequest(), obj);
-    }
+void BaseClonerTest::processNetworkResponse(const BSONObj& obj) {
+    scheduleNetworkResponse(obj);
+    finishProcessingNetworkResponse();
+}
 
-    void BaseClonerTest::scheduleNetworkResponse(ErrorCodes::Error code,
-                                                    const std::string& reason) {
-        ASSERT_TRUE(getNet()->hasReadyRequests());
-        scheduleNetworkResponse(getNet()->getNextReadyRequest(), code, reason);
-    }
+void BaseClonerTest::processNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
+    scheduleNetworkResponse(code, reason);
+    finishProcessingNetworkResponse();
+}
 
-    void BaseClonerTest::processNetworkResponse(const BSONObj& obj) {
-        scheduleNetworkResponse(obj);
-        finishProcessingNetworkResponse();
-    }
+void BaseClonerTest::finishProcessingNetworkResponse() {
+    clear();
+    getNet()->runReadyNetworkOperations();
+}
 
-    void BaseClonerTest::processNetworkResponse(ErrorCodes::Error code,
-                                                   const std::string& reason) {
-        scheduleNetworkResponse(code, reason);
-        finishProcessingNetworkResponse();
-    }
+void BaseClonerTest::testLifeCycle() {
+    // GetDiagnosticString
+    ASSERT_FALSE(getCloner()->getDiagnosticString().empty());
 
-    void BaseClonerTest::finishProcessingNetworkResponse() {
-        clear();
-        getNet()->runReadyNetworkOperations();
-    }
+    // IsActiveAfterStart
+    ASSERT_FALSE(getCloner()->isActive());
+    ASSERT_OK(getCloner()->start());
+    ASSERT_TRUE(getCloner()->isActive());
+    tearDown();
 
-    void BaseClonerTest::testLifeCycle() {
-        // GetDiagnosticString
-        ASSERT_FALSE(getCloner()->getDiagnosticString().empty());
+    // StartWhenActive
+    setUp();
+    ASSERT_OK(getCloner()->start());
+    ASSERT_TRUE(getCloner()->isActive());
+    ASSERT_NOT_OK(getCloner()->start());
+    ASSERT_TRUE(getCloner()->isActive());
+    tearDown();
 
-        // IsActiveAfterStart
-        ASSERT_FALSE(getCloner()->isActive());
-        ASSERT_OK(getCloner()->start());
-        ASSERT_TRUE(getCloner()->isActive());
-        tearDown();
+    // CancelWithoutStart
+    setUp();
+    ASSERT_FALSE(getCloner()->isActive());
+    getCloner()->cancel();
+    ASSERT_FALSE(getCloner()->isActive());
+    tearDown();
 
-        // StartWhenActive
-        setUp();
-        ASSERT_OK(getCloner()->start());
-        ASSERT_TRUE(getCloner()->isActive());
-        ASSERT_NOT_OK(getCloner()->start());
-        ASSERT_TRUE(getCloner()->isActive());
-        tearDown();
+    // WaitWithoutStart
+    setUp();
+    ASSERT_FALSE(getCloner()->isActive());
+    getCloner()->wait();
+    ASSERT_FALSE(getCloner()->isActive());
+    tearDown();
 
-        // CancelWithoutStart
-        setUp();
-        ASSERT_FALSE(getCloner()->isActive());
-        getCloner()->cancel();
-        ASSERT_FALSE(getCloner()->isActive());
-        tearDown();
+    // ShutdownBeforeStart
+    setUp();
+    getExecutor().shutdown();
+    ASSERT_NOT_OK(getCloner()->start());
+    ASSERT_FALSE(getCloner()->isActive());
+    tearDown();
 
-        // WaitWithoutStart
-        setUp();
-        ASSERT_FALSE(getCloner()->isActive());
-        getCloner()->wait();
-        ASSERT_FALSE(getCloner()->isActive());
-        tearDown();
+    // StartAndCancel
+    setUp();
+    ASSERT_OK(getCloner()->start());
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getCloner()->cancel();
+    finishProcessingNetworkResponse();
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
+    ASSERT_FALSE(getCloner()->isActive());
+    tearDown();
 
-        // ShutdownBeforeStart
-        setUp();
-        getExecutor().shutdown();
-        ASSERT_NOT_OK(getCloner()->start());
-        ASSERT_FALSE(getCloner()->isActive());
-        tearDown();
+    // StartButShutdown
+    setUp();
+    ASSERT_OK(getCloner()->start());
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getExecutor().shutdown();
+    // Network interface should not deliver mock response to callback.
+    finishProcessingNetworkResponse();
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
+    ASSERT_FALSE(getCloner()->isActive());
+}
 
-        // StartAndCancel
-        setUp();
-        ASSERT_OK(getCloner()->start());
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getCloner()->cancel();
-        finishProcessingNetworkResponse();
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
-        ASSERT_FALSE(getCloner()->isActive());
-        tearDown();
+Status ClonerStorageInterfaceMock::beginCollection(OperationContext* txn,
+                                                   const NamespaceString& nss,
+                                                   const CollectionOptions& options,
+                                                   const std::vector<BSONObj>& specs) {
+    return beginCollectionFn ? beginCollectionFn(txn, nss, options, specs) : Status::OK();
+}
 
-        // StartButShutdown
-        setUp();
-        ASSERT_OK(getCloner()->start());
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getExecutor().shutdown();
-        // Network interface should not deliver mock response to callback.
-        finishProcessingNetworkResponse();
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
-        ASSERT_FALSE(getCloner()->isActive());
-    }
+Status ClonerStorageInterfaceMock::insertDocuments(OperationContext* txn,
+                                                   const NamespaceString& nss,
+                                                   const std::vector<BSONObj>& docs) {
+    return insertDocumentsFn ? insertDocumentsFn(txn, nss, docs) : Status::OK();
+}
 
-    Status ClonerStorageInterfaceMock::beginCollection(OperationContext* txn,
-                                                       const NamespaceString& nss,
-                                                       const CollectionOptions& options,
-                                                       const std::vector<BSONObj>& specs) {
-        return beginCollectionFn ? beginCollectionFn(txn, nss, options, specs) : Status::OK();
-    }
+Status ClonerStorageInterfaceMock::commitCollection(OperationContext* txn,
+                                                    const NamespaceString& nss) {
+    return Status::OK();
+}
 
-    Status ClonerStorageInterfaceMock::insertDocuments(OperationContext* txn,
-                                                       const NamespaceString& nss,
-                                                       const std::vector<BSONObj>& docs) {
-        return insertDocumentsFn ? insertDocumentsFn(txn, nss, docs) : Status::OK();
-    }
+Status ClonerStorageInterfaceMock::insertMissingDoc(OperationContext* txn,
+                                                    const NamespaceString& nss,
+                                                    const BSONObj& doc) {
+    return Status::OK();
+}
 
-    Status ClonerStorageInterfaceMock::commitCollection(OperationContext* txn,
-                                                        const NamespaceString& nss) {
-        return Status::OK();
-    }
+Status ClonerStorageInterfaceMock::dropUserDatabases(OperationContext* txn) {
+    return dropUserDatabasesFn ? dropUserDatabasesFn(txn) : Status::OK();
+}
 
-    Status ClonerStorageInterfaceMock::insertMissingDoc(OperationContext* txn,
-                                                  const NamespaceString& nss,
-                                                  const BSONObj& doc) {
-        return Status::OK();
-    }
-
-    Status ClonerStorageInterfaceMock::dropUserDatabases(OperationContext* txn) {
-        return dropUserDatabasesFn ? dropUserDatabasesFn(txn) : Status::OK();
-    }
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

@@ -45,102 +45,102 @@
 
 namespace mongo {
 
-    using std::string;
-    using std::vector;
+using std::string;
+using std::vector;
 
 namespace {
 
-    class RemoveShardCmd : public Command {
-    public:
-        RemoveShardCmd() : Command("removeShard", false, "removeshard") { }
+class RemoveShardCmd : public Command {
+public:
+    RemoveShardCmd() : Command("removeShard", false, "removeshard") {}
 
-        virtual bool slaveOk() const {
-            return true;
+    virtual bool slaveOk() const {
+        return true;
+    }
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+    virtual bool isWriteCommandForConfigServer() const {
+        return false;
+    }
+
+    virtual void help(std::stringstream& help) const {
+        help << "remove a shard from the system.";
+    }
+
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::removeShard);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const std::string& dbname,
+                     BSONObj& cmdObj,
+                     int options,
+                     std::string& errmsg,
+                     BSONObjBuilder& result) {
+        const string target = cmdObj.firstElement().valuestrsafe();
+
+        const auto s = grid.shardRegistry()->getShard(txn, target);
+        if (!s) {
+            string msg(str::stream() << "Could not drop shard '" << target
+                                     << "' because it does not exist");
+            log() << msg;
+            return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
 
-        virtual bool adminOnly() const {
-            return true;
+        auto catalogManager = grid.catalogManager(txn);
+        StatusWith<ShardDrainingStatus> removeShardResult =
+            catalogManager->removeShard(txn, s->getId());
+        if (!removeShardResult.isOK()) {
+            return appendCommandStatus(result, removeShardResult.getStatus());
         }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
+        vector<string> databases;
+        Status status = catalogManager->getDatabasesForShard(txn, s->getId(), &databases);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
         }
 
-        virtual void help(std::stringstream& help) const {
-            help << "remove a shard from the system.";
-        }
-
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-
-            ActionSet actions;
-            actions.addAction(ActionType::removeShard);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
-
-            const string target = cmdObj.firstElement().valuestrsafe();
-
-            const auto& s = grid.shardRegistry()->findIfExists(target);
-            if (!s) {
-                string msg(str::stream() <<
-                           "Could not drop shard '" << target <<
-                           "' because it does not exist");
-                log() << msg;
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::ShardNotFound, msg));
-            }
-
-            StatusWith<ShardDrainingStatus> removeShardResult =
-                grid.catalogManager()->removeShard(txn, s->getName());
-            if (!removeShardResult.isOK()) {
-                return appendCommandStatus(result, removeShardResult.getStatus());
-            }
-
-            vector<string> databases;
-            grid.catalogManager()->getDatabasesForShard(s->getName(), &databases);
-
-            // Get BSONObj containing:
-            // 1) note about moving or dropping databases in a shard
-            // 2) list of databases (excluding 'local' database) that need to be moved
-            BSONObj dbInfo;
-            {
-                BSONObjBuilder dbInfoBuilder;
-                dbInfoBuilder.append("note",
-                                     "you need to drop or movePrimary these databases");
-                BSONArrayBuilder dbs(dbInfoBuilder.subarrayStart("dbsToMove"));
-                for (vector<string>::const_iterator it = databases.begin();
-                     it != databases.end();
-                     it++) {
-                    if (*it != "local") {
-                        dbs.append(*it);
-                    }
+        // Get BSONObj containing:
+        // 1) note about moving or dropping databases in a shard
+        // 2) list of databases (excluding 'local' database) that need to be moved
+        BSONObj dbInfo;
+        {
+            BSONObjBuilder dbInfoBuilder;
+            dbInfoBuilder.append("note", "you need to drop or movePrimary these databases");
+            BSONArrayBuilder dbs(dbInfoBuilder.subarrayStart("dbsToMove"));
+            for (vector<string>::const_iterator it = databases.begin(); it != databases.end();
+                 it++) {
+                if (*it != "local") {
+                    dbs.append(*it);
                 }
-                dbs.doneFast();
-                dbInfo = dbInfoBuilder.obj();
             }
+            dbs.doneFast();
+            dbInfo = dbInfoBuilder.obj();
+        }
 
-            // TODO: Standardize/Seperate how we append to the result object
-            switch (removeShardResult.getValue()) {
+        // TODO: Standardize/Seperate how we append to the result object
+        switch (removeShardResult.getValue()) {
             case ShardDrainingStatus::STARTED:
                 result.append("msg", "draining started successfully");
                 result.append("state", "started");
-                result.append("shard", s->getName());
+                result.append("shard", s->getId());
                 result.appendElements(dbInfo);
                 break;
             case ShardDrainingStatus::ONGOING: {
                 vector<ChunkType> chunks;
-                Status status = grid.catalogManager()->getChunks(
-                                            Query(BSON(ChunkType::shard(s->getName()))),
-                                            0,  // return all
-                                            &chunks);
+                Status status = catalogManager->getChunks(txn,
+                                                          BSON(ChunkType::shard(s->getId())),
+                                                          BSONObj(),
+                                                          boost::none,  // return all
+                                                          &chunks,
+                                                          nullptr);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -160,13 +160,13 @@ namespace {
             case ShardDrainingStatus::COMPLETED:
                 result.append("msg", "removeshard completed successfully");
                 result.append("state", "completed");
-                result.append("shard", s->getName());
-            }
-
-            return true;
+                result.append("shard", s->getId());
         }
 
-    } removeShardCmd;
+        return true;
+    }
 
-} // namespace
-} // namespace mongo
+} removeShardCmd;
+
+}  // namespace
+}  // namespace mongo

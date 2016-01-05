@@ -33,69 +33,66 @@
 
 namespace mongo {
 
-    class CappedRecordStoreV1;
+class CappedRecordStoreV1;
 
-    struct Extent;
+struct Extent;
+
+/**
+ * This class iterates over a capped collection identified by 'ns'.
+ * The collection must exist when the constructor is called.
+ */
+class CappedRecordStoreV1Iterator final : public SeekableRecordCursor {
+public:
+    CappedRecordStoreV1Iterator(OperationContext* txn,
+                                const CappedRecordStoreV1* collection,
+                                bool forward);
+
+    boost::optional<Record> next() final;
+    boost::optional<Record> seekExact(const RecordId& id) final;
+    void save() final;
+    bool restore() final;
+    void detachFromOperationContext() final {
+        _txn = nullptr;
+    }
+    void reattachToOperationContext(OperationContext* txn) final {
+        _txn = txn;
+    }
+    void invalidate(OperationContext* txn, const RecordId& dl) final;
+    std::unique_ptr<RecordFetcher> fetcherForNext() const final;
+    std::unique_ptr<RecordFetcher> fetcherForId(const RecordId& id) const final;
+
+private:
+    void advance();
+    bool isEOF() {
+        return _curr.isNull();
+    }
 
     /**
-     * This class iterates over a capped collection identified by 'ns'.
-     * The collection must exist when the constructor is called.
-     *
-     * If start is not DiskLoc(), the iteration begins at that DiskLoc.
-     *
-     * If tailable is true, getNext() can be called after isEOF.  It will use the last valid
-     * returned DiskLoc and try to find the next record from that.
+     * Internal collection navigation helper methods.
      */
-    class CappedRecordStoreV1Iterator : public RecordIterator {
-    public:
-        CappedRecordStoreV1Iterator( OperationContext* txn,
-                                     const CappedRecordStoreV1* collection,
-                                     const RecordId& start,
-                                     bool tailable,
-                                     const CollectionScanParams::Direction& dir );
-        virtual ~CappedRecordStoreV1Iterator() { }
+    DiskLoc getNextCapped(const DiskLoc& dl);
+    DiskLoc prevLoop(const DiskLoc& curr);
+    DiskLoc nextLoop(const DiskLoc& prev);
 
-        // If this is a tailable cursor, isEOF could change its mind after a call to getNext().
-        virtual bool isEOF();
-        virtual RecordId getNext();
-        virtual RecordId curr();
+    // some helpers - these move to RecordStore probably
+    Extent* _getExtent(const DiskLoc& loc);
+    DiskLoc _getNextRecord(const DiskLoc& loc);
+    DiskLoc _getPrevRecord(const DiskLoc& loc);
 
-        virtual void invalidate(const RecordId& dl);
-        virtual void saveState();
-        virtual bool restoreState(OperationContext* txn);
+    // transactional context for read locks. Not owned by us
+    OperationContext* _txn;
 
-        virtual RecordData dataFor( const RecordId& loc ) const;
-    private:
-        /**
-         * Internal collection navigation helper methods.
-         */
-        DiskLoc getNextCapped(const DiskLoc& dl);
-        DiskLoc prevLoop(const DiskLoc& curr);
-        DiskLoc nextLoop(const DiskLoc& prev);
+    // The collection we're iterating over.
+    const CappedRecordStoreV1* const _recordStore;
 
-        // some helpers - these move to RecordStore probably
-        Extent* _getExtent( const DiskLoc& loc );
-        DiskLoc _getNextRecord( const DiskLoc& loc );
-        DiskLoc _getPrevRecord( const DiskLoc& loc );
+    // The result returned on the next call to getNext().
+    DiskLoc _curr;
 
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
+    const bool _forward;
 
-        // The collection we're iterating over.
-        const CappedRecordStoreV1* _recordStore;
-
-        // The result returned on the next call to getNext().
-        DiskLoc _curr;
-
-        // If we're tailable, we try to progress from the last valid result when we hit the end.
-        DiskLoc _prev;
-        bool _tailable;
-
-        CollectionScanParams::Direction _direction;
-
-        // If invalidate kills the DiskLoc we need to move forward, we kill the iterator.  See the
-        // comment in the body of invalidate(...).
-        bool _killedByInvalidate;
-    };
+    // If invalidate kills the DiskLoc we need to move forward, we kill the iterator.  See the
+    // comment in the body of invalidate(...).
+    bool _killedByInvalidate = false;
+};
 
 }  // namespace mongo

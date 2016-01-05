@@ -29,29 +29,29 @@
 #pragma once
 
 #include "mongo/base/status.h"
-#include "mongo/db/index/s2_common.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    class S2AccessMethod : public IndexAccessMethod {
-    public:
-        S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+class S2AccessMethod : public IndexAccessMethod {
+public:
+    S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-        /**
-         * Takes an index spec object for this index and returns a copy tweaked to conform to the
-         * expected format.  When an index build is initiated, this function is called on the spec
-         * object the user provides, and the return value of this function is the final spec object
-         * that gets saved in the index catalog.  Throws a UserException if 'specObj' is invalid.
-         */
-        static BSONObj fixSpec(const BSONObj& specObj);
+    /**
+     * Takes an index spec object for this index and returns a copy tweaked to conform to the
+     * expected format.  When an index build is initiated, this function is called on the spec
+     * object the user provides, and the return value of this function is the final spec object
+     * that gets saved in the index catalog.  Throws a UserException if 'specObj' is invalid.
+     */
+    static BSONObj fixSpec(const BSONObj& specObj);
 
-    private:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
+private:
+    virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
 
-        S2IndexingParams _params;
-    };
+    S2IndexingParams _params;
+};
 
 }  // namespace mongo

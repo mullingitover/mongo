@@ -32,70 +32,70 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/net/message.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-    class ServiceContext;
+class ServiceContext;
 
-    /**
-     * tracks usage by collection
-     */
-    class Top {
+/**
+ * tracks usage by collection
+ */
+class Top {
+public:
+    static Top& get(ServiceContext* service);
 
-    public:
-        static Top& get(ServiceContext* service);
+    Top() = default;
 
-        Top() : _lock("Top") { }
+    struct UsageData {
+        UsageData() : time(0), count(0) {}
+        UsageData(const UsageData& older, const UsageData& newer);
+        long long time;
+        long long count;
 
-        struct UsageData {
-            UsageData() : time(0), count(0) {}
-            UsageData( const UsageData& older, const UsageData& newer );
-            long long time;
-            long long count;
-
-            void inc( long long micros ) {
-                count++;
-                time += micros;
-            }
-        };
-
-        struct CollectionData {
-            /**
-             * constructs a diff
-             */
-            CollectionData() {}
-            CollectionData( const CollectionData& older, const CollectionData& newer );
-
-            UsageData total;
-
-            UsageData readLock;
-            UsageData writeLock;
-
-            UsageData queries;
-            UsageData getmore;
-            UsageData insert;
-            UsageData update;
-            UsageData remove;
-            UsageData commands;
-        };
-
-        typedef StringMap<CollectionData> UsageMap;
-
-    public:
-        void record( StringData ns, int op, int lockType, long long micros, bool command );
-        void append( BSONObjBuilder& b );
-        void cloneMap(UsageMap& out) const;
-        void collectionDropped( StringData ns );
-
-    private:
-        void _appendToUsageMap( BSONObjBuilder& b, const UsageMap& map ) const;
-        void _appendStatsEntry( BSONObjBuilder& b, const char * statsName, const UsageData& map ) const;
-        void _record( CollectionData& c, int op, int lockType, long long micros, bool command );
-
-        mutable SimpleMutex _lock;
-        UsageMap _usage;
-        std::string _lastDropped;
+        void inc(long long micros) {
+            count++;
+            time += micros;
+        }
     };
 
-} // namespace mongo
+    struct CollectionData {
+        /**
+         * constructs a diff
+         */
+        CollectionData() {}
+        CollectionData(const CollectionData& older, const CollectionData& newer);
+
+        UsageData total;
+
+        UsageData readLock;
+        UsageData writeLock;
+
+        UsageData queries;
+        UsageData getmore;
+        UsageData insert;
+        UsageData update;
+        UsageData remove;
+        UsageData commands;
+    };
+
+    typedef StringMap<CollectionData> UsageMap;
+
+public:
+    void record(StringData ns, LogicalOp logicalOp, int lockType, long long micros, bool command);
+    void append(BSONObjBuilder& b);
+    void cloneMap(UsageMap& out) const;
+    void collectionDropped(StringData ns);
+
+private:
+    void _appendToUsageMap(BSONObjBuilder& b, const UsageMap& map) const;
+    void _appendStatsEntry(BSONObjBuilder& b, const char* statsName, const UsageData& map) const;
+    void _record(CollectionData& c, LogicalOp logicalOp, int lockType, long long micros);
+
+    mutable SimpleMutex _lock;
+    UsageMap _usage;
+    std::string _lastDropped;
+};
+
+}  // namespace mongo

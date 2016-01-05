@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/cursor_manager.h"
@@ -41,165 +42,186 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/cursor_responses.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+using std::string;
+using std::stringstream;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
 
-    /**
-     * Lists the indexes for a given collection.
-     *
-     * Format:
-     * {
-     *   listIndexes: <collection name>
-     * }
-     *
-     * Return format:
-     * {
-     *   indexes: [
-     *     ...
-     *   ]
-     * }
-     */
-    class CmdListIndexes : public Command {
-    public:
-        virtual bool slaveOk() const { return false; }
-        virtual bool slaveOverrideOk() const { return true; }
-        virtual bool adminOnly() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+/**
+ * Lists the indexes for a given collection.
+ *
+ * Format:
+ * {
+ *   listIndexes: <collection name>
+ * }
+ *
+ * Return format:
+ * {
+ *   indexes: [
+ *     ...
+ *   ]
+ * }
+ */
+class CmdListIndexes : public Command {
+public:
+    virtual bool slaveOk() const {
+        return false;
+    }
+    virtual bool slaveOverrideOk() const {
+        return true;
+    }
+    virtual bool adminOnly() const {
+        return false;
+    }
+    virtual bool isWriteCommandForConfigServer() const {
+        return false;
+    }
 
-        virtual void help( stringstream& help ) const { help << "list indexes for a collection"; }
+    virtual void help(stringstream& help) const {
+        help << "list indexes for a collection";
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::listIndexes);
-            out->push_back(Privilege(parseResourcePattern( dbname, cmdObj ), actions));
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+
+        // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
+        // 3.0 systems.
+        NamespaceString ns(parseNs(dbname, cmdObj));
+        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
+                                                           ActionType::listIndexes) ||
+            authzSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(dbname, "system.indexes")),
+                ActionType::find)) {
+            return Status::OK();
         }
 
-        CmdListIndexes() : Command( "listIndexes" ) {}
+        return Status(ErrorCodes::Unauthorized,
+                      str::stream()
+                          << "Not authorized to list indexes on collection: " << ns.coll());
+    }
 
-        bool run(OperationContext* txn,
-                 const string& dbname,
-                 BSONObj& cmdObj,
-                 int,
-                 string& errmsg,
-                 BSONObjBuilder& result) {
+    CmdListIndexes() : Command("listIndexes") {}
 
-            BSONElement first = cmdObj.firstElement();
-            uassert(
-                28528,
+    bool run(OperationContext* txn,
+             const string& dbname,
+             BSONObj& cmdObj,
+             int,
+             string& errmsg,
+             BSONObjBuilder& result) {
+        BSONElement first = cmdObj.firstElement();
+        uassert(28528,
                 str::stream() << "Argument to listIndexes must be of type String, not "
                               << typeName(first.type()),
                 first.type() == String);
-            const NamespaceString ns(parseNs(dbname, cmdObj));
-            uassert(
-                28529,
+        StringData collectionName = first.valueStringData();
+        uassert(28529,
                 str::stream() << "Argument to listIndexes must be a collection name, "
                               << "not the empty string",
-                !ns.coll().empty());
+                !collectionName.empty());
+        const NamespaceString ns(dbname, collectionName);
 
-            const long long defaultBatchSize = std::numeric_limits<long long>::max();
-            long long batchSize;
-            Status parseCursorStatus = parseCommandCursorOptions(cmdObj,
-                                                                 defaultBatchSize,
-                                                                 &batchSize);
-            if (!parseCursorStatus.isOK()) {
-                return appendCommandStatus(result, parseCursorStatus);
-            }
-
-            AutoGetCollectionForRead autoColl(txn, ns);
-            if (!autoColl.getDb()) {
-                return appendCommandStatus( result, Status( ErrorCodes::NamespaceNotFound,
-                                                            "no database" ) );
-            }
-
-            const Collection* collection = autoColl.getCollection();
-            if (!collection) {
-                return appendCommandStatus( result, Status( ErrorCodes::NamespaceNotFound,
-                                                            "no collection" ) );
-            }
-
-            const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-            invariant(cce);
-
-            vector<string> indexNames;
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                indexNames.clear();
-                cce->getAllIndexes( txn, &indexNames );
-            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
-
-            std::auto_ptr<WorkingSet> ws(new WorkingSet());
-            std::auto_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
-
-            for ( size_t i = 0; i < indexNames.size(); i++ ) {
-                BSONObj indexSpec;
-                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                    indexSpec = cce->getIndexSpec( txn, indexNames[i] );
-                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
-
-                WorkingSetMember member;
-                member.state = WorkingSetMember::OWNED_OBJ;
-                member.keyData.clear();
-                member.loc = RecordId();
-                member.obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
-                root->pushBack(member);
-            }
-
-            std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name << "."
-                                                        << ns.coll();
-            dassert(NamespaceString(cursorNamespace).isValid());
-            dassert(NamespaceString(cursorNamespace).isListIndexesGetMore());
-            dassert(ns == NamespaceString(cursorNamespace).getTargetNSForListIndexesGetMore());
-
-            PlanExecutor* rawExec;
-            Status makeStatus = PlanExecutor::make(txn,
-                                                   ws.release(),
-                                                   root.release(),
-                                                   cursorNamespace,
-                                                   PlanExecutor::YIELD_MANUAL,
-                                                   &rawExec);
-            std::auto_ptr<PlanExecutor> exec(rawExec);
-            if (!makeStatus.isOK()) {
-                return appendCommandStatus( result, makeStatus );
-            }
-
-            BSONArrayBuilder firstBatch;
-
-            const int byteLimit = MaxBytesToReturnToClientAtOnce;
-            for (long long objCount = 0;
-                 objCount < batchSize && firstBatch.len() < byteLimit;
-                 objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
-                if ( state == PlanExecutor::IS_EOF ) {
-                    break;
-                }
-                invariant( state == PlanExecutor::ADVANCED );
-                firstBatch.append(next);
-            }
-
-            CursorId cursorId = 0LL;
-            if ( !exec->isEOF() ) {
-                exec->saveState();
-                ClientCursor* cursor = new ClientCursor(CursorManager::getGlobalCursorManager(),
-                                                        exec.release(),
-                                                        cursorNamespace);
-                cursorId = cursor->cursorid();
-            }
-
-            appendCursorResponseObject( cursorId, cursorNamespace, firstBatch.arr(), &result );
-
-            return true;
+        const long long defaultBatchSize = std::numeric_limits<long long>::max();
+        long long batchSize;
+        Status parseCursorStatus = parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize);
+        if (!parseCursorStatus.isOK()) {
+            return appendCommandStatus(result, parseCursorStatus);
         }
 
-    } cmdListIndexes;
+        AutoGetCollectionForRead autoColl(txn, ns);
+        if (!autoColl.getDb()) {
+            return appendCommandStatus(result,
+                                       Status(ErrorCodes::NamespaceNotFound, "no database"));
+        }
 
+        const Collection* collection = autoColl.getCollection();
+        if (!collection) {
+            return appendCommandStatus(result,
+                                       Status(ErrorCodes::NamespaceNotFound, "no collection"));
+        }
+
+        const CollectionCatalogEntry* cce = collection->getCatalogEntry();
+        invariant(cce);
+
+        vector<string> indexNames;
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            indexNames.clear();
+            cce->getAllIndexes(txn, &indexNames);
+        }
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
+
+        auto ws = make_unique<WorkingSet>();
+        auto root = make_unique<QueuedDataStage>(txn, ws.get());
+
+        for (size_t i = 0; i < indexNames.size(); i++) {
+            BSONObj indexSpec;
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                indexSpec = cce->getIndexSpec(txn, indexNames[i]);
+            }
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
+
+            WorkingSetID id = ws->allocate();
+            WorkingSetMember* member = ws->get(id);
+            member->keyData.clear();
+            member->loc = RecordId();
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
+            member->transitionToOwnedObj();
+            root->pushBack(id);
+        }
+
+        std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name << "."
+                                                    << ns.coll();
+        dassert(NamespaceString(cursorNamespace).isValid());
+        dassert(NamespaceString(cursorNamespace).isListIndexesCursorNS());
+        dassert(ns == NamespaceString(cursorNamespace).getTargetNSForListIndexes());
+
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            txn, std::move(ws), std::move(root), cursorNamespace, PlanExecutor::YIELD_MANUAL);
+        if (!statusWithPlanExecutor.isOK()) {
+            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
+        }
+        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+
+        BSONArrayBuilder firstBatch;
+
+        const int byteLimit = FindCommon::kMaxBytesToReturnToClientAtOnce;
+        for (long long objCount = 0; objCount < batchSize && firstBatch.len() < byteLimit;
+             objCount++) {
+            BSONObj next;
+            PlanExecutor::ExecState state = exec->getNext(&next, NULL);
+            if (state == PlanExecutor::IS_EOF) {
+                break;
+            }
+            invariant(state == PlanExecutor::ADVANCED);
+            firstBatch.append(next);
+        }
+
+        CursorId cursorId = 0LL;
+        if (!exec->isEOF()) {
+            exec->saveState();
+            exec->detachFromOperationContext();
+            ClientCursor* cursor =
+                new ClientCursor(CursorManager::getGlobalCursorManager(),
+                                 exec.release(),
+                                 cursorNamespace,
+                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
+            cursorId = cursor->cursorid();
+        }
+
+        appendCursorResponseObject(cursorId, cursorNamespace, firstBatch.arr(), &result);
+
+        return true;
+    }
+
+} cmdListIndexes;
 }

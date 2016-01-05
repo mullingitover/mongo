@@ -27,6 +27,7 @@ executor:
         authenticationMechanism: SCRAM-SHA-1
         password: *keyFileData
         username: __system
+        readMode: commands
     hooks:
     - class: CleanEveryN
       n: 20
@@ -35,7 +36,6 @@ executor:
       mongod_options:
         auth: ''
         keyFile: *keyFile
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1
           enableLocalhostAuthBypass: false

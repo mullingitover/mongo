@@ -31,149 +31,145 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
-    using std::vector;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
 
-    // static
-    const char* CountScan::kStageType = "COUNT_SCAN";
+// static
+const char* CountScan::kStageType = "COUNT_SCAN";
 
-    CountScan::CountScan(OperationContext* txn,
-                         const CountScanParams& params,
-                         WorkingSet* workingSet)
-        : _txn(txn),
-          _workingSet(workingSet),
-          _descriptor(params.descriptor),
-          _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
-          _shouldDedup(params.descriptor->isMultikey(txn)),
-          _params(params),
-          _commonStats(kStageType) {
-        _specificStats.keyPattern = _params.descriptor->keyPattern();
-        _specificStats.indexName = _params.descriptor->indexName();
-        _specificStats.isMultiKey = _params.descriptor->isMultikey(txn);
-        _specificStats.indexVersion = _params.descriptor->version();
+CountScan::CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet)
+    : PlanStage(kStageType, txn),
+      _workingSet(workingSet),
+      _descriptor(params.descriptor),
+      _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
+      _shouldDedup(params.descriptor->isMultikey(txn)),
+      _params(params) {
+    _specificStats.keyPattern = _params.descriptor->keyPattern();
+    _specificStats.indexName = _params.descriptor->indexName();
+    _specificStats.isMultiKey = _params.descriptor->isMultikey(txn);
+    _specificStats.isUnique = _params.descriptor->unique();
+    _specificStats.isSparse = _params.descriptor->isSparse();
+    _specificStats.isPartial = _params.descriptor->isPartial();
+    _specificStats.indexVersion = _params.descriptor->version();
 
-        // endKey must be after startKey in index order since we only do forward scans.
-        dassert(_params.startKey.woCompare(_params.endKey,
-                                           Ordering::make(params.descriptor->keyPattern()),
-                                           /*compareFieldNames*/false) <= 0);
-    }
+    // endKey must be after startKey in index order since we only do forward scans.
+    dassert(_params.startKey.woCompare(_params.endKey,
+                                       Ordering::make(params.descriptor->keyPattern()),
+                                       /*compareFieldNames*/ false) <= 0);
+}
 
 
-    PlanStage::StageState CountScan::work(WorkingSetID* out) {
-        ++_commonStats.works;
-        if (_commonStats.isEOF) return PlanStage::IS_EOF;
+PlanStage::StageState CountScan::work(WorkingSetID* out) {
+    ++_commonStats.works;
+    if (_commonStats.isEOF)
+        return PlanStage::IS_EOF;
 
-        // Adds the amount of time taken by work() to executionTimeMillis.
-        ScopedTimer timer(&_commonStats.executionTimeMillis);
+    // Adds the amount of time taken by work() to executionTimeMillis.
+    ScopedTimer timer(&_commonStats.executionTimeMillis);
 
-        boost::optional<IndexKeyEntry> entry;
-        const bool needInit = !_cursor;
-        try {
-            // We don't care about the keys.
-            const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
+    boost::optional<IndexKeyEntry> entry;
+    const bool needInit = !_cursor;
+    try {
+        // We don't care about the keys.
+        const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
 
-            if (needInit) {
-                // First call to work().  Perform cursor init.
-                _cursor = _iam->newCursor(_txn);
-                _cursor->setEndPosition(_params.endKey, _params.endKeyInclusive);
+        if (needInit) {
+            // First call to work().  Perform cursor init.
+            _cursor = _iam->newCursor(getOpCtx());
+            _cursor->setEndPosition(_params.endKey, _params.endKeyInclusive);
 
-                entry = _cursor->seek(_params.startKey, _params.startKeyInclusive, kWantLoc);
-            }
-            else {
-                entry = _cursor->next(kWantLoc);
-            }
+            entry = _cursor->seek(_params.startKey, _params.startKeyInclusive, kWantLoc);
+        } else {
+            entry = _cursor->next(kWantLoc);
         }
-        catch (const WriteConflictException& wce) {
-            if (needInit) {
-                // Release our cursor and try again next time.
-                _cursor.reset();
-            }
-            *out = WorkingSet::INVALID_ID;
-            return PlanStage::NEED_YIELD;
-        }
-
-        ++_specificStats.keysExamined;
-
-        if (!entry) {
-            _commonStats.isEOF = true;
+    } catch (const WriteConflictException& wce) {
+        if (needInit) {
+            // Release our cursor and try again next time.
             _cursor.reset();
-            return PlanStage::IS_EOF;
         }
-
-        if (_shouldDedup && !_returned.insert(entry->loc).second) {
-            // *loc was already in _returned.
-            ++_commonStats.needTime;
-            return PlanStage::NEED_TIME;
-        }
-
         *out = WorkingSet::INVALID_ID;
-        ++_commonStats.advanced;
-        return PlanStage::ADVANCED;
+        return PlanStage::NEED_YIELD;
     }
 
-    bool CountScan::isEOF() {
-        return _commonStats.isEOF;
+    ++_specificStats.keysExamined;
+
+    if (!entry) {
+        _commonStats.isEOF = true;
+        _cursor.reset();
+        return PlanStage::IS_EOF;
     }
 
-    void CountScan::saveState() {
-        _txn = NULL;
-        ++_commonStats.yields;
-        if (_cursor) _cursor->savePositioned();
+    if (_shouldDedup && !_returned.insert(entry->loc).second) {
+        // *loc was already in _returned.
+        ++_commonStats.needTime;
+        return PlanStage::NEED_TIME;
     }
 
-    void CountScan::restoreState(OperationContext* opCtx) {
-        invariant(_txn == NULL);
-        _txn = opCtx;
-        ++_commonStats.unyields;
-        
-        if (_cursor) _cursor->restore(opCtx);
+    *out = WorkingSet::INVALID_ID;
+    ++_commonStats.advanced;
+    return PlanStage::ADVANCED;
+}
 
-        // This can change during yielding.
-        // TODO this isn't sufficient. See SERVER-17678.
-        _shouldDedup = _descriptor->isMultikey(_txn);
+bool CountScan::isEOF() {
+    return _commonStats.isEOF;
+}
+
+void CountScan::doSaveState() {
+    if (_cursor)
+        _cursor->save();
+}
+
+void CountScan::doRestoreState() {
+    if (_cursor)
+        _cursor->restore();
+
+    // This can change during yielding.
+    // TODO this isn't sufficient. See SERVER-17678.
+    _shouldDedup = _descriptor->isMultikey(getOpCtx());
+}
+
+void CountScan::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+}
+
+void CountScan::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(getOpCtx());
+}
+
+void CountScan::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
+    // The only state we're responsible for holding is what RecordIds to drop.  If a document
+    // mutates the underlying index cursor will deal with it.
+    if (INVALIDATION_MUTATION == type) {
+        return;
     }
 
-    void CountScan::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-        ++_commonStats.invalidates;
-
-        // The only state we're responsible for holding is what RecordIds to drop.  If a document
-        // mutates the underlying index cursor will deal with it.
-        if (INVALIDATION_MUTATION == type) {
-            return;
-        }
-
-        // If we see this RecordId again, it may not be the same document it was before, so we want
-        // to return it if we see it again.
-        unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
-        if (it != _returned.end()) {
-            _returned.erase(it);
-        }
+    // If we see this RecordId again, it may not be the same document it was before, so we want
+    // to return it if we see it again.
+    unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
+    if (it != _returned.end()) {
+        _returned.erase(it);
     }
+}
 
-    vector<PlanStage*> CountScan::getChildren() const {
-        vector<PlanStage*> empty;
-        return empty;
-    }
+unique_ptr<PlanStageStats> CountScan::getStats() {
+    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
 
-    PlanStageStats* CountScan::getStats() {
-        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_COUNT_SCAN));
+    unique_ptr<CountScanStats> countStats = make_unique<CountScanStats>(_specificStats);
+    countStats->keyPattern = _specificStats.keyPattern.getOwned();
+    ret->specific = std::move(countStats);
 
-        CountScanStats* countStats = new CountScanStats(_specificStats);
-        countStats->keyPattern = _specificStats.keyPattern.getOwned();
-        ret->specific.reset(countStats);
+    return ret;
+}
 
-        return ret.release();
-    }
-
-    const CommonStats* CountScan::getCommonStats() const {
-        return &_commonStats;
-    }
-
-    const SpecificStats* CountScan::getSpecificStats() const {
-        return &_specificStats;
-    }
+const SpecificStats* CountScan::getSpecificStats() const {
+    return &_specificStats;
+}
 
 }  // namespace mongo

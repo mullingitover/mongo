@@ -1,18 +1,4 @@
 # -*- mode: python; -*-
-# build file for MongoDB
-# this requires scons
-# you can get from http://www.scons.org
-# then just type scons
-
-# some common tasks
-#   build 64-bit mac and pushing to s3
-#      scons --64 s3dist
-#      scons --distname=0.8 s3dist
-#      all s3 pushes require settings.py and simples3
-
-# This file, SConstruct, configures the build environment, and then delegates to
-# several, subordinate SConscript files, which describe specific build rules.
-
 import copy
 import datetime
 import errno
@@ -27,6 +13,12 @@ import textwrap
 import uuid
 from buildscripts import utils
 from buildscripts import moduleconfig
+
+from mongo_scons_utils import (
+    default_buildinfo_environment_data,
+    default_variant_dir_generator,
+    get_toolchain_ver,
+)
 
 import libdeps
 
@@ -88,50 +80,24 @@ def is_running_os(*os_list):
 def env_os_is_wrapper(self, *os_list):
     return is_os_raw(self['TARGET_OS'], os_list)
 
-# --- options ----
-options = {}
+def add_option(name, **kwargs):
 
-def add_option( name, help, nargs, contributesToVariantDir,
-                dest=None, default = None, type="string", choices=None, metavar=None, const=None ):
+    if 'dest' not in kwargs:
+        kwargs['dest'] = name
 
-    if dest is None:
-        dest = name
+    if 'metavar' not in kwargs and kwargs.get('type', None) == 'choice':
+        kwargs['metavar'] = '[' + '|'.join(kwargs['choices']) + ']'
 
-    if type == 'choice' and not metavar:
-        metavar = '[' + '|'.join(choices) + ']'
+    AddOption('--' + name, **kwargs)
 
-    AddOption( "--" + name , 
-               dest=dest,
-               type=type,
-               nargs=nargs,
-               action="store",
-               choices=choices,
-               default=default,
-               metavar=metavar,
-               const=const,
-               help=help )
+def get_option(name):
+    return GetOption(name)
 
-    options[name] = { "help" : help ,
-                      "nargs" : nargs ,
-                      "contributesToVariantDir" : contributesToVariantDir ,
-                      "dest" : dest,
-                      "default": default }
-
-def get_option( name ):
-    return GetOption( name )
-
-def has_option( name ):
-    x = get_option( name )
-    if x is None:
-        return False
-
-    if x == False:
-        return False
-
-    if x == "":
-        return False
-
-    return True
+def has_option(name):
+    optval = GetOption(name)
+    # Options with nargs=0 are true when their value is the empty tuple. Otherwise,
+    # if the value is falsish (empty string, None, etc.), coerce to False.
+    return True if optval == () else bool(optval)
 
 def use_system_version_of_library(name):
     return has_option('use-system-all') or has_option('use-system-' + name)
@@ -140,176 +106,296 @@ def use_system_version_of_library(name):
 # add a new C++ library dependency that may be shimmed out to the system, add it to the below
 # list.
 def using_system_version_of_cxx_libraries():
-    cxx_library_names = ["tcmalloc", "boost", "v8"]
+    cxx_library_names = ["tcmalloc", "boost"]
     return True in [use_system_version_of_library(x) for x in cxx_library_names]
 
-def get_variant_dir():
+def make_variant_dir_generator():
+    memoized_variant_dir = [False]
+    def generate_variant_dir(target, source, env, for_signature):
+        if not memoized_variant_dir[0]:
+            memoized_variant_dir[0] = env.subst('$BUILD_ROOT/$VARIANT_DIR')
+        return memoized_variant_dir[0]
+    return generate_variant_dir
 
-    build_dir = get_option('build-dir').rstrip('/')
+# Options TODOs:
+#
+# - We should either alphabetize the entire list of options, or split them into logical groups
+#   with clear boundaries, and then alphabetize the groups. There is no way in SCons though to
+#   inform it of options groups.
+#
+# - Many of these options are currently only either present or absent. This is not good for
+#   scripting the build invocation because it means you need to interpolate in the presence of
+#   the whole option. It is better to make all options take an optional on/off or true/false
+#   using the nargs='const' mechanism.
+#
 
-    if has_option('variant-dir'):
-        return (build_dir + '/' + get_option('variant-dir')).rstrip('/')
+add_option('mute',
+    help='do not display commandlines for compiling and linking, to reduce screen noise',
+    nargs=0,
+)
 
-    substitute = lambda x: re.sub( "[:,\\\\/]" , "_" , x )
+add_option('prefix',
+    default='$BUILD_ROOT/install',
+    help='installation prefix',
+)
 
-    a = []
+add_option('nostrip',
+    help='do not strip installed binaries',
+    nargs=0,
+)
 
-    for name in options:
-        o = options[name]
-        if not has_option( o["dest"] ):
-            continue
-        if not o["contributesToVariantDir"]:
-            continue
-        if get_option(o["dest"]) == o["default"]:
-            continue
+add_option('build-dir',
+    default='#build',
+    help='build output directory',
+)
 
-        if o["nargs"] == 0:
-            a.append( name )
-        else:
-            x = substitute( get_option( name ) )
-            a.append( name + "_" + x )
+add_option('release',
+    help='release build',
+    nargs=0,
+)
 
-    extras = []
-    if has_option("extra-variant-dirs"):
-        extras = [substitute(x) for x in get_option( 'extra-variant-dirs' ).split( ',' )]
+add_option('lto',
+    help='enable link time optimizations (experimental, except with MSVC)',
+    nargs=0,
+)
 
-    if has_option("add-branch-to-variant-dir"):
-        extras += ["branch_" + substitute( utils.getGitBranch() )]
+add_option('dynamic-windows',
+    help='dynamically link on Windows',
+    nargs=0,
+)
 
-    if has_option('cache'):
-        s = "cached"
-        s += "/".join(extras) + "/"
-    else:
-        s = "${TARGET_ARCH}/"
-        a += extras
+add_option('endian',
+    choices=['big', 'little', 'auto'],
+    default='auto',
+    help='endianness of target platform',
+    nargs=1,
+    type='choice',
+)
 
-        if len(a) > 0:
-            a.sort()
-            s += "/".join( a ) + "/"
-        else:
-            s += "normal/"
+add_option('disable-minimum-compiler-version-enforcement',
+    help='allow use of unsupported older compilers (NEVER for production builds)',
+    nargs=0,
+)
 
-    return (build_dir + '/' + s).rstrip('/')
+add_option('ssl',
+    help='Enable SSL',
+    nargs=0
+)
 
-# build output
-add_option( "mute" , "do not display commandlines for compiling and linking, to reduce screen noise", 0, False )
+add_option('wiredtiger',
+    choices=['on', 'off'],
+    const='on',
+    default='on',
+    help='Enable wiredtiger',
+    nargs='?',
+    type='choice',
+)
 
-# installation/packaging
-add_option( "prefix" , "installation prefix" , 1 , False, default='$BUILD_ROOT/install' )
-add_option( "distname" , "dist name (0.8.0)" , 1 , False )
-add_option( "distmod", "additional piece for full dist name" , 1 , False )
-add_option( "distarch", "override the architecture name in dist output" , 1 , False )
-add_option( "nostrip", "do not strip installed binaries" , 0 , False )
-add_option( "extra-variant-dirs", "extra variant dir components, separated by commas", 1, False)
-add_option( "add-branch-to-variant-dir", "add current git branch to the variant dir", 0, False )
-add_option( "build-dir", "build output directory", 1, False, default='#build')
-add_option( "variant-dir", "override variant subdirectory", 1, False )
+js_engine_choices = ['mozjs', 'none']
+add_option('js-engine',
+    choices=js_engine_choices,
+    default=js_engine_choices[0],
+    help='JavaScript scripting engine implementation',
+    type='choice',
+)
 
-# linking options
-add_option( "release" , "release build" , 0 , True )
+add_option('server-js',
+    choices=['on', 'off'],
+    const='on',
+    default='on',
+    help='Build mongod without JavaScript support',
+    type='choice',
+)
 
-add_option( "lto", "enable link time optimizations (experimental, except with MSVC)" , 0 , True )
-add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
+add_option('libc++',
+    help='use libc++ (experimental, requires clang)',
+    nargs=0,
+)
 
-# base compile flags
-add_option( "endian" , "endianness of target platform" , 1 , False , "endian",
-            type="choice", choices=["big", "little", "auto"], default="auto" )
+add_option('use-glibcxx-debug',
+    help='Enable the glibc++ debug implementations of the C++ standard libary',
+    nargs=0,
+)
 
-add_option( "disable-minimum-compiler-version-enforcement",
-            "allow use of unsupported older compilers (NEVER for production builds)",
-            0, False )
+add_option('noshell',
+    help="don't build shell",
+    nargs=0,
+)
 
-add_option( "ssl" , "Enable SSL" , 0 , True )
-add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
-            type="choice", choices=["on", "off"], const="on", default="on")
+add_option('safeshell',
+    help="don't let shell scripts run programs (still, don't run untrusted scripts)",
+    nargs=0,
+)
 
-# library choices
-js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
-add_option( "js-engine", "JavaScript scripting engine implementation", 1, False,
-           type='choice', default=js_engine_choices[0], choices=js_engine_choices)
-add_option( "server-js", "Build mongod without JavaScript support", 1, False,
-           type='choice', choices=["on", "off"], const="on", default="on")
-add_option( "libc++", "use libc++ (experimental, requires clang)", 0, True )
+add_option('dbg',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable runtime debugging checks',
+    nargs='?',
+    type='choice',
+)
 
-add_option( "use-glibcxx-debug",
-            "Enable the glibc++ debug implementations of the C++ standard libary", 0, True )
+add_option('opt',
+    choices=['on', 'off'],
+    const='on',
+    help='Enable compile-time optimization',
+    nargs='?',
+    type='choice',
+)
 
-# mongo feature options
-add_option( "noshell", "don't build shell" , 0 , True )
-add_option( "safeshell", "don't let shell scripts run programs (still, don't run untrusted scripts)" , 0 , True )
+add_option('sanitize',
+    help='enable selected sanitizers',
+    metavar='san1,san2,...sanN',
+)
 
-# new style debug and optimize flags
-add_option( "dbg", "Enable runtime debugging checks", "?", True, "dbg",
-            type="choice", choices=["on", "off"], const="on" )
+add_option('llvm-symbolizer',
+    default='llvm-symbolizer',
+    help='name of (or path to) the LLVM symbolizer',
+)
 
-add_option( "opt", "Enable compile-time optimization", "?", True, "opt",
-            type="choice", choices=["on", "off"], const="on" )
+add_option('durableDefaultOn',
+    help='have durable default to on',
+    nargs=0,
+)
 
-add_option( "sanitize", "enable selected sanitizers", 1, True, metavar="san1,san2,...sanN" )
-add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, False, default="llvm-symbolizer" )
-
-# debugging/profiling help
 if is_running_os('linux') or is_running_os('windows'):
    defaultAllocator = 'tcmalloc'
 else:
     defaultAllocator = 'system'
-add_option( "allocator" , "allocator to use (tcmalloc or system)" , 1 , True,
-            default=defaultAllocator )
-add_option( "gdbserver" , "build in gdb server support" , 0 , True )
-add_option( "gcov" , "compile with flags for gcov" , 0 , True )
 
-add_option("smokedbprefix", "prefix to dbpath et al. for smoke tests", 1 , False )
-add_option("smokeauth", "run smoke tests with --auth", 0 , False )
+add_option('allocator',
+    default=defaultAllocator,
+    help='allocator to use (tcmalloc or system)',
+)
 
-add_option("use-sasl-client", "Support SASL authentication in the client library", 0, False)
+add_option('gdbserver',
+    help='build in gdb server support',
+    nargs=0,
+)
 
-add_option( "use-system-tcmalloc", "use system version of tcmalloc library", 0, True )
+add_option('gcov',
+    help='compile with flags for gcov',
+    nargs=0,
+)
 
-add_option( "use-system-pcre", "use system version of pcre library", 0, True )
+add_option('smokedbprefix',
+    help='prefix to dbpath et al. for smoke tests',
+)
 
-add_option( "use-system-wiredtiger", "use system version of wiredtiger library", 0, True)
+add_option('smokeauth',
+    help='run smoke tests with --auth',
+    nargs=0,
+)
 
-# library choices
+add_option('use-sasl-client',
+    help='Support SASL authentication in the client library',
+    nargs=0,
+)
+
+add_option('use-system-tcmalloc',
+    help='use system version of tcmalloc library',
+    nargs=0,
+)
+
+add_option('use-system-pcre',
+    help='use system version of pcre library',
+    nargs=0,
+)
+
+add_option('use-system-wiredtiger',
+    help='use system version of wiredtiger library',
+    nargs=0,
+)
+
 boost_choices = ['1.56']
-add_option( "internal-boost", "Specify internal boost version to use", 1, True,
-           type='choice', default=boost_choices[0], choices=boost_choices)
+add_option('internal-boost',
+    choices=boost_choices,
+    default=boost_choices[0],
+    help='Specify internal boost version to use',
+    type='choice',
+)
 
-add_option( "system-boost-lib-search-suffixes",
-            "Comma delimited sequence of boost library suffixes to search",
-            1, False )
+add_option('system-boost-lib-search-suffixes',
+    help='Comma delimited sequence of boost library suffixes to search',
+)
 
-add_option( "use-system-boost", "use system version of boost libraries", 0, True )
+add_option('use-system-boost',
+    help='use system version of boost libraries',
+    nargs=0,
+)
 
-add_option( "use-system-snappy", "use system version of snappy library", 0, True )
+add_option('use-system-snappy',
+    help='use system version of snappy library',
+    nargs=0,
+)
 
-add_option( "use-system-zlib", "use system version of zlib library", 0, True )
+add_option('use-system-valgrind',
+    help='use system version of valgrind library',
+    nargs=0,
+)
 
-add_option( "use-system-v8", "use system version of v8 library", 0, True )
+add_option('use-system-zlib',
+    help='use system version of zlib library',
+    nargs=0,
+)
 
-add_option( "use-system-stemmer", "use system version of stemmer", 0, True )
+add_option('use-system-stemmer',
+    help='use system version of stemmer',
+    nargs=0)
 
-add_option( "use-system-yaml", "use system version of yaml", 0, True )
+add_option('use-system-yaml',
+    help='use system version of yaml',
+    nargs=0,
+)
 
-add_option( "use-system-asio", "use system version of ASIO", 0, True )
+add_option('use-system-asio',
+    help="use system version of ASIO",
+    nargs=0,
+)
 
-add_option( "use-system-all" , "use all system libraries", 0 , True )
+add_option('use-system-intel_decimal128',
+    help='use system version of intel decimal128',
+    nargs=0,
+)
 
-# deprecated
-add_option( "use-new-tools" , "put new tools in the tarball", 0 , False )
+add_option('use-system-all',
+    help='use all system libraries',
+    nargs=0,
+)
 
-add_option( "use-cpu-profiler",
-            "Link against the google-perftools profiler library",
-            0, False )
+add_option('use-new-tools',
+    help='put new tools in the tarball',
+    nargs=0,
+)
 
-add_option('build-fast-and-loose', "looser dependency checking, ignored for --release builds",
-           '?', False, type="choice", choices=["on", "off"], const="on", default="on")
+add_option('use-cpu-profiler',
+    help='Link against the google-perftools profiler library',
+    nargs=0,
+)
 
-add_option('disable-warnings-as-errors', "Don't add -Werror to compiler command line", 0, False)
+add_option('build-fast-and-loose',
+    choices=['on', 'off'],
+    const='on',
+    default='on',
+    help='looser dependency checking, ignored for --release builds',
+    nargs='?',
+    type='choice',
+)
+
+add_option('disable-warnings-as-errors',
+    help="Don't add -Werror to compiler command line",
+    nargs=0,
+)
 
 add_option('variables-help',
-           "Print the help text for SCons variables", 0, False)
+    help='Print the help text for SCons variables',
+    nargs=0,
+)
 
-add_option("osx-version-min", "minimum OS X version to support", 1, True)
+add_option('osx-version-min',
+    help='minimum OS X version to support',
+)
 
 win_version_min_choices = {
     'vista'   : ('0600', '0000'),
@@ -319,17 +405,30 @@ win_version_min_choices = {
     'win81'   : ('0603', '0000'),
 }
 
-add_option("win-version-min", "minimum Windows version to support", 1, True,
-           type = 'choice', default = None,
-           choices = win_version_min_choices.keys())
+add_option('win-version-min',
+    choices=win_version_min_choices.keys(),
+    default=None,
+    help='minimum Windows version to support',
+    type='choice',
+)
 
 add_option('cache',
-           "Use an object cache rather than a per-build variant directory (experimental)",
-           0, False)
+    help='Use an object cache rather than a per-build variant directory (experimental)',
+    nargs=0,
+)
 
 add_option('cache-dir',
-           "Specify the directory to use for caching objects if --cache is in use",
-           1, False, default="$BUILD_ROOT/scons/cache")
+    default='$BUILD_ROOT/scons/cache',
+    help='Specify the directory to use for caching objects if --cache is in use',
+)
+
+add_option("experimental-decimal-support",
+    choices=['on', 'off'],
+    default='off',
+    const='on',
+    help="Enable experimental decimal128 type support",
+    nargs='?',
+)
 
 def find_mongo_custom_variables():
     files = []
@@ -342,19 +441,29 @@ def find_mongo_custom_variables():
     return files
 
 add_option('variables-files',
-           "Specify variables files to load",
-           1, False, default=find_mongo_custom_variables())
+    default=find_mongo_custom_variables(),
+    help="Specify variables files to load",
+)
+
+link_model_choices = ['auto', 'object', 'static', 'dynamic', 'dynamic-strict']
+add_option('link-model',
+    choices=link_model_choices,
+    default='object',
+    help='Select the linking model for the project',
+    type='choice'
+)
 
 variable_parse_mode_choices=['auto', 'posix', 'other']
 add_option('variable-parse-mode',
-           "Select which parsing mode is used to interpret command line variables",
-           1, False,
-           type='choice', default=variable_parse_mode_choices[0],
-           choices=variable_parse_mode_choices)
+    choices=variable_parse_mode_choices,
+    default=variable_parse_mode_choices[0],
+    help='Select which parsing mode is used to interpret command line variables',
+    type='choice',
+)
 
 add_option('modules',
-           "Comma-separated list of modules to build. Empty means none. Default is all.",
-           1, False)
+    help="Comma-separated list of modules to build. Empty means none. Default is all.",
+)
 
 try:
     with open("version.json", "r") as version_fp:
@@ -432,7 +541,13 @@ def decide_platform_tools():
 def variable_tools_converter(val):
     tool_list = shlex.split(val)
     return tool_list + [
-        "jsheader", "mergelib", "mongo_unittest", "textfile", "distsrc", "gziptool"
+        "distsrc",
+        "gziptool",
+        "jsheader",
+        "mergelib",
+        "mongo_integrationtest",
+        "mongo_unittest",
+        "textfile",
     ]
 
 def variable_distsrc_converter(val):
@@ -444,6 +559,9 @@ env_vars = Variables(
     files=variable_shlex_converter(get_option('variables-files')),
     args=ARGUMENTS
 )
+
+env_vars.Add('ABIDW',
+    help="Configures the path to the 'abidw' (a libabigail) utility")
 
 env_vars.Add('ARFLAGS',
     help='Sets flags for the archiver',
@@ -498,10 +616,28 @@ env_vars.Add('LINKFLAGS',
     help='Sets flags for the linker',
     converter=variable_shlex_converter)
 
+# Note: This is only really meaningful when configured via a variables file. See the
+# default_buildinfo_environment_data() function for examples of how to use this.
+env_vars.Add('MONGO_BUILDINFO_ENVIRONMENT_DATA',
+    help='Sets the info returned from the buildInfo command and --version command-line flag',
+    default=default_buildinfo_environment_data())
+
 env_vars.Add('MONGO_DIST_SRC_PREFIX',
     help='Sets the prefix for files in the source distribution archive',
     converter=variable_distsrc_converter,
-    default="mongodb-${MONGO_VERSION}")
+    default="mongodb-src-r${MONGO_VERSION}")
+
+env_vars.Add('MONGO_DISTARCH',
+    help='Adds a string representing the target processor architecture to the dist archive',
+    default='$TARGET_ARCH')
+
+env_vars.Add('MONGO_DISTMOD',
+    help='Adds a string that will be embedded in the dist archive naming',
+    default='')
+
+env_vars.Add('MONGO_DISTNAME',
+    help='Sets the version string to be used in dist archive naming',
+    default='$MONGO_VERSION')
 
 env_vars.Add('MONGO_VERSION',
     help='Sets the version string for MongoDB',
@@ -516,6 +652,10 @@ env_vars.Add('MSVC_USE_SCRIPT',
 
 env_vars.Add('MSVC_VERSION',
     help='Sets the version of Visual Studio to use (e.g.  12.0, 11.0, 10.0)')
+
+env_vars.Add('OBJCOPY',
+    help='Sets the path to objcopy',
+    default=WhereIs('objcopy'))
 
 env_vars.Add('RPATH',
     help='Set the RPATH for dynamic libraries and executables',
@@ -550,6 +690,11 @@ env_vars.Add('TOOLS',
     help='Sets the list of SCons tools to add to the environment',
     converter=variable_tools_converter,
     default=decide_platform_tools())
+
+env_vars.Add('VARIANT_DIR',
+    help='Sets the name (or generator function) for the variant directory',
+    default=default_variant_dir_generator,
+)
 
 # don't run configure if user calls --help
 if GetOption('help'):
@@ -609,7 +754,7 @@ def printLocalInfo():
 
 printLocalInfo()
 
-boostLibs = [ "thread" , "filesystem" , "program_options", "system" ]
+boostLibs = [ "thread" , "filesystem" , "program_options", "system", "regex", "chrono" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
@@ -617,9 +762,6 @@ releaseBuild = has_option("release")
 
 dbg_opt_mapping = {
     # --dbg, --opt   :   dbg    opt
-    ( None,  None  ) : ( False, True ),
-    ( None,  "on"  ) : ( False, True ),
-    ( None,  "off" ) : ( False, False ),
     ( "on",  None  ) : ( True,  False ),  # special case interaction
     ( "on",  "on"  ) : ( True,  True ),
     ( "on",  "off" ) : ( True,  False ),
@@ -639,12 +781,9 @@ jsEngine = get_option( "js-engine")
 
 serverJs = get_option( "server-js" ) == "on"
 
-usev8 = (jsEngine != 'none')
+usemozjs = (jsEngine.startswith('mozjs'))
 
-v8version = jsEngine[3:] if jsEngine.startswith('v8-') else 'none'
-v8suffix = '' if v8version == '3.12' else '-' + v8version
-
-if not serverJs and not usev8:
+if not serverJs and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
 # We defer building the env until we have determined whether we want certain values. Some values
@@ -657,8 +796,9 @@ if not serverJs and not usev8:
 # variant dirs. For now, we call that BUILD_ROOT. If and when we s/BUILD_DIR/VARIANT_DIR/g,
 # then also s/BUILD_ROOT/BUILD_DIR/g.
 envDict = dict(BUILD_ROOT=buildDir,
-               BUILD_DIR=get_variant_dir(),
+               BUILD_DIR=make_variant_dir_generator(),
                DIST_ARCHIVE_SUFFIX='.tgz',
+               DIST_BINARIES=[],
                MODULE_BANNERS=[],
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
@@ -668,10 +808,13 @@ envDict = dict(BUILD_ROOT=buildDir,
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
+               INTEGRATION_TEST_ALIAS='integration_tests',
+               INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
                CONFIGUREDIR=sconsDataDir.Dir('sconf_temp'),
                CONFIGURELOG=sconsDataDir.File('config.log'),
                INSTALL_DIR=installDir,
                CONFIG_HEADER_DEFINES={},
+               LIBDEPS_TAG_EXPANSIONS=[],
                )
 
 env = Environment(variables=env_vars, **envDict)
@@ -738,13 +881,17 @@ def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix
 
 # These preprocessor macros came from
 # http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
+#
+# NOTE: Remember to add a trailing comma to form any required one
+# element tuples, or your configure checks will fail in strange ways.
 processor_macros = {
-    'x86_64': ('__x86_64', '_M_AMD64'),
-    'i386': ('__i386', '_M_IX86'),
-    'sparc': ('__sparc'),
-    'PowerPC': ('__powerpc__', '__PPC'),
-    'arm' : ('__arm__'),
-    'arm64' : ('__arm64__', '__aarch64__'),
+    'arm'    : ('__arm__',),
+    'arm64'  : ('__arm64__', '__aarch64__'),
+    'i386'   : ('__i386', '_M_IX86'),
+    'ppc64'  : ('__powerpc64__',),
+    's390x'  : ('__s390x__',),
+    'sparc'  : ('__sparc',),
+    'x86_64' : ('__x86_64', '_M_AMD64'),
 }
 
 def CheckForProcessor(context, which_arch):
@@ -854,6 +1001,9 @@ elif not detectConf.CheckForOS(env['TARGET_OS']):
 
 detectConf.Finish()
 
+env['CC_VERSION'] = get_toolchain_ver(env, 'CC')
+env['CXX_VERSION'] = get_toolchain_ver(env, 'CXX')
+
 if not env['HOST_ARCH']:
     env['HOST_ARCH'] = env['TARGET_ARCH']
 
@@ -870,11 +1020,130 @@ if has_option("cache"):
         env.FatalError("Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084")
     env.CacheDir(str(env.Dir(cacheDir)))
 
+# Normalize the link model. If it is auto, then a release build uses 'object' mode. Otherwise
+# we automatically select the 'static' model on non-windows platforms, or 'object' if on
+# Windows. If the user specified, honor the request, unless it conflicts with the requirement
+# that release builds use the 'object' mode, in which case, error out.
+#
+# We require the use of the 'object' mode for release builds because it is the only linking
+# model that works across all of our platforms. We would like to ensure that all of our
+# released artifacts are built with the same known-good-everywhere model.
+link_model = get_option('link-model')
+
+if link_model == "auto":
+    link_model = "object" if (env.TargetOSIs('windows') or has_option("release")) else "static"
+elif has_option("release") and link_model != "object":
+    print("The link model for release builds is required to be 'object'")
+    Exit(1)
+
+# The only link model currently supported on Windows is 'object', since there is no equivalent
+# to --whole-archive.
+if env.TargetOSIs('windows') and link_model != 'object':
+    print("Windows builds must use the 'object' link model");
+    Exit(1);
+
+# The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
+# modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
+env['_LIBDEPS'] = '$_LIBDEPS_OBJS' if link_model == "object" else '$_LIBDEPS_LIBS'
+
+if link_model.startswith("dynamic"):
+
+    # Add in the abi linking tool if the user requested and it is
+    # supported on this platform.
+    if env.get('ABIDW'):
+        abilink = Tool('abilink')
+        if abilink.exists(env):
+            abilink(env)
+
+    # Redirect the 'Library' target, which we always use instead of 'StaticLibrary' for things
+    # that can be built in either mode, to point to SharedLibrary.
+    env['BUILDERS']['Library'] = env['BUILDERS']['SharedLibrary']
+    # Do the same for SharedObject
+    env['BUILDERS']['Object'] = env['BUILDERS']['SharedObject']
+
+    # TODO: Ideally, the conditions below should be based on a
+    # detection of what linker we are using, not the local OS, but I
+    # doubt very much that we will see the mach-o linker on anything
+    # other than Darwin, or a BFD/sun-esque linker elsewhere.
+
+    # On Darwin, we need to tell the linker that undefined symbols are
+    # resolved via dynamic lookup; otherwise we get build failures. On
+    # other unixes, we need to suppress as-needed behavior so that
+    # initializers are ensured present, even if there is no visible
+    # edge to the library in the symbol graph.
+    #
+    # NOTE: The darwin linker flag is only needed because the library
+    # graph is not a DAG. Once the graph is a DAG, we will require all
+    # edges to be expressed, and we should drop the flag. When that
+    # happens, we should also add -z,defs flag on ELF platforms to
+    # ensure that missing symbols due to unnamed dependency edges
+    # result in link errors.
+    #
+    # NOTE: The 'incomplete' tag can be applied to a library to
+    # indicate that it does not (or cannot) completely express all of
+    # its required link dependencies. This can occur for three
+    # reasons:
+    #
+    # - No unique provider for the symbol: Some symbols do not have a
+    #   unique dependency that provides a definition, in which case it
+    #   is impossible for the library to express a dependency edge to
+    #   resolve the symbol
+    #
+    # - The library is part of a cycle: If library A depends on B,
+    #   which depends on C, which depends on A, then it is impossible
+    #   to express all three edges in SCons, since otherwise there is
+    #   no way to sequence building the libraries. The cyclic
+    #   libraries actually work at runtime, because some parent object
+    #   links all of them.
+    #
+    # - The symbol is provided by an executable into which the library
+    #   will be linked. The mongo::inShutdown symbol is a good
+    #   example.
+    #
+    # All of these are defects in the linking model. In an effort to
+    # eliminate these issues, we have begun tagging those libraries
+    # that are affected, and requiring that all non-tagged libraries
+    # correctly express all dependencies. As we repair each defective
+    # library, we can remove the tag. When all the tags are removed
+    # the graph will be acyclic.
+
+    if env.TargetOSIs('osx'):
+        if link_model == "dynamic-strict":
+            # Darwin is strict by default
+            pass
+        else:
+            def libdeps_tags_expand_incomplete(source, target, env, for_signature):
+                # On darwin, since it is strict by default, we need to add a flag
+                # when libraries are tagged incomplete.
+                if 'incomplete' in target[0].get_env().get("LIBDEPS_TAGS", []):
+                    return ["-Wl,-undefined,dynamic_lookup"]
+                return []
+            env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
+    else:
+        env.AppendUnique(SHLINKFLAGS=["-Wl,--no-as-needed"])
+
+        # Using zdefs doesn't work at all with the sanitizers
+        if not has_option('sanitize'):
+
+            if link_model == "dynamic-strict":
+                env.AppendUnique(SHLINKFLAGS=["-Wl,-z,defs"])
+            else:
+                # On BFD/gold linker environments, which are not strict by
+                # default, we need to add a flag when libraries are not
+                # tagged incomplete.
+                def libdeps_tags_expand_incomplete(source, target, env, for_signature):
+                    if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
+                        return ["-Wl,-z,defs"]
+                    return []
+                env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
+
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
 # Ignore requests to build fast and loose for release builds.
-if get_option('build-fast-and-loose') == "on" and not has_option('release'):
+# Also ignore fast-and-loose option if the scons cache is enabled (see SERVER-19088)
+if get_option('build-fast-and-loose') == "on" and \
+    not has_option('release') and not has_option('cache'):
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
@@ -898,8 +1167,6 @@ if endian == "little":
 elif endian == "big":
     env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
 
-env['_LIBDEPS'] = '$_LIBDEPS_OBJS'
-
 if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # The libraries we build in LIBDEPS_OBJS mode are just placeholders for tracking dependencies.
     # This avoids wasting time and disk IO on them.
@@ -916,21 +1183,29 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     env['RANLIBCOM'] = noop_action
     env['RANLIBCOMSTR'] = 'Skipping ranlib for $TARGET'
 
-libdeps.setup_environment( env )
+libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")))
 
-if env.TargetOSIs('linux', 'freebsd'):
+if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
     env['LINK_LIBGROUP_START'] = '-Wl,--start-group'
     env['LINK_LIBGROUP_END'] = '-Wl,--end-group'
+    env['LINK_WHOLE_ARCHIVE_START'] = '-Wl,--whole-archive'
+    env['LINK_WHOLE_ARCHIVE_END'] = '-Wl,--no-whole-archive'
 elif env.TargetOSIs('osx'):
     env['LINK_LIBGROUP_START'] = ''
     env['LINK_LIBGROUP_END'] = ''
+    env['LINK_WHOLE_ARCHIVE_START'] = '-Wl,-all_load'
+    env['LINK_WHOLE_ARCHIVE_END'] = '-Wl,-noall_load'
 elif env.TargetOSIs('solaris'):
-    env['LINK_LIBGROUP_START'] = '-z rescan'
-    env['LINK_LIBGROUP_END'] = ''
+    env['LINK_LIBGROUP_START'] = '-z rescan-start'
+    env['LINK_LIBGROUP_END'] = '-z rescan-end'
+    env['LINK_WHOLE_ARCHIVE_START'] = '-z allextract'
+    env['LINK_WHOLE_ARCHIVE_END'] = '-z defaultextract'
 
 # ---- other build setup -----
 if debugBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
+else:
+    env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
     env.Append( LIBS=['m'] )
@@ -1065,21 +1340,26 @@ elif env.TargetOSIs('windows'):
         # without having been initialized (implies /Od: no optimizations)
         env.Append( CCFLAGS=["/RTC1"] )
 
+        # Support large object files since some unit-test sources contain a lot of code
+        env.Append( CCFLAGS=["/bigobj"] )
+
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
 
-    env.Append(LIBS=['ws2_32.lib',
-                     'kernel32.lib',
-                     'advapi32.lib',
-                     'Psapi.lib',
-                     'DbgHelp.lib',
-                     'shell32.lib',
-                     'Iphlpapi.lib',
-                     'version.lib'])
-
-    # v8 calls timeGetTime()
-    if usev8:
-        env.Append(LIBS=['winmm.lib'])
+    env.Append(
+        LIBS=[
+            'DbgHelp.lib',
+            'Iphlpapi.lib',
+            'Psapi.lib',
+            'advapi32.lib',
+            'bcrypt.lib',
+            'kernel32.lib',
+            'shell32.lib',
+            'version.lib',
+            'winmm.lib',
+            'ws2_32.lib',
+        ],
+    )
 
 # When building on visual studio, this sets the name of the debug symbols file
 if env.ToolchainIs('msvc'):
@@ -1089,7 +1369,8 @@ env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if env.TargetOSIs('posix'):
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
-    env.Append( CCFLAGS=["-fPIC",
+    env.Append( CCFLAGS=["-fno-omit-frame-pointer",
+                         "-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
                          "-pthread",
@@ -1128,8 +1409,8 @@ if env.TargetOSIs('posix'):
             pass
 
     if env.TargetOSIs('linux') and has_option( "gcov" ):
-        env.Append( CXXFLAGS=" -fprofile-arcs -ftest-coverage " )
-        env.Append( LINKFLAGS=" -fprofile-arcs -ftest-coverage " )
+        env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
+        env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
 
     if optBuild:
         env.Append( CCFLAGS=["-O2"] )
@@ -1142,18 +1423,6 @@ if env.TargetOSIs('posix'):
             env.Append( LINKFLAGS=["-fstack-protector"] )
             env.Append( SHLINKFLAGS=["-fstack-protector"] )
 
-if has_option( "ssl" ):
-    env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-    env.Append( MONGO_CRYPTO=["openssl"] )
-    if env.TargetOSIs('windows'):
-        env.Append( LIBS=["libeay32"] )
-        env.Append( LIBS=["ssleay32"] )
-    else:
-        env.Append( LIBS=["ssl"] )
-        env.Append( LIBS=["crypto"] )
-else:
-    env.Append( MONGO_CRYPTO=["tom"] )
-
 wiredtiger = False
 if get_option('wiredtiger') == 'on':
     # Wiredtiger only supports 64-bit architecture, and will fail to compile on 32-bit
@@ -1163,6 +1432,10 @@ if get_option('wiredtiger') == 'on':
             "Re-run scons with --wiredtiger=off to build on 32-bit platforms")
     else:
         wiredtiger = True
+        env.SetConfigHeaderDefine("MONGO_CONFIG_WIREDTIGER_ENABLED")
+
+if get_option('experimental-decimal-support') == 'on':
+    env.SetConfigHeaderDefine("MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT")
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -1319,11 +1592,31 @@ def doConfigure(myenv):
 
     conf.Finish()
 
-    def AddFlagIfSupported(env, tool, extension, flag, **mutation):
+    def AddFlagIfSupported(env, tool, extension, flag, link, **mutation):
         def CheckFlagTest(context, tool, extension, flag):
-            test_body = ""
-            context.Message('Checking if %s compiler supports %s... ' % (tool, flag))
-            ret = context.TryCompile(test_body, extension)
+            if link:
+                if tool == 'C':
+                    test_body = """
+                    #include <stdlib.h>
+                    #include <stdio.h>
+                    int main() {
+                        printf("Hello, World!");
+                        return EXIT_SUCCESS;
+                    }"""
+                elif tool == 'C++':
+                    test_body = """
+                    #include <iostream>
+                    #include <cstdlib>
+                    int main() {
+                        std::cout << "Hello, World!" << std::endl;
+                        return EXIT_SUCCESS;
+                    }"""
+                context.Message('Checking if linker supports %s... ' % (flag))
+                ret = context.TryLink(textwrap.dedent(test_body), extension)
+            else:
+                test_body = ""
+                context.Message('Checking if %s compiler supports %s... ' % (tool, flag))
+                ret = context.TryCompile(textwrap.dedent(test_body), extension)
             context.Result(ret)
             return ret
 
@@ -1362,13 +1655,20 @@ def doConfigure(myenv):
         return available
 
     def AddToCFLAGSIfSupported(env, flag):
-        return AddFlagIfSupported(env, 'C', '.c', flag, CFLAGS=[flag])
+        return AddFlagIfSupported(env, 'C', '.c', flag, False, CFLAGS=[flag])
 
     def AddToCCFLAGSIfSupported(env, flag):
-        return AddFlagIfSupported(env, 'C', '.c', flag, CCFLAGS=[flag])
+        return AddFlagIfSupported(env, 'C', '.c', flag, False, CCFLAGS=[flag])
 
     def AddToCXXFLAGSIfSupported(env, flag):
-        return AddFlagIfSupported(env, 'C++', '.cpp', flag, CXXFLAGS=[flag])
+        return AddFlagIfSupported(env, 'C++', '.cpp', flag, False, CXXFLAGS=[flag])
+
+    def AddToLINKFLAGSIfSupported(env, flag):
+        return AddFlagIfSupported(env, 'C', '.c', flag, True, LINKFLAGS=[flag])
+
+    def AddToSHLINKFLAGSIfSupported(env, flag):
+        return AddFlagIfSupported(env, 'C', '.c', flag, True, SHLINKFLAGS=[flag])
+
 
     if myenv.ToolchainIs('clang', 'gcc'):
         # This warning was added in g++-4.8.
@@ -1415,6 +1715,13 @@ def doConfigure(myenv):
 
         # Don't issue warnings about potentially evaluated expressions
         AddToCCFLAGSIfSupported(myenv, "-Wno-potentially-evaluated-expression")
+
+        # Warn about moves of prvalues, which can inhibit copy elision.
+        AddToCXXFLAGSIfSupported(myenv, "-Wpessimizing-move")
+
+        # Warn about redundant moves, such as moving a local variable in a return that is different
+        # than the return type.
+        AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
 
     # Check if we need to disable null-conversion warnings
     if myenv.ToolchainIs('clang'):
@@ -1515,6 +1822,32 @@ def doConfigure(myenv):
 
     if not conf.CheckCxx11():
         myenv.ConfError('C++11 support is required to build MongoDB')
+
+    conf.Finish()
+
+    def CheckMemset_s(context):
+        test_body = """
+        #define __STDC_WANT_LIB_EXT1__ 1
+        #include <cstring>
+        int main(int argc, char* argv[]) {
+            void* data = nullptr;
+            return memset_s(data, 0, 0, 0);
+        }
+        """
+
+        context.Message('Checking for memset_s... ')
+        ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
+    conf = Configure(env, custom_tests = {
+        'CheckMemset_s' : CheckMemset_s,
+    })
+    if conf.CheckMemset_s():
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_MEMSET_S")
+
+    if conf.CheckFunc('strnlen'):
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STRNLEN")
 
     conf.Finish()
 
@@ -1704,6 +2037,7 @@ def doConfigure(myenv):
         else:
             llvm_symbolizer = myenv.WhereIs(llvm_symbolizer)
 
+        tsan_options = ""
         if llvm_symbolizer:
             myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
             myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
@@ -1725,6 +2059,11 @@ def doConfigure(myenv):
         #
         myenv.Append( CCFLAGS=["/Zc:inline"])
 
+    # This tells clang/gcc to use the gold linker if it is available - we prefer the gold linker
+    # because it is much faster.
+    if myenv.ToolchainIs('gcc', 'clang'):
+        AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+
     # Apply any link time optimization settings as selected by the 'lto' option.
     if has_option('lto'):
         if myenv.ToolchainIs('msvc'):
@@ -1740,41 +2079,8 @@ def doConfigure(myenv):
         elif myenv.ToolchainIs('gcc', 'clang'):
             # For GCC and clang, the flag is -flto, and we need to pass it both on the compile
             # and link lines.
-            if AddToCCFLAGSIfSupported(myenv, '-flto'):
-                myenv.Append(LINKFLAGS=['-flto'])
-
-                def LinkHelloWorld(context, adornment = None):
-                    test_body = """
-                    #include <iostream>
-                    int main() {
-                        std::cout << "Hello, World!" << std::endl;
-                        return 0;
-                    }
-                    """
-                    message = "Trying to link with LTO"
-                    if adornment:
-                        message = message + " " + adornment
-                    message = message + "..."
-                    context.Message(message)
-                    ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
-                    context.Result(ret)
-                    return ret
-
-                conf = Configure(myenv, help=False, custom_tests = {
-                    'LinkHelloWorld' : LinkHelloWorld,
-                })
-
-                # Some systems (clang, on a system with the BFD linker by default) may need to
-                # explicitly request the gold linker for LTO to work. If we can't LTO link a
-                # simple program, see if -fuse=ld=gold helps.
-                if not conf.LinkHelloWorld():
-                    conf.env.Append(LINKFLAGS=["-fuse-ld=gold"])
-                    if not conf.LinkHelloWorld("(with -fuse-ld=gold)"):
-                        myenv.ConfError("Error: Couldn't link with LTO")
-
-                myenv = conf.Finish()
-
-            else:
+            if not AddToCCFLAGSIfSupported(myenv, '-flto') or \
+                    not AddToLINKFLAGSIfSupported(myenv, '-flto'):
                 myenv.ConfError("Link time optimization requested, "
                     "but selected compiler does not honor -flto" )
         else:
@@ -1784,49 +2090,33 @@ def doConfigure(myenv):
     if not myenv.ToolchainIs('msvc'):
         AddToCCFLAGSIfSupported(myenv, "-fno-builtin-memcmp")
 
-    # When using msvc, check for support for __declspec(thread), unless we have been asked
-    # explicitly not to use it. For other compilers, see if __thread works.
-    if myenv.ToolchainIs('msvc'):
-        haveDeclSpecThread = False
-        def CheckDeclspecThread(context):
-            test_body = """
-            __declspec( thread ) int tsp_int;
-            int main(int argc, char* argv[]) {
-            tsp_int = argc;
-            return 0;
-            }
-            """
-            context.Message('Checking for __declspec(thread)... ')
-            ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
-            context.Result(ret)
-            return ret
-        conf = Configure(myenv, help=False, custom_tests = {
-            'CheckDeclspecThread' : CheckDeclspecThread,
-        })
-        haveDeclSpecThread = conf.CheckDeclspecThread()
-        conf.Finish()
-        if haveDeclSpecThread:
-            myenv.SetConfigHeaderDefine("MONGO_CONFIG_HAVE___DECLSPEC_THREAD")
-    else:
-        def CheckUUThread(context):
-            test_body = """
-            __thread int tsp_int;
-            int main(int argc, char* argv[]) {
-                tsp_int = argc;
-                return 0;
-            }
-            """
-            context.Message('Checking for __thread... ')
-            ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
-            context.Result(ret)
-            return ret
-        conf = Configure(myenv, help=False, custom_tests = {
-            'CheckUUThread' : CheckUUThread,
-        })
-        haveUUThread = conf.CheckUUThread()
-        conf.Finish()
-        if haveUUThread:
-            myenv.SetConfigHeaderDefine("MONGO_CONFIG_HAVE___THREAD")
+    def CheckStorageClass(context, storage_class):
+        test_body = """
+        {0} int tsp_int = 1;
+        int main(int argc, char** argv) {{
+            return !(tsp_int == argc);
+        }}
+        """.format(storage_class)
+        context.Message('Checking for storage class {0} '.format(storage_class))
+        ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckStorageClass': CheckStorageClass
+    })
+    haveTriviallyConstructibleThreadLocals = False
+    for storage_class, macro_name in [
+            ('thread_local', 'MONGO_CONFIG_HAVE_THREAD_LOCAL'),
+            ('__thread', 'MONGO_CONFIG_HAVE___THREAD'),
+            ('__declspec(thread)', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD')]:
+        if conf.CheckStorageClass(storage_class):
+            haveTriviallyConstructibleThreadLocals = True
+            myenv.SetConfigHeaderDefine(macro_name)
+    conf.Finish()
+    if not haveTriviallyConstructibleThreadLocals:
+        print "Compiler must support a thread local storage class for trivially constructible types"
+        Exit(1)
 
     # not all C++11-enabled gcc versions have type properties
     def CheckCXX11IsTriviallyCopyable(context):
@@ -1911,6 +2201,70 @@ def doConfigure(myenv):
     })
     libdeps.setup_conftests(conf)
 
+    if has_option( "ssl" ):
+        sslLibName = "ssl"
+        cryptoLibName = "crypto"
+        if conf.env.TargetOSIs('windows'):
+            sslLibName = "ssleay32"
+            cryptoLibName = "libeay32"
+
+        if not conf.CheckLibWithHeader(
+                sslLibName,
+                ["openssl/ssl.h"],
+                "C",
+                "SSL_version(NULL);",
+                autoadd=True):
+            conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
+
+        if not conf.CheckLibWithHeader(
+                cryptoLibName,
+                ["openssl/crypto.h"],
+                "C",
+                "SSLeay_version(0);",
+                autoadd=True):
+            conf.env.ConfError("Couldn't find OpenSSL crypto.h header and library")
+
+        def CheckLinkSSL(context):
+            test_body = """
+            #include <openssl/err.h>
+            #include <openssl/ssl.h>
+            #include <stdlib.h>
+
+            int main() {
+                SSL_library_init();
+                SSL_load_error_strings();
+                ERR_load_crypto_strings();
+
+                OpenSSL_add_all_algorithms();
+                ERR_free_strings();
+
+                return EXIT_SUCCESS;
+            }
+            """
+            context.Message("Checking that linking to OpenSSL works...")
+            ret = context.TryLink(textwrap.dedent(test_body), ".c")
+            context.Result(ret)
+            return ret
+
+        conf.AddTest("CheckLinkSSL", CheckLinkSSL)
+
+        if not conf.CheckLinkSSL():
+            conf.env.ConfError("SSL is enabled, but is unavailable")
+
+        env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
+        env.Append( MONGO_CRYPTO=["openssl"] )
+
+        if conf.CheckDeclaration(
+            "FIPS_mode_set",
+            includes="""
+                #include <openssl/crypto.h>
+                #include <openssl/evp.h>
+            """):
+            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_FIPS_MODE_SET')
+
+    else:
+        env.Append( MONGO_CRYPTO=["tom"] )
+
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
         conf.FindSysLibDep("pcrecpp", ["pcrecpp"])
@@ -1921,7 +2275,7 @@ def doConfigure(myenv):
         conf.FindSysLibDep("snappy", ["snappy"])
 
     if use_system_version_of_library("zlib"):
-        conf.FindSysLibDep("zlib", ["zlib" if windows else "z"])
+        conf.FindSysLibDep("zlib", ["zdll" if conf.env.TargetOSIs('windows') else "z"])
 
     if use_system_version_of_library("stemmer"):
         conf.FindSysLibDep("stemmer", ["stemmer"])
@@ -1929,18 +2283,29 @@ def doConfigure(myenv):
     if use_system_version_of_library("yaml"):
         conf.FindSysLibDep("yaml", ["yaml-cpp"])
 
+    if use_system_version_of_library("intel_decimal128"):
+        conf.FindSysLibDep("intel_decimal128", ["bid"])
+
     if wiredtiger and use_system_version_of_library("wiredtiger"):
         if not conf.CheckCXXHeader( "wiredtiger.h" ):
             myenv.ConfError("Cannot find wiredtiger headers")
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
+
+    conf.env.Append(
+        CPPDEFINES=[
+            ("BOOST_THREAD_VERSION", "4"),
+            # Boost thread v4's variadic thread support doesn't
+            # permit more than four parameters.
+            "BOOST_THREAD_DONT_PROVIDE_VARIADIC_THREAD",
+            "BOOST_SYSTEM_NO_DEPRECATED",
+        ]
+    )
 
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
             myenv.ConfError("can't find boost headers")
         if not conf.CheckBoostMinVersion():
             myenv.ConfError("system's version of boost is too old. version 1.49 or better required")
-
-        conf.env.Append(CPPDEFINES=[("BOOST_THREAD_VERSION", "2")])
 
         # Note that on Windows with using-system-boost builds, the following
         # FindSysLibDep calls do nothing useful (but nothing problematic either)
@@ -1954,6 +2319,20 @@ def doConfigure(myenv):
                     boostlib,
                     [boostlib + suffix for suffix in boostSuffixList],
                     language='C++')
+    else:
+        # For the built in boost, we can set these without risking ODR violations, so do so.
+        conf.env.Append(
+            CPPDEFINES=[
+                # We don't want interruptions because we don't use
+                # them and they have a performance cost.
+                "BOOST_THREAD_DONT_PROVIDE_INTERRUPTIONS",
+
+                # We believe that none of our platforms are affected
+                # by the EINTR bug. Setting this avoids a retry loop
+                # in boosts mutex.hpp that we don't want to pay for.
+                "BOOST_THREAD_HAS_NO_EINTR_BUG",
+            ],
+        )
 
     if posix_system:
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_HEADER_UNISTD_H")
@@ -1974,13 +2353,6 @@ def doConfigure(myenv):
 
     if env.TargetOSIs('solaris'):
         conf.CheckLib( "nsl" )
-
-    if usev8 and use_system_version_of_library("v8"):
-        if debugBuild:
-            v8_lib_choices = ["v8_g", "v8"]
-        else:
-            v8_lib_choices = ["v8"]
-        conf.FindSysLibDep( "v8", v8_lib_choices )
 
     conf.env['MONGO_BUILD_SASL_CLIENT'] = bool(has_option("use-sasl-client"))
     if conf.env['MONGO_BUILD_SASL_CLIENT'] and not conf.CheckLibWithHeader(
@@ -2050,40 +2422,6 @@ def doConfigure(myenv):
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
 
-    def CheckLinkSSL(context):
-        test_body = """
-        #include <openssl/err.h>
-        #include <openssl/ssl.h>
-        #include <stdlib.h>
-
-        int main() {
-            SSL_library_init();
-            SSL_load_error_strings();
-            ERR_load_crypto_strings();
-
-            OpenSSL_add_all_algorithms();
-            ERR_free_strings();
-            return EXIT_SUCCESS;
-        }
-        """
-        context.Message("Checking if OpenSSL is available...")
-        ret = context.TryLink(textwrap.dedent(test_body), ".c")
-        context.Result(ret)
-        return ret
-    conf.AddTest("CheckLinkSSL", CheckLinkSSL)
-
-    if has_option("ssl"):
-        if not conf.CheckLinkSSL():
-            conf.env.ConfError("SSL is enabled, but is unavailable")
-
-        if conf.CheckDeclaration(
-            "FIPS_mode_set",
-            includes="""
-                #include <openssl/crypto.h>
-                #include <openssl/evp.h>
-            """):
-            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_FIPS_MODE_SET')
-
     return conf.Finish()
 
 env = doConfigure( env )
@@ -2102,6 +2440,10 @@ checkErrorCodes()
 # --- lint ----
 
 def doLint( env , target , source ):
+    import buildscripts.clang_format
+    if not buildscripts.clang_format.lint(None, []):
+        raise Exception("clang-format lint errors")
+
     import buildscripts.lint
     if not buildscripts.lint.run_lint( [ "src/mongo/" ] ):
         raise Exception( "lint errors" )
@@ -2113,17 +2455,24 @@ env.AlwaysBuild( "lint" )
 #  ----  INSTALL -------
 
 def getSystemInstallName():
-    dist_arch = GetOption("distarch")
-    arch_name = env['TARGET_ARCH'] if not dist_arch else dist_arch
-    n = env.GetTargetOSName() + "-" + arch_name
-    if has_option("nostrip"):
-        n += "-debugsymbols"
+    arch_name = env.subst('$MONGO_DISTARCH')
+
+    # We need to make sure the directory names inside dist tarballs are permanently
+    # consistent, even if the target OS name used in scons is different. Any differences
+    # between the names used by env.TargetOSIs/env.GetTargetOSName should be added
+    # to the translation dictionary below.
+    os_name_translations = {
+        'windows': 'win32'
+    }
+    os_name = env.GetTargetOSName()
+    os_name = os_name_translations.get(os_name, os_name)
+    n = os_name + "-" + arch_name
 
     if len(mongo_modules):
             n += "-" + "-".join(m.name for m in mongo_modules)
 
-    dn = GetOption("distmod")
-    if dn and len(dn) > 0:
+    dn = env.subst('$MONGO_DISTMOD')
+    if len(dn) > 0:
         n = n + "-" + dn
 
     return n
@@ -2149,12 +2498,7 @@ def add_version_to_distsrc(env, archive):
 
 env.AddDistSrcCallback(add_version_to_distsrc)
 
-if has_option('distname'):
-    distName = GetOption( "distname" )
-else:
-    distName = env['MONGO_VERSION']
-
-env['SERVER_DIST_BASENAME'] = 'mongodb-%s-%s' % (getSystemInstallName(), distName)
+env['SERVER_DIST_BASENAME'] = env.subst('mongodb-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
 
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
@@ -2170,18 +2514,19 @@ Export("env")
 Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("serverJs")
-Export("usev8")
-Export("v8version v8suffix")
+Export("usemozjs")
 Export("boostSuffix")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("wiredtiger")
+Export("endian")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
-env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+compileDb = env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+
 env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
 env.Alias("distsrc-tgz", env.GZip(
     target="mongodb-src-${MONGO_VERSION}.tgz",
@@ -2192,4 +2537,19 @@ env.Alias("distsrc", "distsrc-tgz")
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 
-env.Alias('all', ['core', 'tools', 'dbtest', 'unittests'])
+env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+
+# Substitute environment variables in any build targets so that we can
+# say, for instance:
+#
+# > scons --prefix=/foo/bar '$INSTALL_DIR'
+# or
+# > scons \$BUILD_DIR/mongo/base
+#
+# That way, you can reference targets under the variant dir or install
+# path via an invariant name.
+#
+# We need to replace the values in the BUILD_TARGETS object in-place
+# because SCons wants it to be a particular object.
+for i, s in enumerate(BUILD_TARGETS):
+    BUILD_TARGETS[i] = env.subst(s)

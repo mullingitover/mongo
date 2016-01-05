@@ -29,28 +29,52 @@
 #pragma once
 
 #include "mongo/client/connection_pool.h"
-#include "mongo/client/remote_command_runner.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 
 namespace mongo {
 
-    class RemoteCommandRunnerImpl : public RemoteCommandRunner {
-    public:
-        RemoteCommandRunnerImpl(int messagingPortTags);
-        virtual ~RemoteCommandRunnerImpl();
+namespace executor {
+class NetworkConnectionHook;
+}  // namespace executor
 
-        /**
-         * Closes all underlying connections. Must be called before the destructor runs.
-         */
-        void shutdown();
+template <typename T>
+class StatusWith;
 
-        virtual StatusWith<RemoteCommandResponse> runCommand(const RemoteCommandRequest& request);
+/**
+ * Utility used by the network executor to run commands against a MongoDB instance. It abstracts
+ * the logic of managing connections and turns the remote instance into a stateless
+ * request-response service.
+ */
+class RemoteCommandRunnerImpl {
+public:
+    RemoteCommandRunnerImpl(int messagingTags,
+                            std::unique_ptr<executor::NetworkConnectionHook> hook);
+    ~RemoteCommandRunnerImpl();
 
-    private:
-        // The connection pool on which to send requests
-        ConnectionPool _connPool;
+    /**
+     * Starts up the connection pool.
+     */
+    void startup();
 
-        // Whether shutdown has been called
-        bool _shutDown;
-    };
+    /**
+     * Closes all underlying connections. Must be called before the destructor runs.
+     */
+    void shutdown();
 
-} // namespace mongo
+    /**
+     * Synchronously invokes the command described by "request" and returns the server's
+     * response or any status.
+     */
+    StatusWith<executor::RemoteCommandResponse> runCommand(
+        const executor::RemoteCommandRequest& request);
+
+private:
+    // The connection pool on which to send requests
+    ConnectionPool _connPool;
+
+    // True if startup has been called
+    bool _active{false};
+};
+
+}  // namespace mongo

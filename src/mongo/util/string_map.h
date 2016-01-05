@@ -29,39 +29,60 @@
 
 #pragma once
 
+#include <third_party/murmurhash3/MurmurHash3.h>
+
 #include "mongo/base/string_data.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/unordered_fast_key_table.h"
 
 namespace mongo {
 
-    typedef StringData::Hasher StringMapDefaultHash;
+struct StringMapTraits {
+    static uint32_t hash(StringData a) {
+        uint32_t hash;
+        MurmurHash3_x86_32(a.rawData(), a.size(), 0, &hash);
+        return hash;
+    }
 
-    struct StringMapDefaultEqual {
-        bool operator()( StringData a, StringData b ) const {
-            return a == b;
+    static bool equals(StringData a, StringData b) {
+        return a == b;
+    }
+
+    static std::string toStorage(StringData s) {
+        return s.toString();
+    }
+
+    static StringData toLookup(const std::string& s) {
+        return StringData(s);
+    }
+
+    class HashedKey {
+    public:
+        explicit HashedKey(StringData key = "") : _key(key), _hash(StringMapTraits::hash(_key)) {}
+
+        HashedKey(StringData key, uint32_t hash) : _key(key), _hash(hash) {
+            // If you claim to know the hash, it better be correct.
+            dassert(_hash == StringMapTraits::hash(_key));
         }
-    };
 
-    struct StringMapDefaultConvertor {
-        StringData operator()( const std::string& s ) const {
-            return StringData( s );
+        const StringData& key() const {
+            return _key;
         }
-    };
 
-    struct StringMapDefaultConvertorOther {
-        std::string operator()( StringData s ) const {
-            return s.toString();
+        uint32_t hash() const {
+            return _hash;
         }
-    };
 
-    template< typename V >
-    class StringMap : public UnorderedFastKeyTable< StringData, // K_L
-                                                    std::string, // K_S
-                                                    V,           // V
-                                                    StringMapDefaultHash,
-                                                    StringMapDefaultEqual,
-                                                    StringMapDefaultConvertor,
-                                                    StringMapDefaultConvertorOther > {
+    private:
+        StringData _key;
+        uint32_t _hash;
     };
-}
+};
 
+template <typename V>
+using StringMap = UnorderedFastKeyTable<StringData,   // K_L
+                                        std::string,  // K_S
+                                        V,
+                                        StringMapTraits>;
+
+}  // namespace mongo

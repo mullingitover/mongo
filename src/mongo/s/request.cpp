@@ -40,7 +40,6 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/cluster_last_error_info.h"
-#include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
 #include "mongo/util/log.h"
@@ -48,115 +47,79 @@
 
 namespace mongo {
 
-    using std::endl;
-    using std::string;
+using std::string;
 
-    Request::Request(Message& m, AbstractMessagingPort* p)
-        : _clientInfo(&cc()),
-          _m(m),
-          _d(m),
-          _p(p),
-          _id(_m.header().getId()),
-          _didInit(false) {
+Request::Request(Message& m, AbstractMessagingPort* p)
+    : _clientInfo(&cc()), _m(m), _d(m), _p(p), _id(_m.header().getId()), _didInit(false) {
+    ClusterLastErrorInfo::get(_clientInfo).newRequest();
+}
 
-        ClusterLastErrorInfo::get(_clientInfo).newRequest();
+void Request::init(OperationContext* txn) {
+    if (_didInit) {
+        return;
     }
 
-    void Request::init() {
-        if (_didInit) {
-            return;
-        }
+    _m.header().setId(_id);
+    LastError::get(_clientInfo).startRequest();
+    ClusterLastErrorInfo::get(_clientInfo).clearRequestInfo();
 
-        _m.header().setId(_id);
-        LastError::get(_clientInfo).startRequest();
-        ClusterLastErrorInfo::get(_clientInfo).clearRequestInfo();
+    if (_d.messageShouldHaveNs()) {
+        const NamespaceString nss(getns());
 
-        if (_d.messageShouldHaveNs()) {
-            const NamespaceString nss(getns());
+        uassert(ErrorCodes::IllegalOperation,
+                "can't use 'local' database through mongos",
+                nss.db() != "local");
 
-            uassert(ErrorCodes::IllegalOperation,
-                    "can't use 'local' database through mongos",
-                    nss.db() != "local");
-
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid ns [" << nss.ns() << "]",
-                    nss.isValid());
-        }
-
-        AuthorizationSession::get(_clientInfo)->startRequest(NULL);
-        _didInit = true;
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid ns [" << nss.ns() << "]",
+                nss.isValid());
     }
 
-    void Request::process( int attempt ) {
-        init();
-        int op = _m.operation();
-        verify( op > dbMsg );
+    AuthorizationSession::get(_clientInfo)->startRequest(txn);
+    _didInit = true;
+}
 
-        const MSGID msgId = _m.header().getId();
+void Request::process(OperationContext* txn, int attempt) {
+    init(txn);
+    int op = _m.operation();
+    verify(op > dbMsg);
 
-        Timer t;
-        LOG(3) << "Request::process begin ns: " << getns()
-               << " msg id: " << msgId
-               << " op: " << op
-               << " attempt: " << attempt
-               << endl;
+    const MSGID msgId = _m.header().getId();
 
-        _d.markSet();
+    LOG(3) << "Request::process begin ns: " << getnsIfPresent() << " msg id: " << msgId
+           << " op: " << op << " attempt: " << attempt;
 
-        bool iscmd = false;
-        if ( op == dbKillCursors ) {
-            cursorCache.gotKillCursors( _m );
-            globalOpCounters.gotOp( op , iscmd );
+    _d.markSet();
+
+    bool iscmd = false;
+    if (op == dbKillCursors) {
+        Strategy::killCursors(txn, *this);
+        globalOpCounters.gotOp(op, iscmd);
+    } else if (op == dbQuery) {
+        NamespaceString nss(getns());
+        iscmd = nss.isCommand() || nss.isSpecialCommand();
+
+        if (iscmd) {
+            int n = _d.getQueryNToReturn();
+            uassert(16978,
+                    str::stream() << "bad numberToReturn (" << n
+                                  << ") for $cmd type ns - can only be 1 or -1",
+                    n == 1 || n == -1);
+
+            Strategy::clientCommandOp(txn, *this);
+        } else {
+            Strategy::queryOp(txn, *this);
         }
-        else if ( op == dbQuery ) {
-            NamespaceString nss(getns());
-            iscmd = nss.isCommand() || nss.isSpecialCommand();
-
-            if (iscmd) {
-                int n = _d.getQueryNToReturn();
-                uassert( 16978, str::stream() << "bad numberToReturn (" << n
-                                              << ") for $cmd type ns - can only be 1 or -1",
-                         n == 1 || n == -1 );
-
-                Strategy::clientCommandOp(*this);
-            }
-            else {
-                Strategy::queryOp( *this );
-            }
-
-            globalOpCounters.gotOp( op , iscmd );
-        }
-        else if ( op == dbGetMore ) {
-            Strategy::getMore( *this );
-            globalOpCounters.gotOp( op , iscmd );
-        }
-        else {
-            Strategy::writeOp( op, *this );
-            // globalOpCounters are handled by write commands.
-        }
-
-        LOG(3) << "Request::process end ns: " << getns()
-               << " msg id: " << msgId
-               << " op: " << op
-               << " attempt: " << attempt
-               << " " << t.millis() << "ms"
-               << endl;
+    } else if (op == dbGetMore) {
+        Strategy::getMore(txn, *this);
+        globalOpCounters.gotOp(op, iscmd);
+    } else {
+        Strategy::writeOp(txn, op, *this);
+        // globalOpCounters are handled by write commands.
     }
 
-    void Request::reply( Message & response , const string& fromServer ) {
-        verify( _didInit );
-        long long cursor = response.header().getCursor();
-        if ( cursor ) {
-            if ( fromServer.size() ) {
-                cursorCache.storeRef(fromServer, cursor, getns());
-            }
-            else {
-                // probably a getMore
-                // make sure we have a ref for this
-                verify( cursorCache.getRef( cursor ).size() );
-            }
-        }
-        _p->reply( _m , response , _id );
-    }
+    LOG(3) << "Request::process end ns: " << getnsIfPresent() << " msg id: " << msgId
+           << " op: " << op << " attempt: " << attempt;
+}
 
-} // namespace mongo
+}  // namespace mongo

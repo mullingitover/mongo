@@ -28,73 +28,45 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
-
+#include "mongo/stdx/memory.h"
+#include "mongo/db/repl/replication_executor.h"
+#include "mongo/executor/task_executor_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 namespace executor {
-    class NetworkInterfaceMock;
-} // namespace executor
+class NetworkInterfaceMock;
+class TaskExecutor;
+}  // namespace executor
 
 namespace repl {
 
-    using std::unique_ptr;
+class ReplicationExecutor;
+class StorageInterfaceMock;
 
-    class ReplicationExecutor;
-    class StorageInterfaceMock;
+/**
+ * Test fixture for tests that require a ReplicationExecutor backed by
+ * a NetworkInterfaceMock.
+ */
+class ReplicationExecutorTest : public executor::TaskExecutorTest {
+protected:
+    ReplicationExecutor& getReplExecutor();
 
     /**
-     * Test fixture for tests that require a ReplicationExecutor backed by
-     * a NetworkInterfaceMock.
+     * Anything that needs to be done after launchExecutorThread should go in here.
      */
-    class ReplicationExecutorTest : public unittest::Test {
-    protected:
-        executor::NetworkInterfaceMock* getNet() { return _net; }
-        ReplicationExecutor& getExecutor() { return *_executor; }
-        /**
-         * Runs ReplicationExecutor in background.
-         */
-        void launchExecutorThread();
+    void postExecutorThreadLaunch() override;
 
-        /**
-         * Anything that needs to be done after launchExecutorThread should go in here.
-         */
-        virtual void postExecutorThreadLaunch();
+private:
+    std::unique_ptr<executor::TaskExecutor> makeTaskExecutor(
+        std::unique_ptr<executor::NetworkInterfaceMock> net) override;
 
-        /**
-         * Waits for background ReplicationExecutor to stop running.
-         *
-         * The executor should be shutdown prior to calling this function
-         * or the test may block indefinitely.
-         */
-        void joinExecutorThread();
+    StorageInterfaceMock* _storage{nullptr};
 
-        /**
-         * Initializes both the NetworkInterfaceMock and ReplicationExecutor but
-         * does not run the executor in the background.
-         *
-         * To run the executor in the background, tests should invoke launchExecutorThread() or
-         * override this function() to achieve the same effect.
-         */
-        virtual void setUp();
-
-        /**
-         * Destroys the replication executor.
-         *
-         * Shuts down running background executor.
-         */
-        virtual void tearDown();
-
-
-    private:
-        executor::NetworkInterfaceMock* _net;
-        StorageInterfaceMock* _storage;
-        unique_ptr<ReplicationExecutor> _executor;
-        unique_ptr<boost::thread> _executorThread;
-    };
+    std::unique_ptr<ReplicationExecutor> _executor;
+    bool _executorStarted{false};
+};
 
 }  // namespace repl
 }  // namespace mongo

@@ -33,36 +33,28 @@
 
 namespace mongo {
 
-    /**
-     * This stage just returns EOF immediately.
-     */
-    class EOFStage : public PlanStage {
-    public:
-        EOFStage();
+/**
+ * This stage just returns EOF immediately.
+ */
+class EOFStage final : public PlanStage {
+public:
+    EOFStage(OperationContext* opCtx);
 
-        virtual ~EOFStage();
+    ~EOFStage();
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    StageType stageType() const final {
+        return STAGE_EOF;
+    }
 
-        virtual StageType stageType() const { return STAGE_EOF; }
+    std::unique_ptr<PlanStageStats> getStats();
 
-        PlanStageStats* getStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual const CommonStats* getCommonStats() const;
-
-        virtual const SpecificStats* getSpecificStats() const;
-
-        static const char* kStageType;
-
-    private:
-        CommonStats _commonStats;
-    };
+    static const char* kStageType;
+};
 
 }  // namespace mongo

@@ -37,48 +37,36 @@
 
 namespace mongo {
 
-    bool WriteConflictException::trace = false;
+std::atomic<bool> WriteConflictException::trace(false);  // NOLINT
 
-    WriteConflictException::WriteConflictException()
-        : DBException( "WriteConflict", ErrorCodes::WriteConflict ) {
-
-        if ( trace ) {
-            printStackTrace();
-        }
-
+WriteConflictException::WriteConflictException()
+    : DBException("WriteConflict", ErrorCodes::WriteConflict) {
+    if (trace) {
+        printStackTrace();
     }
+}
 
-    void WriteConflictException::logAndBackoff(int attempt,
-                                               StringData operation,
-                                               StringData ns) {
+void WriteConflictException::logAndBackoff(int attempt, StringData operation, StringData ns) {
+    LOG(1) << "Caught WriteConflictException doing " << operation << " on " << ns
+           << ", attempt: " << attempt << " retrying";
 
-        LOG(1) << "Caught WriteConflictException doing " << operation
-               << " on " << ns
-               << ", attempt: " << attempt << " retrying";
-
-        // All numbers below chosen by guess and check against a few random benchmarks.
-        if (attempt < 4) {
-            // no-op
-        }
-        else if (attempt < 10) {
-            sleepmillis(1);
-        }
-        else if (attempt < 100) {
-            sleepmillis(5);
-        }
-        else {
-            sleepmillis(10);
-        }
-
+    // All numbers below chosen by guess and check against a few random benchmarks.
+    if (attempt < 4) {
+        // no-op
+    } else if (attempt < 10) {
+        sleepmillis(1);
+    } else if (attempt < 100) {
+        sleepmillis(5);
+    } else {
+        sleepmillis(10);
     }
+}
 
-    namespace {
-        // for WriteConflictException
-        ExportedServerParameter<bool> TraceWCExceptionsSetting(ServerParameterSet::getGlobal(),
-                                                               "traceWriteConflictExceptions",
-                                                               &WriteConflictException::trace,
-                                                               true, // allowedToChangeAtStartup
-                                                               true); // allowedToChangeAtRuntime
-    }
-
+namespace {
+// for WriteConflictException
+ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> TraceWCExceptionsSetting(
+    ServerParameterSet::getGlobal(),
+    "traceWriteConflictExceptions",
+    &WriteConflictException::trace);
+}
 }

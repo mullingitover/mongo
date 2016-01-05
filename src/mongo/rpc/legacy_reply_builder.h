@@ -30,36 +30,51 @@
 
 #include <memory>
 
-#include "mongo/base/status_with.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/rpc/document_range.h"
+#include "mongo/rpc/protocol.h"
 #include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 namespace rpc {
 
-    class LegacyReplyBuilder : public ReplyBuilderInterface {
-    public:
+class LegacyReplyBuilder : public ReplyBuilderInterface {
+public:
+    static const char kCursorTag[];
+    static const char kFirstBatchTag[];
 
-        LegacyReplyBuilder();
-        LegacyReplyBuilder(std::unique_ptr<Message>);
-        ~LegacyReplyBuilder() final;
+    LegacyReplyBuilder();
+    LegacyReplyBuilder(Message&&);
+    ~LegacyReplyBuilder() final;
 
-        LegacyReplyBuilder& setMetadata(BSONObj metadata) final;
-        LegacyReplyBuilder& setRawCommandReply(BSONObj commandReply) final;
+    // Override of setCommandReply specifically used to handle SendStaleConfigException.
+    LegacyReplyBuilder& setCommandReply(Status nonOKStatus, const BSONObj& extraErrorInfo) final;
+    LegacyReplyBuilder& setRawCommandReply(const BSONObj& commandReply) final;
 
-        LegacyReplyBuilder& addOutputDocs(DocumentRange outputDocs) final;
-        LegacyReplyBuilder& addOutputDoc(BSONObj outputDoc) final;
+    BufBuilder& getInPlaceReplyBuilder(std::size_t) final;
 
-        State getState() const final;
+    LegacyReplyBuilder& setMetadata(const BSONObj& metadata) final;
 
-        std::unique_ptr<Message> done() final;
+    Status addOutputDocs(DocumentRange outputDocs) final;
+    Status addOutputDoc(const BSONObj& outputDoc) final;
 
-    private:
-        BufBuilder _builder{};
-        std::unique_ptr<Message> _message;
-        State _state{State::kMetadata};
-    };
+    State getState() const final;
+
+    void reset() final;
+
+    Message done() final;
+
+    Protocol getProtocol() const final;
+
+private:
+    BufBuilder _builder{};
+    Message _message;
+    State _state{State::kCommandReply};
+    // For stale config errors we need to set the correct ResultFlag.
+    bool _staleConfigError{false};
+};
 
 }  // namespace rpc
 }  // namespace mongo

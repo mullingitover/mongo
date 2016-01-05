@@ -48,54 +48,60 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
-    Status dropCollection(OperationContext* txn,
-                          const NamespaceString& collectionName,
-                          BSONObjBuilder& result) {
-        if (!serverGlobalParams.quiet) {
-            log() << "CMD: drop " << collectionName;
+
+Status dropCollection(OperationContext* txn,
+                      const NamespaceString& collectionName,
+                      BSONObjBuilder& result) {
+    if (!serverGlobalParams.quiet) {
+        log() << "CMD: drop " << collectionName;
+    }
+
+    const std::string dbname = collectionName.db().toString();
+
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        ScopedTransaction transaction(txn, MODE_IX);
+
+        AutoGetDb autoDb(txn, dbname, MODE_X);
+        Database* const db = autoDb.getDb();
+        Collection* coll = db ? db->getCollection(collectionName) : nullptr;
+
+        // If db/collection does not exist, short circuit and return.
+        if (!db || !coll) {
+            return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
-        std::string dbname = collectionName.db().toString();
+        const bool shardVersionCheck = true;
+        OldClientContext context(txn, collectionName.ns(), shardVersionCheck);
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            ScopedTransaction transaction(txn, MODE_IX);
+        bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(collectionName);
 
-            AutoGetDb autoDb(txn, dbname, MODE_X);
-            Database* const db = autoDb.getDb();
-            Collection* coll = db ? db->getCollection(collectionName) : nullptr;
+        if (userInitiatedWritesAndNotPrimary) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while dropping collection "
+                                        << collectionName.ns());
+        }
 
-            // If db/collection does not exist, short circuit and return.
-            if ( !db || !coll ) {
-                return Status(ErrorCodes::NamespaceNotFound, "ns not found");
-            }
-            OldClientContext context(txn, collectionName);
+        int numIndexes = coll->getIndexCatalog()->numIndexesTotal(txn);
 
-            bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname);
+        BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
 
-            if (userInitiatedWritesAndNotPrimary) {
-                return Status(ErrorCodes::NotMaster,
-                              str::stream() << "Not primary while dropping collection "
-                                            << collectionName.ns());
-            }
+        WriteUnitOfWork wunit(txn);
+        Status s = db->dropCollection(txn, collectionName.ns());
 
-            int numIndexes = coll->getIndexCatalog()->numIndexesTotal(txn);
+        result.append("ns", collectionName.ns());
 
-            BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
+        if (!s.isOK()) {
+            return s;
+        }
 
-            WriteUnitOfWork wunit(txn);
-            Status s = db->dropCollection(txn, collectionName.ns());
+        result.append("nIndexesWas", numIndexes);
 
-            result.append("ns", collectionName);
-
-            if ( !s.isOK() ) {
-                return s;
-            }
-
-            result.append("nIndexesWas", numIndexes);
-
-            wunit.commit();
-        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "drop", collectionName.ns());
-        return Status::OK();
+        wunit.commit();
     }
-} // namespace mongo
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "drop", collectionName.ns());
+
+    return Status::OK();
+}
+
+}  // namespace mongo

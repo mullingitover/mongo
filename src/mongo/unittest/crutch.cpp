@@ -41,36 +41,38 @@
 
 namespace mongo {
 
-    bool inShutdown() {
-        return false;
-    }
+class Client;
 
-    class OperationContext;
+bool inShutdown() {
+    return false;
+}
 
-    DBClientBase* createDirectClient(OperationContext* txn) {
-        fassertFailed(17249);
-        return NULL;
-    }
+class OperationContext;
 
-    bool haveLocalShardingInfo(const std::string& ns) {
-        return false;
-    }
+DBClientBase* createDirectClient(OperationContext* txn) {
+    fassertFailed(17249);
+    return NULL;
+}
 
-    void dbexit(ExitCode rc, const char *why) {
-        invariant(!"unittests shouldn't call dbexit");
-    }
+bool haveLocalShardingInfo(Client* client, const std::string& ns) {
+    return false;
+}
 
-    void exitCleanly(ExitCode code) {
-        invariant(!"unittests shouldn't call exitCleanly");
-    }
+void dbexit(ExitCode rc, const char* why) {
+    invariant(!"unittests shouldn't call dbexit");
+}
+
+void exitCleanly(ExitCode code) {
+    invariant(!"unittests shouldn't call exitCleanly");
+}
 
 #ifdef _WIN32
-    void signalShutdown() {}
+void signalShutdown() {}
 
 namespace ntservice {
-    bool shouldStartService() {
-        return false;
-    }
+bool shouldStartService() {
+    return false;
+}
 }
 #endif
 

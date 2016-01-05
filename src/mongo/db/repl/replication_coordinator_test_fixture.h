@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/db/repl/repl_settings.h"
@@ -38,162 +37,197 @@
 
 namespace mongo {
 
-    class BSONObj;
-    struct HostAndPort;
+class BSONObj;
+struct HostAndPort;
 
 namespace executor {
-    class NetworkInterfaceMock;
-} // namespace executor
+class NetworkInterfaceMock;
+}  // namespace executor
 
 namespace repl {
 
-    class ReplicaSetConfig;
-    class ReplicationCoordinatorExternalStateMock;
-    class ReplicationCoordinatorImpl;
-    class StorageInterfaceMock;
-    class TopologyCoordinatorImpl;
+class ReplicaSetConfig;
+class ReplicationCoordinatorExternalStateMock;
+class ReplicationCoordinatorImpl;
+class StorageInterfaceMock;
+class TopologyCoordinatorImpl;
+
+/**
+ * Fixture for testing ReplicationCoordinatorImpl behaviors.
+ */
+class ReplCoordTest : public mongo::unittest::Test {
+public:
+    /**
+     * Makes a ResponseStatus with the given "doc" response and optional elapsed time "millis".
+     */
+    static ResponseStatus makeResponseStatus(const BSONObj& doc,
+                                             Milliseconds millis = Milliseconds(0));
 
     /**
-     * Fixture for testing ReplicationCoordinatorImpl behaviors.
+     * Makes a ResponseStatus with the given "doc" response, metadata and optional elapsed time
+     * "millis".
      */
-    class ReplCoordTest : public mongo::unittest::Test {
-    public:
-        /**
-         * Makes a ResponseStatus with the given "doc" response and optional elapsed time "millis".
-         */
-        static ResponseStatus makeResponseStatus(const BSONObj& doc,
-                                                           Milliseconds millis = Milliseconds(0));
+    static ResponseStatus makeResponseStatus(const BSONObj& doc,
+                                             const BSONObj& metadata,
+                                             Milliseconds millis = Milliseconds(0));
 
-        /**
-         * Constructs a ReplicaSetConfig from the given BSON, or raises a test failure exception.
-         */
-        static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
+    /**
+     * Constructs a ReplicaSetConfig from the given BSON, or raises a test failure exception.
+     */
+    static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
+    static ReplicaSetConfig assertMakeRSConfigV0(const BSONObj& configBson);
 
-        ReplCoordTest();
-        virtual ~ReplCoordTest();
+    /**
+     * Adds { protocolVersion: 0 or 1 } to the config.
+     */
+    static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
 
-    protected:
-        virtual void setUp();
-        virtual void tearDown();
+protected:
+    virtual void setUp();
+    virtual void tearDown();
 
-        /**
-         * Gets the network mock.
-         */
-        executor::NetworkInterfaceMock* getNet() { return _net; }
+    /**
+     * Asserts that calling start(configDoc, selfHost) successfully initiates the
+     * ReplicationCoordinator under test.
+     */
+    virtual void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost);
 
-        /**
-         * Gets the replication coordinator under test.
-         */
-        ReplicationCoordinatorImpl* getReplCoord() { return _repl.get();}
+    /**
+     * Gets the network mock.
+     */
+    executor::NetworkInterfaceMock* getNet() {
+        return _net;
+    }
 
-        /**
-         * Gets the topology coordinator used by the replication coordinator under test.
-         */
-        TopologyCoordinatorImpl& getTopoCoord() { return *_topo;}
+    /**
+     * Gets the replication executor under test.
+     */
+    ReplicationExecutor* getReplExec() {
+        return _replExec.get();
+    }
 
-        /**
-         * Gets the external state used by the replication coordinator under test.
-         */
-        ReplicationCoordinatorExternalStateMock* getExternalState() { return _externalState; }
+    /**
+     * Gets the replication coordinator under test.
+     */
+    ReplicationCoordinatorImpl* getReplCoord() {
+        return _repl.get();
+    }
 
-        /**
-         * Adds "selfHost" to the list of hosts that identify as "this" host.
-         */
-        void addSelf(const HostAndPort& selfHost);
+    /**
+     * Gets the topology coordinator used by the replication coordinator under test.
+     */
+    TopologyCoordinatorImpl& getTopoCoord() {
+        return *_topo;
+    }
 
-        /**
-         * Moves time forward in the network until the new time, and asserts if now!=newTime after
-         */
-        void assertRunUntil(Date_t newTime);
+    /**
+     * Gets the external state used by the replication coordinator under test.
+     */
+    ReplicationCoordinatorExternalStateMock* getExternalState() {
+        return _externalState;
+    }
 
-        /**
-         * Shorthand for getNet()->enterNetwork()
-         */
-        void enterNetwork();
+    /**
+     * Adds "selfHost" to the list of hosts that identify as "this" host.
+     */
+    void addSelf(const HostAndPort& selfHost);
 
-        /**
-         * Shorthand for getNet()->exitNetwork()
-         */
-        void exitNetwork();
+    /**
+     * Moves time forward in the network until the new time, and asserts if now!=newTime after
+     */
+    void assertRunUntil(Date_t newTime);
 
-        /**
-         * Initializes the objects under test; this behavior is optional, in case you need to call
-         * any methods on the network or coordinator objects before calling start.
-         */
-        void init();
+    /**
+     * Shorthand for getNet()->enterNetwork()
+     */
+    void enterNetwork();
 
-        /**
-         * Initializes the objects under test, using the given "settings".
-         */
-        void init(const ReplSettings& settings);
+    /**
+     * Shorthand for getNet()->exitNetwork()
+     */
+    void exitNetwork();
 
-        /**
-         * Initializes the objects under test, using "replSet" as the name of the replica set under
-         * test.
-         */
-        void init(const std::string& replSet);
+    /**
+     * Initializes the objects under test; this behavior is optional, in case you need to call
+     * any methods on the network or coordinator objects before calling start.
+     */
+    void init();
 
-        /**
-         * Starts the replication coordinator under test, with no local config document and
-         * no notion of what host or hosts are represented by the network interface.
-         */
-        void start();
+    /**
+     * Initializes the objects under test, using the given "settings".
+     */
+    void init(const ReplSettings& settings);
 
-        /**
-         * Starts the replication coordinator under test, with the given configuration in
-         * local storage and the given host name.
-         */
-        void start(const BSONObj& configDoc, const HostAndPort& selfHost);
+    /**
+     * Initializes the objects under test, using "replSet" as the name of the replica set under
+     * test.
+     */
+    void init(const std::string& replSet);
 
-        /**
-         * Starts the replication coordinator under test with the given host name.
-         */
-        void start(const HostAndPort& selfHost);
+    /**
+     * Starts the replication coordinator under test, with no local config document and
+     * no notion of what host or hosts are represented by the network interface.
+     */
+    void start();
 
-        /**
-         * Brings the repl coord from SECONDARY to PRIMARY by simulating the messages required to
-         * elect it.
-         *
-         * Behavior is unspecified if node does not have a clean config, is not in SECONDARY, etc.
-         */
-        void simulateSuccessfulElection();
-        void simulateSuccessfulV1Election();
+    /**
+     * Starts the replication coordinator under test, with the given configuration in
+     * local storage and the given host name.
+     */
+    void start(const BSONObj& configDoc, const HostAndPort& selfHost);
 
-        /**
-         * Brings the repl coord from PRIMARY to SECONDARY by simulating a period of time in which
-         * all heartbeats respond with an error condition, such as time out.
-         */
-        void simulateStepDownOnIsolation();
+    /**
+     * Starts the replication coordinator under test with the given host name.
+     */
+    void start(const HostAndPort& selfHost);
 
-        /**
-         * Asserts that calling start(configDoc, selfHost) successfully initiates the
-         * ReplicationCoordinator under test.
-         */
-        void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost);
+    /**
+     * Brings the TopologyCoordinator from follower to candidate by simulating a period of time in
+     * which the election timer expires and starts a dry run election.
+     * Returns after dry run is completed but before actual election starts.
+     * If 'onDryRunRequest' is provided, this function is invoked with the
+     * replSetRequestVotes network request before simulateSuccessfulDryRun() simulates
+     * a successful dry run vote response.
+     * Applicable to protocol version 1 only.
+     */
+    void simulateSuccessfulDryRun(
+        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+    void simulateSuccessfulDryRun();
 
-        /**
-         * Shuts down the objects under test.
-         */
-        void shutdown();
+    /**
+     * Brings the repl coord from SECONDARY to PRIMARY by simulating the messages required to
+     * elect it.
+     *
+     * Behavior is unspecified if node does not have a clean config, is not in SECONDARY, etc.
+     */
+    void simulateSuccessfulElection();
+    void simulateSuccessfulV1Election();
 
-        /**
-         * Returns the number of collected log lines containing "needle".
-         */
-        int64_t countLogLinesContaining(const std::string& needle);
+    /**
+     * Shuts down the objects under test.
+     */
+    void shutdown();
 
-    private:
-        boost::scoped_ptr<ReplicationCoordinatorImpl> _repl;
-        // Owned by ReplicationCoordinatorImpl
-        TopologyCoordinatorImpl* _topo;
-        // Owned by ReplicationCoordinatorImpl
-        executor::NetworkInterfaceMock* _net;
-        // Owned by ReplicationCoordinatorImpl
-        StorageInterfaceMock* _storage;
-        // Owned by ReplicationCoordinatorImpl
-        ReplicationCoordinatorExternalStateMock* _externalState;
-        ReplSettings _settings;
-        bool _callShutdown;
-    };
+    /**
+     * Receive the heartbeat request from replication coordinator and reply with a response.
+     */
+    void replyToReceivedHeartbeat();
+    void replyToReceivedHeartbeatV1();
+
+private:
+    std::unique_ptr<ReplicationCoordinatorImpl> _repl;
+    // Owned by ReplicationCoordinatorImpl
+    TopologyCoordinatorImpl* _topo = nullptr;
+    // Owned by ReplicationExecutor
+    executor::NetworkInterfaceMock* _net = nullptr;
+    // Owned by ReplicationExecutor
+    StorageInterfaceMock* _storage = nullptr;
+    std::unique_ptr<ReplicationExecutor> _replExec;
+    // Owned by ReplicationCoordinatorImpl
+    ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
+    ReplSettings _settings;
+    bool _callShutdown = false;
+};
 
 }  // namespace repl
 }  // namespace mongo

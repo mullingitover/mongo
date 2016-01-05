@@ -33,18 +33,7 @@ __txn_op_log(WT_SESSION_IMPL *session,
 	 * 3) row store remove; or
 	 * 4) row store insert/update.
 	 */
-	if (cbt->btree->type != BTREE_ROW) {
-		WT_ASSERT(session, cbt->ins != NULL);
-		recno = WT_INSERT_RECNO(cbt->ins);
-		WT_ASSERT(session, recno != 0);
-
-		if (WT_UPDATE_DELETED_ISSET(upd))
-			WT_ERR(__wt_logop_col_remove_pack(session, logrec,
-			    op->fileid, recno));
-		else
-			WT_ERR(__wt_logop_col_put_pack(session, logrec,
-			    op->fileid, recno, &value));
-	} else {
+	if (cbt->btree->type == BTREE_ROW) {
 		WT_ERR(__wt_cursor_row_leaf_key(cbt, &key));
 
 		if (WT_UPDATE_DELETED_ISSET(upd))
@@ -53,6 +42,16 @@ __txn_op_log(WT_SESSION_IMPL *session,
 		else
 			WT_ERR(__wt_logop_row_put_pack(session, logrec,
 			    op->fileid, &key, &value));
+	} else {
+		recno = WT_INSERT_RECNO(cbt->ins);
+		WT_ASSERT(session, recno != WT_RECNO_OOB);
+
+		if (WT_UPDATE_DELETED_ISSET(upd))
+			WT_ERR(__wt_logop_col_remove_pack(session, logrec,
+			    op->fileid, recno));
+		else
+			WT_ERR(__wt_logop_col_put_pack(session, logrec,
+			    op->fileid, recno, &value));
 	}
 
 err:	__wt_buf_free(session, &key);
@@ -67,9 +66,9 @@ static int
 __txn_commit_printlog(
     WT_SESSION_IMPL *session, const uint8_t **pp, const uint8_t *end, FILE *out)
 {
-	int firstrecord;
+	bool firstrecord;
 
-	firstrecord = 1;
+	firstrecord = true;
 	WT_RET(__wt_fprintf(out, "    \"ops\": [\n"));
 
 	/* The logging subsystem zero-pads records. */
@@ -78,7 +77,7 @@ __txn_commit_printlog(
 			WT_RET(__wt_fprintf(out, ",\n"));
 		WT_RET(__wt_fprintf(out, "      {"));
 
-		firstrecord = 0;
+		firstrecord = false;
 
 		WT_RET(__wt_txn_op_printlog(session, pp, end, out));
 		WT_RET(__wt_fprintf(out, "\n      }"));
@@ -158,7 +157,8 @@ __wt_txn_log_op(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
 	txn = &session->txn;
 
 	if (!FLD_ISSET(S2C(session)->log_flags, WT_CONN_LOG_ENABLED) ||
-	    F_ISSET(session, WT_SESSION_NO_LOGGING))
+	    F_ISSET(session, WT_SESSION_NO_LOGGING) ||
+	    F_ISSET(S2BT(session), WT_BTREE_NO_LOGGING))
 		return (0);
 
 	/* We'd better have a transaction. */
@@ -204,6 +204,11 @@ __wt_txn_log_commit(WT_SESSION_IMPL *session, const char *cfg[])
 
 	WT_UNUSED(cfg);
 	txn = &session->txn;
+	/*
+	 * If there are no log records there is nothing to do.
+	 */
+	if (txn->logrec == NULL)
+		return (0);
 
 	/* Write updates to the log. */
 	return (__wt_log_write(session, txn->logrec, NULL, txn->txn_logsync));
@@ -221,7 +226,8 @@ __txn_log_file_sync(WT_SESSION_IMPL *session, uint32_t flags, WT_LSN *lsnp)
 	WT_DECL_RET;
 	size_t header_size;
 	uint32_t rectype = WT_LOGREC_FILE_SYNC;
-	int start, need_sync;
+	int start;
+	bool need_sync;
 	const char *fmt = WT_UNCHECKED_STRING(III);
 
 	btree = S2BT(session);
@@ -271,7 +277,7 @@ __wt_txn_checkpoint_logread(
  */
 int
 __wt_txn_checkpoint_log(
-    WT_SESSION_IMPL *session, int full, uint32_t flags, WT_LSN *lsnp)
+    WT_SESSION_IMPL *session, bool full, uint32_t flags, WT_LSN *lsnp)
 {
 	WT_DECL_ITEM(logrec);
 	WT_DECL_RET;
@@ -295,14 +301,14 @@ __wt_txn_checkpoint_log(
 			if (lsnp != NULL)
 				*lsnp = *ckpt_lsn;
 			return (0);
-		} else
-			return (__txn_log_file_sync(session, flags, lsnp));
+		}
+		return (__txn_log_file_sync(session, flags, lsnp));
 	}
 
 	switch (flags) {
 	case WT_TXN_LOG_CKPT_PREPARE:
-		txn->full_ckpt = 1;
-		*ckpt_lsn = S2C(session)->log->write_start_lsn;
+		txn->full_ckpt = true;
+		WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		/*
 		 * We need to make sure that the log records in the checkpoint
 		 * LSN are on disk.  In particular to make sure that the
@@ -310,7 +316,6 @@ __wt_txn_checkpoint_log(
 		 */
 		WT_ERR(__wt_log_force_sync(session, ckpt_lsn));
 		break;
-
 	case WT_TXN_LOG_CKPT_START:
 		/* Take a copy of the transaction snapshot. */
 		txn->ckpt_nsnapshot = txn->snapshot_count;
@@ -322,7 +327,6 @@ __wt_txn_checkpoint_log(
 			WT_ERR(__wt_vpack_uint(
 			    &p, WT_PTRDIFF(end, p), txn->snapshot[i]));
 		break;
-
 	case WT_TXN_LOG_CKPT_STOP:
 		/*
 		 * During a clean connection close, we get here without the
@@ -333,7 +337,7 @@ __wt_txn_checkpoint_log(
 			txn->ckpt_nsnapshot = 0;
 			WT_CLEAR(empty);
 			ckpt_snapshot = &empty;
-			*ckpt_lsn = S2C(session)->log->write_start_lsn;
+			WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		} else
 			ckpt_snapshot = txn->ckpt_snapshot;
 
@@ -355,9 +359,13 @@ __wt_txn_checkpoint_log(
 		/*
 		 * If this full checkpoint completed successfully and there is
 		 * no hot backup in progress, tell the logging subsystem the
-		 * checkpoint LSN so that it can archive.
+		 * checkpoint LSN so that it can archive.  Do not update the
+		 * logging checkpoint LSN if this is during a clean connection
+		 * close, only during a full checkpoint.  A clean close may not
+		 * update any metadata LSN and we do not want to archive in
+		 * that case.
 		 */
-		if (!S2C(session)->hot_backup)
+		if (!S2C(session)->hot_backup && txn->full_ckpt)
 			WT_ERR(__wt_log_ckpt(session, ckpt_lsn));
 
 		/* FALLTHROUGH */
@@ -366,9 +374,8 @@ __wt_txn_checkpoint_log(
 		WT_INIT_LSN(ckpt_lsn);
 		txn->ckpt_nsnapshot = 0;
 		__wt_scr_free(session, &txn->ckpt_snapshot);
-		txn->full_ckpt = 0;
+		txn->full_ckpt = false;
 		break;
-
 	WT_ILLEGAL_VALUE_ERR(session);
 	}
 
@@ -416,9 +423,9 @@ __wt_txn_truncate_log(
 	} else {
 		op->type = WT_TXN_OP_TRUNCATE_COL;
 		op->u.truncate_col.start =
-		    (start == NULL) ? 0 : start->recno;
+		    (start == NULL) ? WT_RECNO_OOB : start->recno;
 		op->u.truncate_col.stop =
-		    (stop == NULL) ? 0 : stop->recno;
+		    (stop == NULL) ? WT_RECNO_OOB : stop->recno;
 	}
 
 	/* Write that operation into the in-memory log. */
@@ -452,12 +459,12 @@ __txn_printlog(WT_SESSION_IMPL *session,
 	FILE *out;
 	WT_LOG_RECORD *logrec;
 	WT_LSN ckpt_lsn;
-	int compressed;
+	const uint8_t *end, *p;
+	const char *msg;
 	uint64_t txnid;
 	uint32_t fileid, rectype;
 	int32_t start;
-	const uint8_t *end, *p;
-	const char *msg;
+	bool compressed;
 
 	WT_UNUSED(next_lsnp);
 	out = cookie;

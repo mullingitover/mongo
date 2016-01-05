@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/index/index_access_method.h"
@@ -40,75 +39,70 @@
 
 namespace mongo {
 
-    class IndexAccessMethod;
-    class IndexDescriptor;
-    class WorkingSet;
+class IndexAccessMethod;
+class IndexDescriptor;
+class WorkingSet;
 
-    struct CountScanParams {
-        CountScanParams() : descriptor(NULL) { }
+struct CountScanParams {
+    CountScanParams() : descriptor(NULL) {}
 
-        // What index are we traversing?
-        const IndexDescriptor* descriptor;
+    // What index are we traversing?
+    const IndexDescriptor* descriptor;
 
-        BSONObj startKey;
-        bool startKeyInclusive;
+    BSONObj startKey;
+    bool startKeyInclusive;
 
-        BSONObj endKey;
-        bool endKeyInclusive;
-    };
+    BSONObj endKey;
+    bool endKeyInclusive;
+};
 
-    /**
-     * Used by the count command.  Scans an index from a start key to an end key.  Does not create
-     * any WorkingSetMember(s) for any of the data, instead returning ADVANCED to indicate to the
-     * caller that another result should be counted.
-     *
-     * Only created through the getExecutorCount path, as count is the only operation that doesn't
-     * care about its data.
-     */
-    class CountScan : public PlanStage {
-    public:
-        CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet);
-        virtual ~CountScan() { }
+/**
+ * Used by the count command.  Scans an index from a start key to an end key.  Does not create
+ * any WorkingSetMember(s) for any of the data, instead returning ADVANCED to indicate to the
+ * caller that another result should be counted.
+ *
+ * Only created through the getExecutorCount path, as count is the only operation that doesn't
+ * care about its data.
+ */
+class CountScan final : public PlanStage {
+public:
+    CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet);
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    StageState work(WorkingSetID* out) final;
+    bool isEOF() final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    StageType stageType() const final {
+        return STAGE_COUNT_SCAN;
+    }
 
-        virtual StageType stageType() const { return STAGE_COUNT_SCAN; }
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual PlanStageStats* getStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual const CommonStats* getCommonStats() const;
+    static const char* kStageType;
 
-        virtual const SpecificStats* getSpecificStats() const;
+private:
+    // The WorkingSet we annotate with results.  Not owned by us.
+    WorkingSet* _workingSet;
 
-        static const char* kStageType;
+    // Index access.  Both pointers below are owned by Collection -> IndexCatalog.
+    const IndexDescriptor* _descriptor;
+    const IndexAccessMethod* _iam;
 
-    private:
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
-        // The WorkingSet we annotate with results.  Not owned by us.
-        WorkingSet* _workingSet;
+    // Could our index have duplicates?  If so, we use _returned to dedup.
+    bool _shouldDedup;
+    unordered_set<RecordId, RecordId::Hasher> _returned;
 
-        // Index access.  Both pointers below are owned by Collection -> IndexCatalog.
-        const IndexDescriptor* _descriptor;
-        const IndexAccessMethod* _iam;
+    CountScanParams _params;
 
-        std::unique_ptr<SortedDataInterface::Cursor> _cursor;
-
-        // Could our index have duplicates?  If so, we use _returned to dedup.
-        bool _shouldDedup;
-        unordered_set<RecordId, RecordId::Hasher> _returned;
-
-        CountScanParams _params;
-
-        CommonStats _commonStats;
-        CountScanStats _specificStats;
-    };
+    CountScanStats _specificStats;
+};
 
 }  // namespace mongo

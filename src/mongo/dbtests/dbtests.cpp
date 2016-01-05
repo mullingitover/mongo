@@ -41,6 +41,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/service_context_d.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/framework.h"
@@ -48,67 +49,73 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/startup_test.h"
+#include "mongo/util/static_observer.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
 namespace dbtests {
-    // This specifies default dbpath for our testing framework
-    const std::string default_test_dbpath = "/tmp/unittest";
+// This specifies default dbpath for our testing framework
+const std::string default_test_dbpath = "/tmp/unittest";
 
-    Status createIndex(OperationContext* txn,
-                       StringData ns,
-                       const BSONObj& keys,
-                       bool unique) {
-        BSONObjBuilder specBuilder;
-        specBuilder <<
-            "name" << DBClientBase::genIndexName(keys) <<
-            "ns" << ns <<
-            "key" << keys;
-        if (unique) {
-            specBuilder << "unique" << true;
-        }
-        return createIndexFromSpec(txn, ns, specBuilder.done());
+void initWireSpec() {
+    WireSpec& spec = WireSpec::instance();
+    // accept from any version
+    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
+    spec.maxWireVersionIncoming = FIND_COMMAND;
+    // connect to any version
+    spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
+    spec.maxWireVersionOutgoing = FIND_COMMAND;
+}
+
+Status createIndex(OperationContext* txn, StringData ns, const BSONObj& keys, bool unique) {
+    BSONObjBuilder specBuilder;
+    specBuilder << "name" << DBClientBase::genIndexName(keys) << "ns" << ns << "key" << keys;
+    if (unique) {
+        specBuilder << "unique" << true;
     }
+    return createIndexFromSpec(txn, ns, specBuilder.done());
+}
 
-    Status createIndexFromSpec(OperationContext* txn, StringData ns, const BSONObj& spec) {
-        AutoGetOrCreateDb autoDb(txn, nsToDatabaseSubstring(ns), MODE_X);
-        Collection* coll;
-        {
-            WriteUnitOfWork wunit(txn);
-            coll = autoDb.getDb()->getOrCreateCollection(txn, ns);
-            invariant(coll);
-            wunit.commit();
-        }
-        MultiIndexBlock indexer(txn, coll);
-        Status status = indexer.init(spec);
-        if (status == ErrorCodes::IndexAlreadyExists) {
-            return Status::OK();
-        }
-        if (!status.isOK()) {
-            return status;
-        }
-        status = indexer.insertAllDocumentsInCollection();
-        if (!status.isOK()) {
-            return status;
-        }
+Status createIndexFromSpec(OperationContext* txn, StringData ns, const BSONObj& spec) {
+    AutoGetOrCreateDb autoDb(txn, nsToDatabaseSubstring(ns), MODE_X);
+    Collection* coll;
+    {
         WriteUnitOfWork wunit(txn);
-        indexer.commit();
+        coll = autoDb.getDb()->getOrCreateCollection(txn, ns);
+        invariant(coll);
         wunit.commit();
+    }
+    MultiIndexBlock indexer(txn, coll);
+    Status status = indexer.init(spec);
+    if (status == ErrorCodes::IndexAlreadyExists) {
         return Status::OK();
     }
+    if (!status.isOK()) {
+        return status;
+    }
+    status = indexer.insertAllDocumentsInCollection();
+    if (!status.isOK()) {
+        return status;
+    }
+    WriteUnitOfWork wunit(txn);
+    indexer.commit();
+    wunit.commit();
+    return Status::OK();
+}
 
 }  // namespace dbtests
-} // namespace mongo
+}  // namespace mongo
 
 
-int dbtestsMain( int argc, char** argv, char** envp ) {
+int dbtestsMain(int argc, char** argv, char** envp) {
     static StaticObserver StaticObserver;
+    Command::testCommandsEnabled = true;
     ::mongo::setupSynchronousSignalHandlers();
-    repl::ReplSettings replSettings;
-    replSettings.oplogSize = 10 * 1024 * 1024;
-    repl::setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
-    Command::testCommandsEnabled = 1;
+    mongo::dbtests::initWireSpec();
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    repl::ReplSettings replSettings;
+    replSettings.setOplogSizeBytes(10 * 1024 * 1024);
+    repl::setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
     getGlobalAuthorizationManager()->setAuthEnabled(false);
     StartupTest::runTests();
     return mongo::dbtests::runDbTests(argc, argv);

@@ -22,6 +22,7 @@ function test(db, sharded, indexType) {
         assert.eq(config.chunks.count({'ns': shardedDB[coll].getFullName()}), 10);
     }
 
+    Random.setRandomSeed();
     var numPts = 10*1000;
     for (var i=0; i < numPts; i++) {
         var lat = 90 - Random.rand() * 180;
@@ -37,7 +38,7 @@ function test(db, sharded, indexType) {
     assert.commandWorked(db.runCommand(geoCmd), tojson({sharded: sharded, indexType: indexType}));
 }
 
-var sharded = new ShardingTest({shards: 3, verbose: 0, mongos: 1});
+var sharded = new ShardingTest({ shards: 3, mongos: 1 });
 sharded.stopBalancer();
 sharded.adminCommand( { enablesharding : "test" } );
 var shardedDB = sharded.getDB('test');

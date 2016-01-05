@@ -36,12 +36,12 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/sync_tail.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 
 namespace mongo {
 namespace repl {
-    // Body of the thread that will do the background sync.
-    void runSyncThread();
+// Body of the thread that will do the background sync.
+void runSyncThread();
 
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

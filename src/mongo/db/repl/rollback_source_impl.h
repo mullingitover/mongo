@@ -32,43 +32,49 @@
 
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/rollback_source.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
-    class DBClientConnection;
+class DBClientBase;
 
 namespace repl {
 
+/**
+ * Rollback source implementation using a connection.
+ */
+
+class RollbackSourceImpl : public RollbackSource {
+public:
     /**
-     * Rollback source implementation using a connection.
+     * Type of function to return a connection to the sync source.
      */
+    using GetConnectionFn = stdx::function<DBClientBase*()>;
 
-    class RollbackSourceImpl : public RollbackSource {
-    public:
+    RollbackSourceImpl(GetConnectionFn getConnection,
+                       const HostAndPort& source,
+                       const std::string& collectionName);
 
-        explicit RollbackSourceImpl(DBClientConnection* conn, const std::string& collectionName);
+    const OplogInterface& getOplog() const override;
 
-        const OplogInterface& getOplog() const override;
+    int getRollbackId() const override;
 
-        int getRollbackId() const override;
+    BSONObj getLastOperation() const override;
 
-        BSONObj getLastOperation() const override;
+    BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-        BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
+    void copyCollectionFromRemote(OperationContext* txn, const NamespaceString& nss) const override;
 
-        void copyCollectionFromRemote(OperationContext* txn,
-                                      const NamespaceString& nss) const override;
+    StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 
-        StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
-
-    private:
-
-        DBClientConnection* _conn;
-        std::string _collectionName;
-        OplogInterfaceRemote _oplog;
-
-    };
+private:
+    GetConnectionFn _getConnection;
+    HostAndPort _source;
+    std::string _collectionName;
+    OplogInterfaceRemote _oplog;
+};
 
 
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

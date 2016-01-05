@@ -33,8 +33,6 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 
-#include "boost/scoped_ptr.hpp"
-
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -47,41 +45,38 @@
 
 namespace mongo {
 
-    using std::string;
+using std::string;
 
-    WiredTigerServerStatusSection::WiredTigerServerStatusSection(WiredTigerKVEngine* engine)
-        : ServerStatusSection(kWiredTigerEngineName),
-          _engine(engine) { }
+WiredTigerServerStatusSection::WiredTigerServerStatusSection(WiredTigerKVEngine* engine)
+    : ServerStatusSection(kWiredTigerEngineName), _engine(engine) {}
 
-    bool WiredTigerServerStatusSection::includeByDefault() const {
-        return true;
+bool WiredTigerServerStatusSection::includeByDefault() const {
+    return true;
+}
+
+BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* txn,
+                                                       const BSONElement& configElement) const {
+    // The session does not open a transaction here as one is not needed and opening one would
+    // mean that execution could become blocked when a new transaction cannot be allocated
+    // immediately.
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(txn)->getSessionNoTxn(txn);
+    invariant(session);
+
+    WT_SESSION* s = session->getSession();
+    invariant(s);
+    const string uri = "statistics:";
+
+    BSONObjBuilder bob;
+    Status status = WiredTigerUtil::exportTableToBSON(s, uri, "statistics=(fast)", &bob);
+    if (!status.isOK()) {
+        bob.append("error", "unable to retrieve statistics");
+        bob.append("code", static_cast<int>(status.code()));
+        bob.append("reason", status.reason());
     }
 
-    BSONObj WiredTigerServerStatusSection::generateSection(
-                OperationContext* txn,
-                const BSONElement& configElement) const {
+    WiredTigerRecoveryUnit::appendGlobalStats(bob);
 
-        WiredTigerSession* session =
-            checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit())->getSession(txn);
-        invariant(session);
-
-        WT_SESSION* s = session->getSession();
-        invariant(s);
-        const string uri = "statistics:";
-
-        BSONObjBuilder bob;
-        Status status = WiredTigerUtil::exportTableToBSON(s, uri,
-                                                          "statistics=(fast)", &bob);
-        if (!status.isOK()) {
-            bob.append("error", "unable to retrieve statistics");
-            bob.append("code", static_cast<int>(status.code()));
-            bob.append("reason", status.reason());
-        }
-
-        WiredTigerRecoveryUnit::appendGlobalStats(bob);
-
-        return bob.obj();
-    }
+    return bob.obj();
+}
 
 }  // namespace mongo
-

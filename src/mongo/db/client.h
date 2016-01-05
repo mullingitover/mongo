@@ -36,122 +36,155 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
-
 #include "mongo/db/client_basic.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/random.h"
 #include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/threadlocal.h"
 
 namespace mongo {
 
-    class Collection;
-    class AbstractMessagingPort;
+class Collection;
+class AbstractMessagingPort;
 
-    typedef long long ConnectionId;
+typedef long long ConnectionId;
 
-    /** the database's concept of an outside "client" */
-    class Client : public ClientBasic {
-    public:
-        /** each thread which does db operations has a Client object in TLS.
-         *  call this when your thread starts.
-        */
-        static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
-        static void initThread(const char* desc,
-                               ServiceContext* serviceContext,
-                               AbstractMessagingPort* mp);
+/** the database's concept of an outside "client" */
+class Client : public ClientBasic {
+public:
+    /**
+     * Creates a Client object and stores it in TLS for the current thread.
+     *
+     * An unowned pointer to a AbstractMessagingPort may optionally be provided. If 'mp' is
+     * non-null, then it will be used to augment the thread name, and for reporting purposes.
+     *
+     * If provided, 'mp' must outlive the newly-created Client object. Client::destroy() may be used
+     * to help enforce that the Client does not outlive 'mp'.
+     */
+    static void initThread(const char* desc, AbstractMessagingPort* mp = 0);
+    static void initThread(const char* desc,
+                           ServiceContext* serviceContext,
+                           AbstractMessagingPort* mp);
 
-        /**
-         * Inits a thread if that thread has not already been init'd, setting the thread name to
-         * "desc".
-         */
-        static void initThreadIfNotAlready(const char* desc);
+    /**
+     * Inits a thread if that thread has not already been init'd, setting the thread name to
+     * "desc".
+     */
+    static void initThreadIfNotAlready(const char* desc);
 
-        /**
-         * Inits a thread if that thread has not already been init'd, using the existing thread name
-         */
-        static void initThreadIfNotAlready();
+    /**
+     * Inits a thread if that thread has not already been init'd, using the existing thread name
+     */
+    static void initThreadIfNotAlready();
 
-        std::string clientAddress(bool includePort = false) const;
-        const std::string& desc() const { return _desc; }
+    /**
+     * Destroys the Client object stored in TLS for the current thread. The current thread must have
+     * a Client.
+     *
+     * If destroy() is not called explicitly, then the Client stored in TLS will be destroyed upon
+     * exit of the current thread.
+     */
+    static void destroy();
 
-        void reportState(BSONObjBuilder& builder);
+    std::string clientAddress(bool includePort = false) const;
+    const std::string& desc() const {
+        return _desc;
+    }
 
-        // Ensures stability of the client's OperationContext. When the client is locked,
-        // the OperationContext will not disappear.
-        void lock() { _lock.lock(); }
-        void unlock() { _lock.unlock(); }
+    void reportState(BSONObjBuilder& builder);
 
-        /**
-         * Makes a new operation context representing an operation on this client.  At most
-         * one operation context may be in scope on a client at a time.
-         */
-        ServiceContext::UniqueOperationContext makeOperationContext();
+    // Ensures stability of the client's OperationContext. When the client is locked,
+    // the OperationContext will not disappear.
+    void lock() {
+        _lock.lock();
+    }
+    void unlock() {
+        _lock.unlock();
+    }
 
-        /**
-         * Sets the active operation context on this client to "txn", which must be non-NULL.
-         *
-         * It is an error to call this method if there is already an operation context on Client.
-         * It is an error to call this on an unlocked client.
-         */
-        void setOperationContext(OperationContext* txn);
+    /**
+     * Makes a new operation context representing an operation on this client.  At most
+     * one operation context may be in scope on a client at a time.
+     */
+    ServiceContext::UniqueOperationContext makeOperationContext();
 
-        /**
-         * Clears the active operation context on this client.
-         *
-         * There must already be such a context set on this client.
-         * It is an error to call this on an unlocked client.
-         */
-        void resetOperationContext();
+    /**
+     * Sets the active operation context on this client to "txn", which must be non-NULL.
+     *
+     * It is an error to call this method if there is already an operation context on Client.
+     * It is an error to call this on an unlocked client.
+     */
+    void setOperationContext(OperationContext* txn);
 
-        /**
-         * Gets the operation context active on this client, or nullptr if there is no such context.
-         *
-         * It is an error to call this method on an unlocked client, or to use the value returned
-         * by this method while the client is not locked.
-         */
-        OperationContext* getOperationContext() { return _txn; }
+    /**
+     * Clears the active operation context on this client.
+     *
+     * There must already be such a context set on this client.
+     * It is an error to call this on an unlocked client.
+     */
+    void resetOperationContext();
 
-        // TODO(spencer): SERVER-10228 SERVER-14779 Remove this/move it fully into OperationContext.
-        bool isInDirectClient() const { return _inDirectClient; }
-        void setInDirectClient(bool newVal) { _inDirectClient = newVal; }
+    /**
+     * Gets the operation context active on this client, or nullptr if there is no such context.
+     *
+     * It is an error to call this method on an unlocked client, or to use the value returned
+     * by this method while the client is not locked.
+     */
+    OperationContext* getOperationContext() {
+        return _txn;
+    }
 
-        ConnectionId getConnectionId() const { return _connectionId; }
-        bool isFromUserConnection() const { return _connectionId > 0; }
+    // TODO(spencer): SERVER-10228 SERVER-14779 Remove this/move it fully into OperationContext.
+    bool isInDirectClient() const {
+        return _inDirectClient;
+    }
+    void setInDirectClient(bool newVal) {
+        _inDirectClient = newVal;
+    }
 
-    private:
-        friend class ServiceContext;
-        Client(std::string desc,
-               ServiceContext* serviceContext,
-               AbstractMessagingPort *p = 0);
+    ConnectionId getConnectionId() const {
+        return _connectionId;
+    }
+    bool isFromUserConnection() const {
+        return _connectionId > 0;
+    }
+
+    PseudoRandom& getPrng() {
+        return _prng;
+    }
+
+private:
+    friend class ServiceContext;
+    Client(std::string desc, ServiceContext* serviceContext, AbstractMessagingPort* p = 0);
 
 
-        // Description for the client (e.g. conn8)
-        const std::string _desc;
+    // Description for the client (e.g. conn8)
+    const std::string _desc;
 
-        // OS id of the thread, which owns this client
-        const boost::thread::id _threadId;
+    // OS id of the thread, which owns this client
+    const stdx::thread::id _threadId;
 
-        // > 0 for things "conn", 0 otherwise
-        const ConnectionId _connectionId;
+    // > 0 for things "conn", 0 otherwise
+    const ConnectionId _connectionId;
 
-        // Protects the contents of the Client (such as changing the OperationContext, etc)
-        mutable SpinLock _lock;
+    // Protects the contents of the Client (such as changing the OperationContext, etc)
+    mutable SpinLock _lock;
 
-        // Whether this client is running as DBDirectClient
-        bool _inDirectClient = false;
+    // Whether this client is running as DBDirectClient
+    bool _inDirectClient = false;
 
-        // If != NULL, then contains the currently active OperationContext
-        OperationContext* _txn = nullptr;
-    };
+    // If != NULL, then contains the currently active OperationContext
+    OperationContext* _txn = nullptr;
 
-    /** get the Client object for this thread. */
-    Client& cc();
+    PseudoRandom _prng;
+};
 
-    bool haveClient();
+/** get the Client object for this thread. */
+Client& cc();
 
+bool haveClient();
 };

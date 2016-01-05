@@ -39,37 +39,39 @@
 namespace mongo {
 namespace rpc {
 
-    class LegacyRequestBuilder : public RequestBuilderInterface {
-    public:
-        LegacyRequestBuilder();
-        ~LegacyRequestBuilder() final;
+class LegacyRequestBuilder : public RequestBuilderInterface {
+public:
+    LegacyRequestBuilder();
+    ~LegacyRequestBuilder() final;
 
-        LegacyRequestBuilder(std::unique_ptr<Message>);
+    LegacyRequestBuilder(Message&&);
 
-        LegacyRequestBuilder& setDatabase(StringData database) final;
-        LegacyRequestBuilder& setCommandName(StringData commandName) final;
-        LegacyRequestBuilder& setMetadata(BSONObj metadata) final;
-        LegacyRequestBuilder& setCommandArgs(BSONObj commandArgs) final;
+    LegacyRequestBuilder& setDatabase(StringData database) final;
+    LegacyRequestBuilder& setCommandName(StringData commandName) final;
+    LegacyRequestBuilder& setMetadata(BSONObj metadata) final;
+    LegacyRequestBuilder& setCommandArgs(BSONObj commandArgs) final;
 
-        LegacyRequestBuilder& addInputDocs(DocumentRange inputDocs) final;
-        LegacyRequestBuilder& addInputDoc(BSONObj inputDoc) final;
+    LegacyRequestBuilder& addInputDocs(DocumentRange inputDocs) final;
+    LegacyRequestBuilder& addInputDoc(BSONObj inputDoc) final;
 
-        State getState() const final;
+    State getState() const final;
 
-        std::unique_ptr<Message> done() final;
+    Protocol getProtocol() const final;
 
-    private:
-        std::unique_ptr<Message> _message;
-        BufBuilder _builder{};
+    Message done() final;
 
-        // we need to stash this as we need commandArgs to
-        // upconvert.
-        BSONObj _metadata;
+private:
+    Message _message;
+    BufBuilder _builder{};
 
-        std::string _ns{}; // copied to in setDatabase
+    // we need to stash this as we need metadata to
+    // upconvert.
+    BSONObj _commandArgs;
 
-        State _state{State::kDatabase};
-    };
+    std::string _ns{};  // copied to in setDatabase
+
+    State _state{State::kDatabase};
+};
 
 }  // namespace rpc
 }  // namespace mongo

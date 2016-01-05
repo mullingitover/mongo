@@ -35,44 +35,48 @@
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/repl/repl_client_info.h"
 
 namespace mongo {
 
-    /* ns:      namespace, e.g. <database>.<collection>
-       pattern: the "where" clause / criteria
-       justOne: stop after 1 match
-       god:     allow access to system namespaces, and don't yield
-    */
-    long long deleteObjects(OperationContext* txn,
-                            Database* db,
-                            StringData ns,
-                            BSONObj pattern,
-                            PlanExecutor::YieldPolicy policy,
-                            bool justOne,
-                            bool god,
-                            bool fromMigrate) {
-        NamespaceString nsString(ns);
-        DeleteRequest request(nsString);
-        request.setQuery(pattern);
-        request.setMulti(!justOne);
-        request.setGod(god);
-        request.setFromMigrate(fromMigrate);
-        request.setYieldPolicy(policy);
+/* ns:      namespace, e.g. <database>.<collection>
+   pattern: the "where" clause / criteria
+   justOne: stop after 1 match
+   god:     allow access to system namespaces, and don't yield
+*/
+long long deleteObjects(OperationContext* txn,
+                        Collection* collection,
+                        StringData ns,
+                        BSONObj pattern,
+                        PlanExecutor::YieldPolicy policy,
+                        bool justOne,
+                        bool god,
+                        bool fromMigrate) {
+    NamespaceString nsString(ns);
+    DeleteRequest request(nsString);
+    request.setQuery(pattern);
+    request.setMulti(!justOne);
+    request.setGod(god);
+    request.setFromMigrate(fromMigrate);
+    request.setYieldPolicy(policy);
 
-        Collection* collection = NULL;
-        if (db) {
-            collection = db->getCollection(nsString.ns());
-        }
+    ParsedDelete parsedDelete(txn, &request);
+    uassertStatusOK(parsedDelete.parseRequest());
 
-        ParsedDelete parsedDelete(txn, &request);
-        uassertStatusOK(parsedDelete.parseRequest());
+    auto client = txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
 
-        PlanExecutor* rawExec;
-        uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete, &rawExec));
-        boost::scoped_ptr<PlanExecutor> exec(rawExec);
+    std::unique_ptr<PlanExecutor> exec =
+        uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete));
 
-        uassertStatusOK(exec->executePlan());
-        return DeleteStage::getNumDeleted(exec.get());
+    uassertStatusOK(exec->executePlan());
+
+    // No-ops need to reset lastOp in the client, for write concern.
+    if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+        repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
     }
+
+    return DeleteStage::getNumDeleted(*exec);
+}
 
 }  // namespace mongo

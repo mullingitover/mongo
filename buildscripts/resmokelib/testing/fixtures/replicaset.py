@@ -29,7 +29,8 @@ class ReplicaSetFixture(interface.ReplFixture):
                  dbpath_prefix=None,
                  preserve_dbpath=False,
                  num_nodes=2,
-                 auth_options=None):
+                 auth_options=None,
+                 replset_config_options=None):
 
         interface.ReplFixture.__init__(self, logger, job_num)
 
@@ -38,6 +39,7 @@ class ReplicaSetFixture(interface.ReplFixture):
         self.preserve_dbpath = preserve_dbpath
         self.num_nodes = num_nodes
         self.auth_options = auth_options
+        self.replset_config_options = utils.default_if_none(replset_config_options, {})
 
         # The dbpath in mongod_options is used as the dbpath prefix for replica set members and
         # takes precedence over other settings. The ShardedClusterFixture uses this parameter to
@@ -53,14 +55,18 @@ class ReplicaSetFixture(interface.ReplFixture):
                                                config.FIXTURE_SUBDIR)
 
         self.nodes = []
+        self.replset_name = None
 
     def setup(self):
-        replset_name = self.mongod_options.get("replSet", "rs")
+        self.replset_name = self.mongod_options.get("replSet", "rs")
 
-        for i in xrange(self.num_nodes):
-            node = self._new_mongod(i, replset_name)
+        if not self.nodes:
+            for i in xrange(self.num_nodes):
+                node = self._new_mongod(i, self.replset_name)
+                self.nodes.append(node)
+
+        for node in self.nodes:
             node.setup()
-            self.nodes.append(node)
 
         self.port = self.get_primary().port
 
@@ -72,12 +78,14 @@ class ReplicaSetFixture(interface.ReplFixture):
         # Initiate the replica set.
         members = []
         for (i, node) in enumerate(self.nodes):
-            conn_str = "localhost:%d" % (node.port)
-            member_info = {"_id": i, "host": conn_str}
+            member_info = {"_id": i, "host": node.get_connection_string()}
             if i > 0:
                 member_info["priority"] = 0
+            if i >= 7:
+                # Only 7 nodes in a replica set can vote, so the other members must be non-voting.
+                member_info["votes"] = 0
             members.append(member_info)
-        initiate_cmd_obj = {"replSetInitiate": {"_id": replset_name, "members": members}}
+        initiate_cmd_obj = {"replSetInitiate": {"_id": self.replset_name, "members": members}}
 
         client = utils.new_mongo_client(port=self.port)
         if self.auth_options is not None:
@@ -85,6 +93,9 @@ class ReplicaSetFixture(interface.ReplFixture):
             auth_db.authenticate(self.auth_options["username"],
                                  password=self.auth_options["password"],
                                  mechanism=self.auth_options["authenticationMechanism"])
+
+        if self.replset_config_options.get("configsvr", False):
+            initiate_cmd_obj["replSetInitiate"]["configsvr"] = True
 
         self.logger.info("Issuing replSetInitiate command...")
         client.admin.command(initiate_cmd_obj)
@@ -97,7 +108,7 @@ class ReplicaSetFixture(interface.ReplFixture):
             if is_master:
                 break
             self.logger.info("Waiting for primary on port %d to be elected.", self.port)
-            time.sleep(1)  # Wait a little bit before trying again.
+            time.sleep(0.1)  # Wait a little bit before trying again.
 
         # Wait for the secondaries to become available.
         for secondary in self.get_secondaries():
@@ -109,7 +120,7 @@ class ReplicaSetFixture(interface.ReplFixture):
                     break
                 self.logger.info("Waiting for secondary on port %d to become available.",
                                  secondary.port)
-                time.sleep(1)  # Wait a little bit before trying again.
+                time.sleep(0.1)  # Wait a little bit before trying again.
 
     def teardown(self):
         running_at_start = self.is_running()
@@ -121,7 +132,7 @@ class ReplicaSetFixture(interface.ReplFixture):
             self.logger.info("Stopping all members of the replica set...")
 
         # Terminate the secondaries first to reduce noise in the logs.
-        for node in self.nodes[::-1]:
+        for node in reversed(self.nodes):
             success = node.teardown() and success
 
         if running_at_start:
@@ -190,3 +201,10 @@ class ReplicaSetFixture(interface.ReplFixture):
             logger_name = "%s:secondary%s" % (self.logger.name, suffix)
 
         return logging.loggers.new_logger(logger_name, parent=self.logger)
+
+    def get_connection_string(self):
+        if self.replset_name is None:
+            raise ValueError("Must call setup() before calling get_connection_string()")
+
+        conn_strs = [node.get_connection_string() for node in self.nodes]
+        return self.replset_name + "/" + ",".join(conn_strs)

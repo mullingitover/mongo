@@ -60,7 +60,7 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
         assert(cmdResult.ok);
 
         var testedAtLeastOnce = false;
-        var query = { op: 'command', ns: 'test.$cmd' };
+        var query = { op: 'command' };
         Object.extend(query, profileQuery);
 
         hostList.forEach(function(node) {
@@ -149,7 +149,6 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
         formatProfileQuery({ geoNear: 'user' }));
 
     // Mongos doesn't implement geoSearch; test it only with ReplicaSetConnection.
-    // We'll omit geoWalk, it's not a public command.
     if (!isMongos) {
         cmdTest(
             {

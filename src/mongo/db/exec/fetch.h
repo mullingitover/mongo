@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
@@ -37,71 +37,69 @@
 
 namespace mongo {
 
+class SeekableRecordCursor;
+
+/**
+ * This stage turns a RecordId into a BSONObj.
+ *
+ * In WorkingSetMember terms, it transitions from LOC_AND_IDX to LOC_AND_OBJ by reading
+ * the record at the provided loc.  Returns verbatim any data that already has an object.
+ *
+ * Preconditions: Valid RecordId.
+ */
+class FetchStage : public PlanStage {
+public:
+    FetchStage(OperationContext* txn,
+               WorkingSet* ws,
+               PlanStage* child,
+               const MatchExpression* filter,
+               const Collection* collection);
+
+    ~FetchStage();
+
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
+
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
+
+    StageType stageType() const final {
+        return STAGE_FETCH;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats();
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
+
+private:
     /**
-     * This stage turns a RecordId into a BSONObj.
-     *
-     * In WorkingSetMember terms, it transitions from LOC_AND_IDX to LOC_AND_UNOWNED_OBJ by reading
-     * the record at the provided loc.  Returns verbatim any data that already has an object.
-     *
-     * Preconditions: Valid RecordId.
+     * If the member (with id memberID) passes our filter, set *out to memberID and return that
+     * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
      */
-    class FetchStage : public PlanStage {
-    public:
-        FetchStage(OperationContext* txn,
-                   WorkingSet* ws,
-                   PlanStage* child,
-                   const MatchExpression* filter,
-                   const Collection* collection);
+    StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
-        virtual ~FetchStage();
+    // Collection which is used by this stage. Used to resolve record ids retrieved by child
+    // stages. The lifetime of the collection must supersede that of the stage.
+    const Collection* _collection;
+    // Used to fetch Records from _collection.
+    std::unique_ptr<SeekableRecordCursor> _cursor;
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    // _ws is not owned by us.
+    WorkingSet* _ws;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    // If not Null, we use this rather than asking our child what to do next.
+    WorkingSetID _idRetrying;
 
-        virtual StageType stageType() const { return STAGE_FETCH; }
-
-        PlanStageStats* getStats();
-
-        virtual const CommonStats* getCommonStats() const;
-
-        virtual const SpecificStats* getSpecificStats() const;
-
-        static const char* kStageType;
-
-    private:
-
-        /**
-         * If the member (with id memberID) passes our filter, set *out to memberID and return that
-         * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
-         */
-        StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID,
-                                   WorkingSetID* out);
-
-        OperationContext* _txn;
-
-        // Collection which is used by this stage. Used to resolve record ids retrieved by child
-        // stages. The lifetime of the collection must supersede that of the stage.
-        const Collection* _collection;
-
-        // _ws is not owned by us.
-        WorkingSet* _ws;
-        boost::scoped_ptr<PlanStage> _child;
-
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
-
-        // If not Null, we use this rather than asking our child what to do next.
-        WorkingSetID _idRetrying;
-
-        // Stats
-        CommonStats _commonStats;
-        FetchStats _specificStats;
-    };
+    // Stats
+    FetchStats _specificStats;
+};
 
 }  // namespace mongo

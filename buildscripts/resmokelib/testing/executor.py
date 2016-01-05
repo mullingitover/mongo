@@ -87,13 +87,17 @@ class TestGroupExecutor(object):
                     raise errors.StopExecution("Received interrupt from user")
 
                 sb = []  # String builder.
-                self._test_group.summarize(sb)
+                self._test_group.summarize_latest(sb)
                 self.logger.info("Summary: %s", "\n    ".join(sb))
 
                 if not report.wasSuccessful():
                     return_code = 1
                     if _config.FAIL_FAST:
                         break
+
+                # Clear the report so it can be reused for the next execution.
+                for job in self._jobs:
+                    job.report.reset()
                 num_repeats -= 1
         finally:
             if not self._teardown_fixtures():

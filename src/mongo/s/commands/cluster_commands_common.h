@@ -28,34 +28,112 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/s/strategy.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    class BSONObj;
+class BSONObj;
+
+class AScopedConnection;
+class ClusterCursorManager;
+class DBClientBase;
+class DBClientCursor;
+
+namespace executor {
+class TaskExecutor;
+}  // namespace executor
+
+/**
+ * DEPRECATED - do not use in any new code. All new code must use the TaskExecutor interface
+ * instead.
+ */
+class Future {
+public:
+    class CommandResult {
+    public:
+        std::string getServer() const {
+            return _server;
+        }
+
+        bool isDone() const {
+            return _done;
+        }
+
+        bool ok() const {
+            verify(_done);
+            return _ok;
+        }
+
+        BSONObj result() const {
+            verify(_done);
+            return _res;
+        }
+
+        /**
+           blocks until command is done
+           returns ok()
+         */
+        bool join(OperationContext* txn, int maxRetries = 1);
+
+    private:
+        CommandResult(const std::string& server,
+                      const std::string& db,
+                      const BSONObj& cmd,
+                      int options,
+                      DBClientBase* conn,
+                      bool useShardedConn);
+        void init();
+
+        std::string _server;
+        std::string _db;
+        int _options;
+        BSONObj _cmd;
+        DBClientBase* _conn;
+        std::unique_ptr<AScopedConnection> _connHolder;  // used if not provided a connection
+        bool _useShardConn;
+
+        std::unique_ptr<DBClientCursor> _cursor;
+
+        BSONObj _res;
+        bool _ok;
+        bool _done;
+
+        friend class Future;
+    };
+
 
     /**
-     * Utility function to compute a single error code from a vector of command results.
-     *
-     * @return If there is an error code common to all of the error results, returns that error
-     *          code; otherwise, returns 0.
+     * @param server server name
+     * @param db db name
+     * @param cmd cmd to exec
+     * @param conn optional connection to use.  will use standard pooled if non-specified
+     * @param useShardConn use ShardConnection
      */
-    int getUniqueCodeFromCommandResults(const std::vector<Strategy::CommandResult>& results);
+    static std::shared_ptr<CommandResult> spawnCommand(const std::string& server,
+                                                       const std::string& db,
+                                                       const BSONObj& cmd,
+                                                       int options,
+                                                       DBClientBase* conn = 0,
+                                                       bool useShardConn = false);
+};
 
-    /**
-     * Utility function to return an empty result set from a command.
-     */
-    bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::string& ns);
+/**
+ * Utility function to compute a single error code from a vector of command results.
+ *
+ * @return If there is an error code common to all of the error results, returns that error
+ *          code; otherwise, returns 0.
+ */
+int getUniqueCodeFromCommandResults(const std::vector<Strategy::CommandResult>& results);
 
-    /**
-     * Utility function to parse a cursor command response and save the cursor in the CursorCache
-     * "refs" container. Returns Status::OK() if the cursor was successfully saved or no cursor
-     * was specified in the command response, and returns an error Status if a parsing error was
-     * encountered.
-     */
-    Status storePossibleCursor(const std::string& server, const BSONObj& cmdResult);
+/**
+ * Utility function to return an empty result set from a command.
+ */
+bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::string& ns);
 
-} // namespace mongo
+}  // namespace mongo

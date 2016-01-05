@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <map>
 #include <string>
 
@@ -36,149 +35,158 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 
 namespace mongo {
 
-    class CollectionCatalogEntry;
-    struct CollectionOptions;
-    class IndexAccessMethod;
-    class IndexCatalogEntry;
-    class IndexDescriptor;
-    class RecordStore;
-    class RecordStoreV1Base;
-    class RecoveryUnit;
-    class OperationContext;
+class CollectionCatalogEntry;
+struct CollectionOptions;
+class IndexAccessMethod;
+class IndexCatalogEntry;
+class IndexDescriptor;
+class RecordId;
+class RecordStore;
+class RecordStoreV1Base;
+class RecoveryUnit;
+class OperationContext;
 
-    class MMAPV1DatabaseCatalogEntry : public DatabaseCatalogEntry {
-    public:
-        MMAPV1DatabaseCatalogEntry( OperationContext* txn,
-                                    StringData name,
-                                    StringData path,
-                                    bool directoryperdb,
-                                    bool transient );
+class MMAPV1DatabaseCatalogEntry : public DatabaseCatalogEntry {
+public:
+    MMAPV1DatabaseCatalogEntry(OperationContext* txn,
+                               StringData name,
+                               StringData path,
+                               bool directoryperdb,
+                               bool transient);
 
-        virtual ~MMAPV1DatabaseCatalogEntry();
+    virtual ~MMAPV1DatabaseCatalogEntry();
 
-        // these two seem the same and yet different
-        // TODO(ERH): consolidate into one ideally
-        virtual bool exists() const { return _namespaceIndex.pathExists(); }
-        virtual bool isEmpty() const { return !_namespaceIndex.allocated(); }
-        virtual bool hasUserData() const {
-            // The two collections which exist and can't be removed are:
-            //    system.indexes
-            //    system.namespaces
-            return _collections.size() > 2;
-        }
+    // these two seem the same and yet different
+    // TODO(ERH): consolidate into one ideally
+    virtual bool exists() const {
+        return _namespaceIndex.pathExists();
+    }
+    virtual bool isEmpty() const {
+        return !_namespaceIndex.allocated();
+    }
+    virtual bool hasUserData() const {
+        // The two collections which exist and can't be removed are:
+        //    system.indexes
+        //    system.namespaces
+        return _collections.size() > 2;
+    }
 
-        virtual int64_t sizeOnDisk( OperationContext* opCtx ) const;
+    virtual int64_t sizeOnDisk(OperationContext* opCtx) const;
 
-        virtual bool isOlderThan24( OperationContext* opCtx ) const;
-        virtual void markIndexSafe24AndUp( OperationContext* opCtx );
+    virtual bool isOlderThan24(OperationContext* opCtx) const;
+    virtual void markIndexSafe24AndUp(OperationContext* opCtx);
 
-        virtual bool currentFilesCompatible( OperationContext* opCtx ) const;
+    virtual bool currentFilesCompatible(OperationContext* opCtx) const;
 
-        virtual void appendExtraStats( OperationContext* opCtx,
-                                       BSONObjBuilder* out,
-                                       double scale ) const;
+    virtual void appendExtraStats(OperationContext* opCtx, BSONObjBuilder* out, double scale) const;
 
-        Status createCollection( OperationContext* txn,
-                                 StringData ns,
-                                 const CollectionOptions& options,
-                                 bool allocateDefaultSpace );
+    Status createCollection(OperationContext* txn,
+                            StringData ns,
+                            const CollectionOptions& options,
+                            bool allocateDefaultSpace);
 
-        Status dropCollection( OperationContext* txn, StringData ns );
+    Status dropCollection(OperationContext* txn, StringData ns);
 
-        Status renameCollection( OperationContext* txn,
-                                 StringData fromNS,
-                                 StringData toNS,
-                                 bool stayTemp );
+    Status renameCollection(OperationContext* txn,
+                            StringData fromNS,
+                            StringData toNS,
+                            bool stayTemp);
 
-        void getCollectionNamespaces( std::list<std::string>* tofill ) const;
+    void getCollectionNamespaces(std::list<std::string>* tofill) const;
 
-        /**
-         * will return NULL if ns does not exist
-         */
-        CollectionCatalogEntry* getCollectionCatalogEntry( StringData ns ) const;
+    /**
+     * will return NULL if ns does not exist
+     */
+    NamespaceDetailsCollectionCatalogEntry* getCollectionCatalogEntry(StringData ns) const;
 
-        RecordStore* getRecordStore( StringData ns ) const;
+    RecordStore* getRecordStore(StringData ns) const;
 
-        IndexAccessMethod* getIndex( OperationContext* txn,
-                                     const CollectionCatalogEntry* collection,
-                                     IndexCatalogEntry* index );
+    IndexAccessMethod* getIndex(OperationContext* txn,
+                                const CollectionCatalogEntry* collection,
+                                IndexCatalogEntry* index);
 
-        const MmapV1ExtentManager* getExtentManager() const { return &_extentManager; }
-        MmapV1ExtentManager* getExtentManager() { return &_extentManager; }
+    const MmapV1ExtentManager* getExtentManager() const {
+        return &_extentManager;
+    }
+    MmapV1ExtentManager* getExtentManager() {
+        return &_extentManager;
+    }
 
-        CollectionOptions getCollectionOptions( OperationContext* txn,
-                                                StringData ns ) const;
+    CollectionOptions getCollectionOptions(OperationContext* txn, StringData ns) const;
 
-        /**
-         * Creates a CollectionCatalogEntry in the form of an index rather than a collection.
-         * MMAPv1 puts both indexes and collections into CCEs. A namespace named 'name' must not
-         * exist.
-         */
-        void createNamespaceForIndex(OperationContext* txn, StringData name);
+    CollectionOptions getCollectionOptions(OperationContext* txn, RecordId nsRid) const;
 
-    private:
-        class EntryInsertion;
-        class EntryRemoval;
+    /**
+     * Creates a CollectionCatalogEntry in the form of an index rather than a collection.
+     * MMAPv1 puts both indexes and collections into CCEs. A namespace named 'name' must not
+     * exist.
+     */
+    void createNamespaceForIndex(OperationContext* txn, StringData name);
 
-        friend class NamespaceDetailsCollectionCatalogEntry;
+private:
+    class EntryInsertion;
+    class EntryRemoval;
 
-        // The _collections map is a cache for efficiently looking up namespace information. Access
-        // to the cache is protected by holding the appropriate DB lock. Regular operations
-        // (insert/update/delete/query) hold intent locks on the database and they access the cache
-        // directly. Metadata operations, such as create db/collection, etc acquire exclusive lock
-        // on the database, which protects against concurrent readers of the cache.
-        //
-        // Once initialized, the cache must remain consistent with the data in the memory-mapped
-        // database files through _removeFromCache and _insertInCache. These methods use the
-        // RecoveryUnit to ensure correct handling of rollback.
+    friend class NamespaceDetailsCollectionCatalogEntry;
 
-        struct Entry {
-            boost::scoped_ptr<CollectionCatalogEntry> catalogEntry;
-            boost::scoped_ptr<RecordStoreV1Base> recordStore;
-        };
+    // The _collections map is a cache for efficiently looking up namespace information. Access
+    // to the cache is protected by holding the appropriate DB lock. Regular operations
+    // (insert/update/delete/query) hold intent locks on the database and they access the cache
+    // directly. Metadata operations, such as create db/collection, etc acquire exclusive lock
+    // on the database, which protects against concurrent readers of the cache.
+    //
+    // Once initialized, the cache must remain consistent with the data in the memory-mapped
+    // database files through _removeFromCache and _insertInCache. These methods use the
+    // RecoveryUnit to ensure correct handling of rollback.
 
-        typedef std::map<std::string, Entry*> CollectionMap;
+    struct Entry {
+        std::unique_ptr<NamespaceDetailsCollectionCatalogEntry> catalogEntry;
+        std::unique_ptr<RecordStoreV1Base> recordStore;
+    };
+
+    typedef std::map<std::string, Entry*> CollectionMap;
 
 
-        RecordStoreV1Base* _getIndexRecordStore();
-        RecordStoreV1Base* _getNamespaceRecordStore() const;
-        RecordStoreV1Base* _getRecordStore(StringData ns) const;
+    RecordStoreV1Base* _getIndexRecordStore();
+    RecordStoreV1Base* _getNamespaceRecordStore() const;
+    RecordStoreV1Base* _getRecordStore(StringData ns) const;
 
-        void _addNamespaceToNamespaceCollection(OperationContext* txn,
+    RecordId _addNamespaceToNamespaceCollection(OperationContext* txn,
                                                 StringData ns,
                                                 const BSONObj* options);
 
-        void _removeNamespaceFromNamespaceCollection(OperationContext* txn, StringData ns);
+    void _removeNamespaceFromNamespaceCollection(OperationContext* txn, StringData ns);
 
-        Status _renameSingleNamespace( OperationContext* txn,
-                                       StringData fromNS,
-                                       StringData toNS,
-                                       bool stayTemp );
+    Status _renameSingleNamespace(OperationContext* txn,
+                                  StringData fromNS,
+                                  StringData toNS,
+                                  bool stayTemp);
 
-        void _ensureSystemCollection(OperationContext* txn, StringData ns);
+    void _ensureSystemCollection(OperationContext* txn, StringData ns);
 
-        void _init( OperationContext* txn );
+    void _init(OperationContext* txn);
 
-        /**
-         * Populate the _collections cache.
-         */
-        void _insertInCache(OperationContext* opCtx, StringData ns, Entry* entry);
+    /**
+     * Populate the _collections cache.
+     */
+    void _insertInCache(OperationContext* opCtx, StringData ns, RecordId rid, Entry* entry);
 
-        /**
-         * Drop cached information for specified namespace. If a RecoveryUnit is specified,
-         * use it to allow rollback. When ru is null, removal is unconditional.
-         */
-        void _removeFromCache(RecoveryUnit* ru, StringData ns);
+    /**
+     * Drop cached information for specified namespace. If a RecoveryUnit is specified,
+     * use it to allow rollback. When ru is null, removal is unconditional.
+     */
+    void _removeFromCache(RecoveryUnit* ru, StringData ns);
 
 
-        const std::string _path;
+    const std::string _path;
 
-        NamespaceIndex _namespaceIndex;
-        MmapV1ExtentManager _extentManager;
-        CollectionMap _collections;
-    };
+    NamespaceIndex _namespaceIndex;
+    MmapV1ExtentManager _extentManager;
+    CollectionMap _collections;
+};
 }

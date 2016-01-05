@@ -32,22 +32,22 @@
 
 namespace mongo {
 
-    class DBClientBase;
-    class ShardConnection;
+class DBClientBase;
+class OperationContext;
+class ShardConnection;
 
 
-    class VersionManager {
-    public:
-        VersionManager() { }
+class VersionManager {
+public:
+    VersionManager() {}
 
-        bool isVersionableCB(DBClientBase*);
-        bool forceRemoteCheckShardVersionCB(const std::string&);
-        bool checkShardVersionCB(DBClientBase*, const std::string&, bool, int);
-        bool checkShardVersionCB(ShardConnection*, bool, int);
-        void resetShardVersionCB(DBClientBase*);
+    bool isVersionableCB(DBClientBase*);
+    bool forceRemoteCheckShardVersionCB(OperationContext* txn, const std::string&);
+    bool checkShardVersionCB(OperationContext*, DBClientBase*, const std::string&, bool, int);
+    bool checkShardVersionCB(OperationContext*, ShardConnection*, bool, int);
+    void resetShardVersionCB(DBClientBase*);
+};
 
-    };
+extern VersionManager versionManager;
 
-    extern VersionManager versionManager;
-
-} // namespace mongo
+}  // namespace mongo

@@ -28,74 +28,142 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/rpc/legacy_reply_builder.h"
+
+#include <iterator>
+
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace rpc {
 
-    LegacyReplyBuilder::LegacyReplyBuilder()
-        : LegacyReplyBuilder(stdx::make_unique<Message>())
-    {}
+LegacyReplyBuilder::LegacyReplyBuilder() : LegacyReplyBuilder(Message()) {}
 
-    LegacyReplyBuilder::LegacyReplyBuilder(std::unique_ptr<Message> message)
-        : _message{std::move(message)} {
-        _builder.skip(sizeof(QueryResult::Value));
+LegacyReplyBuilder::LegacyReplyBuilder(Message&& message) : _message{std::move(message)} {
+    _builder.skip(sizeof(QueryResult::Value));
+}
+
+LegacyReplyBuilder::~LegacyReplyBuilder() {}
+
+LegacyReplyBuilder& LegacyReplyBuilder::setCommandReply(Status nonOKStatus,
+                                                        const BSONObj& extraErrorInfo) {
+    invariant(_state == State::kCommandReply);
+    if (nonOKStatus == ErrorCodes::SendStaleConfig) {
+        _staleConfigError = true;
+        // Need to use the special $err format for SendStaleConfig errors to be backwards
+        // compatible.
+        BSONObjBuilder err;
+        // $err must be the first field in object.
+        err.append("$err", nonOKStatus.reason());
+        err.append("code", nonOKStatus.code());
+        err.appendElements(extraErrorInfo);
+        setRawCommandReply(err.done());
+    } else {
+        // All other errors proceed through the normal path, which also handles state transitions.
+        ReplyBuilderInterface::setCommandReply(std::move(nonOKStatus), extraErrorInfo);
     }
+    return *this;
+}
 
-    LegacyReplyBuilder::~LegacyReplyBuilder() {}
+LegacyReplyBuilder& LegacyReplyBuilder::setRawCommandReply(const BSONObj& commandReply) {
+    invariant(_state == State::kCommandReply);
+    commandReply.appendSelfToBufBuilder(_builder);
+    _state = State::kMetadata;
+    return *this;
+}
 
-    LegacyReplyBuilder& LegacyReplyBuilder::setMetadata(BSONObj metadata) {
-        invariant(_state == State::kMetadata);
-        // no op for now: SERVER-18236
-        _state = State::kCommandReply;
-        return *this;
+BufBuilder& LegacyReplyBuilder::getInPlaceReplyBuilder(std::size_t reserveBytes) {
+    invariant(_state == State::kCommandReply);
+    // Eagerly allocate reserveBytes bytes.
+    _builder.reserveBytes(reserveBytes);
+    // Claim our reservation immediately so we can actually write data to it.
+    _builder.claimReservedBytes(reserveBytes);
+    _state = State::kMetadata;
+    return _builder;
+}
+
+LegacyReplyBuilder& LegacyReplyBuilder::setMetadata(const BSONObj& metadata) {
+    invariant(_state == State::kMetadata);
+    // HACK: the only thing we need to downconvert is ShardingMetadata, which can go at the end of
+    // the object. So we do that in place to avoid copying the command reply.
+    auto shardingMetadata = rpc::ShardingMetadata::readFromMetadata(metadata);
+    invariant(shardingMetadata.isOK() || shardingMetadata.getStatus() == ErrorCodes::NoSuchKey);
+
+    if (shardingMetadata.isOK()) {
+        // Write the sharding metadata in to the end of the object. The third parameter is needed
+        // because we already have skipped some bytes for the message header.
+        BSONObjBuilder resumedBuilder(
+            BSONObjBuilder::ResumeBuildingTag(), _builder, sizeof(QueryResult::Value));
+        shardingMetadata.getValue().writeToMetadata(&resumedBuilder, Protocol::kOpQuery);
     }
+    _state = State::kOutputDocs;
+    return *this;
+}
 
-    LegacyReplyBuilder& LegacyReplyBuilder::setRawCommandReply(BSONObj commandReply) {
-        invariant(_state == State::kCommandReply);
-        commandReply.appendSelfToBufBuilder(_builder);
-        _state = State::kOutputDocs;
-        return *this;
+Status LegacyReplyBuilder::addOutputDocs(DocumentRange docs) {
+    invariant(_state == State::kOutputDocs);
+    // no op
+    return Status::OK();
+}
+
+Status LegacyReplyBuilder::addOutputDoc(const BSONObj& bson) {
+    invariant(_state == State::kOutputDocs);
+    // no op
+    return Status::OK();
+}
+
+ReplyBuilderInterface::State LegacyReplyBuilder::getState() const {
+    return _state;
+}
+
+Protocol LegacyReplyBuilder::getProtocol() const {
+    return rpc::Protocol::kOpQuery;
+}
+
+void LegacyReplyBuilder::reset() {
+    // If we are in State::kMetadata, we are already in the 'start' state, so by
+    // immediately returning, we save a heap allocation.
+    if (_state == State::kCommandReply) {
+        return;
     }
+    _builder.reset();
+    _builder.skip(sizeof(QueryResult::Value));
+    _message.reset();
+    _state = State::kCommandReply;
+    _staleConfigError = false;
+}
 
-    LegacyReplyBuilder& LegacyReplyBuilder::addOutputDocs(DocumentRange outputDocs) {
-        invariant(_state == State::kOutputDocs);
-        // no op
-        return *this;
-    }
 
-    LegacyReplyBuilder& LegacyReplyBuilder::addOutputDoc(BSONObj outputDoc) {
-        invariant(_state == State::kOutputDocs);
-        // no op
-        return *this;
-    }
+Message LegacyReplyBuilder::done() {
+    invariant(_state == State::kOutputDocs);
 
-    ReplyBuilderInterface::State LegacyReplyBuilder::getState() const {
-        return _state;
-    }
+    QueryResult::View qr = _builder.buf();
 
-    std::unique_ptr<Message> LegacyReplyBuilder::done() {
-        invariant(_state == State::kOutputDocs);
-        std::unique_ptr<Message> message = stdx::make_unique<Message>();
-
-        QueryResult::View qr = _builder.buf();
+    if (_staleConfigError) {
+        // For compatibility with legacy mongos, we need to set this result flag on SendStaleConfig
+        qr.setResultFlags(ResultFlag_ErrSet | ResultFlag_ShardConfigStale);
+    } else {
         qr.setResultFlagsToOk();
-        qr.msgdata().setLen(_builder.len());
-        qr.msgdata().setOperation(opReply);
-        qr.setCursorId(0);
-        qr.setStartingFrom(0);
-        qr.setNReturned(1);
-        _builder.decouple();
-
-        message->setData(qr.view2ptr(), true);
-
-        _state = State::kDone;
-        return std::move(message);
     }
+
+    qr.msgdata().setLen(_builder.len());
+    qr.msgdata().setOperation(opReply);
+    qr.setCursorId(0);
+    qr.setStartingFrom(0);
+    qr.setNReturned(1);
+
+    _message.setData(qr.view2ptr(), true);
+    _builder.decouple();
+
+    _state = State::kDone;
+    return std::move(_message);
+}
 
 }  // namespace rpc
 }  // namespace mongo

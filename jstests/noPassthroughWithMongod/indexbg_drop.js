@@ -27,7 +27,7 @@ replTest.initiate({"_id" : "bgIndex",
                     {"_id" : 1, "host" : nodes[1]},
                     {"_id" : 2, "host" : nodes[2], "arbiterOnly" : true}]});
 
-var master = replTest.getMaster();
+var master = replTest.getPrimary();
 var second = replTest.getSecondary();
 
 var masterId = replTest.getNodeId(master);
@@ -42,6 +42,7 @@ var dc = {dropIndexes: collection, index: "i_1"};
 // set up collections
 masterDB.dropDatabase();
 jsTest.log("creating test data " + size + " documents");
+Random.setRandomSeed();
 var bulk = masterDB.getCollection(collection).initializeUnorderedBulkOp();
 for( i = 0; i < size; ++i ) {
     bulk.insert({ i: Random.rand() });

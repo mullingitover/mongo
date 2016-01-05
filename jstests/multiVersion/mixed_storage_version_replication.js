@@ -8,7 +8,7 @@ load('jstests/libs/parallelTester.js');
 
 // Seed random numbers and print the seed. To reproduce a failed test, look for the seed towards
 // the beginning of the output, and give it as an argument to randomize.
-jsTest.randomize();
+Random.setRandomSeed();
 
 /*
  * Namespace for all random operation helpers. Actual tests start below
@@ -86,8 +86,12 @@ var RandomOps = {
     },
 
     getRandomDoc: function(collection) {
-        var randIndex = Random.randInt(0, collection.find().count());
-        return collection.find().sort({$natural: 1}).skip(randIndex).limit(1)[0];
+        try {
+            var randIndex = Random.randInt(0, collection.find().count());
+            return collection.find().sort({$natural: 1}).skip(randIndex).limit(1)[0];
+        } catch(e) {
+            return undefined;
+        }
     },
 
     /*
@@ -151,13 +155,17 @@ var RandomOps = {
         if (coll === null || coll.find().count() === 0) {
             return null;  // No data, can't delete anything.
         }
-        // If multithreaded, doc might be undefined.
         var doc = this.getRandomDoc(coll);
+        if (doc === undefined) {
+            // If multithreaded, there could have been issues finding a random doc.
+            // If so, just skip this operation.
+            return;
+        }
+
         if (this.verbose) {
             print("Deleting:");
             printjson(doc);
         }
-        // If multithreaded, doc might not exist anymore.
         try {
             coll.remove(doc);
         } catch(e) {
@@ -175,8 +183,13 @@ var RandomOps = {
         if (coll === null || coll.find().count() === 0) {
             return null;  // No data, can't update anything.
         }
-        // If multithreaded, doc might be undefined.
         var doc = this.getRandomDoc(coll);
+        if (doc === undefined) {
+            // If multithreaded, there could have been issues finding a random doc.
+            // If so, just skip this operation.
+            return;
+        }
+
         var field = this.randomChoice(this.fieldNames);
         var updateDoc = {$set: {}};
         updateDoc.$set[field] = this.randomChoice(this.fieldValues);
@@ -528,6 +541,7 @@ function startCmds(randomOps, host) {
     ];
     var m = new Mongo(host);
     var numOps = 200;
+    Random.setRandomSeed();
     randomOps.doRandomWork(m, numOps, ops);
     return true;
 }
@@ -538,6 +552,7 @@ function startCmds(randomOps, host) {
 function startCRUD(randomOps, host) {
     var m = new Mongo(host);
     var numOps = 500;
+    Random.setRandomSeed();
     randomOps.doRandomWork(m, numOps, ["insert", "update", "remove"]);
     return true;
 }
@@ -599,10 +614,13 @@ function doMultiThreadedWork(primary, numThreads) {
     // Make sure everyone is syncing from the primary, to ensure we have all combinations of
     // primary/secondary syncing.
     config.settings = {chainingAllowed: false};
-    replTest.initiate();
+    config.protocolVersion = 0;
+    replTest.initiate(config);
     // Ensure all are synced.
     replTest.awaitSecondaryNodes(120000);
     var primary = replTest.getPrimary();
+
+    Random.setRandomSeed();
 
     // Keep track of the indices of different types of primaries.
     // We'll rotate to get a primary of each type.

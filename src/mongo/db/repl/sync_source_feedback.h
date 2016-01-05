@@ -29,68 +29,69 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/condition.hpp>
-
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
-    class OperationContext;
+class OperationContext;
 
 namespace repl {
 
-    class SyncSourceFeedback {
-    public:
-        SyncSourceFeedback();
-        ~SyncSourceFeedback();
+class SyncSourceFeedback {
+public:
+    /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of slave
+    /// replication progress.
+    void forwardSlaveProgress();
 
-        /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of slave
-        /// replication progress.
-        void forwardSlaveProgress();
+    /**
+     * Loops continuously until shutdown() is called, passing updates when they are present. If no
+     * update occurs within the _keepAliveInterval, progress is forwarded to let the upstream node
+     * know that this node, along with the alive nodes chaining through it, are still alive.
+     */
+    void run();
 
-        /// Loops continuously until shutdown() is called, passing updates when they are present.
-        void run();
+    /// Signals the run() method to terminate.
+    void shutdown();
 
-        /// Signals the run() method to terminate.
-        void shutdown();
+private:
+    void _resetConnection();
 
-    private:
-        void _resetConnection();
+    /**
+     * Authenticates _connection using the server's cluster-membership credentials.
+     *
+     * Returns true on successful authentication.
+     */
+    bool replAuthenticate();
 
-        /**
-         * Authenticates _connection using the server's cluster-membership credentials.
-         *
-         * Returns true on successful authentication.
-         */
-        bool replAuthenticate();
+    /* Inform the sync target of our current position in the oplog, as well as the positions
+     * of all secondaries chained through us.
+     */
+    Status updateUpstream(OperationContext* txn);
 
-        /* Inform the sync target of our current position in the oplog, as well as the positions
-         * of all secondaries chained through us.
-         */
-        Status updateUpstream(OperationContext* txn);
+    bool hasConnection() {
+        return _connection.get();
+    }
 
-        bool hasConnection() {
-            return _connection.get();
-        }
+    /// Connect to sync target.
+    bool _connect(OperationContext* txn, const HostAndPort& host);
 
-        /// Connect to sync target.
-        bool _connect(OperationContext* txn, const HostAndPort& host);
-
-        // the member we are currently syncing from
-        HostAndPort _syncTarget;
-        // our connection to our sync target
-        boost::scoped_ptr<DBClientConnection> _connection;
-        // protects cond, _shutdownSignaled, and _positionChanged.
-        boost::mutex _mtx;
-        // used to alert our thread of changes which need to be passed up the chain
-        boost::condition _cond;
-        // used to indicate a position change which has not yet been pushed along
-        bool _positionChanged;
-        // Once this is set to true the _run method will terminate
-        bool _shutdownSignaled;
-    };
-} // namespace repl
-} // namespace mongo
+    // the member we are currently syncing from
+    HostAndPort _syncTarget;
+    // our connection to our sync target
+    std::unique_ptr<DBClientConnection> _connection;
+    // protects cond, _shutdownSignaled, _keepAliveInterval, and _positionChanged.
+    stdx::mutex _mtx;
+    // used to alert our thread of changes which need to be passed up the chain
+    stdx::condition_variable _cond;
+    /// _keepAliveInterval indicates how frequently to forward progress in the absence of updates.
+    Milliseconds _keepAliveInterval = Milliseconds(100);
+    // used to indicate a position change which has not yet been pushed along
+    bool _positionChanged = false;
+    // Once this is set to true the _run method will terminate
+    bool _shutdownSignaled = false;
+};
+}  // namespace repl
+}  // namespace mongo

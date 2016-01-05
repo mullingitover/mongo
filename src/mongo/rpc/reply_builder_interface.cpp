@@ -34,52 +34,56 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/net/message.h"
+
 
 namespace mongo {
 namespace rpc {
 
-    namespace {
-        const char kOKField[] = "ok";
-        const char kCodeField[] = "code";
-        const char kErrorField[] = "errmsg";
+namespace {
+const char kOKField[] = "ok";
+const char kCodeField[] = "code";
+const char kErrorField[] = "errmsg";
 
-        // similar to appendCommandStatus (duplicating logic here to avoid cyclic library
-        // dependency)
-        BSONObj augmentReplyWithStatus(const Status& status, const BSONObj& reply) {
-            BSONObjBuilder bob;
-            bob.appendElements(reply);
-
-            if (!reply.hasField(kOKField)) {
-                bob.append(kOKField, status.isOK() ? 1.0 : 0.0);
-            }
-
-            if (status.isOK()) {
-                return bob.obj();
-            }
-
-            if (!reply.hasField(kErrorField)) {
-                bob.append(kErrorField, status.reason());
-            }
-
-            if (!reply.hasField(kCodeField)) {
-                bob.append(kCodeField, status.code());
-            }
-
-            return bob.obj();
-        }
+// similar to appendCommandStatus (duplicating logic here to avoid cyclic library
+// dependency)
+BSONObj augmentReplyWithStatus(const Status& status, const BSONObj& reply) {
+    auto okField = reply.getField(kOKField);
+    if (!okField.eoo() && okField.trueValue()) {
+        return reply;
     }
 
-    ReplyBuilderInterface&
-    ReplyBuilderInterface::setCommandReply(StatusWith<BSONObj> commandReply) {
-        auto reply = commandReply.isOK() ? std::move(commandReply.getValue()) : BSONObj();
-        return setRawCommandReply(augmentReplyWithStatus(commandReply.getStatus(), reply));
+    BSONObjBuilder bob;
+    bob.appendElements(reply);
+    if (okField.eoo()) {
+        bob.append(kOKField, status.isOK() ? 1.0 : 0.0);
+    }
+    if (status.isOK()) {
+        return bob.obj();
     }
 
-    ReplyBuilderInterface&
-    ReplyBuilderInterface::setCommandReply(Status nonOKStatus, BSONObj extraErrorInfo) {
-        invariant(!nonOKStatus.isOK());
-        return setRawCommandReply(augmentReplyWithStatus(nonOKStatus, extraErrorInfo));
+    if (!reply.hasField(kErrorField)) {
+        bob.append(kErrorField, status.reason());
     }
+
+    if (!reply.hasField(kCodeField)) {
+        bob.append(kCodeField, status.code());
+    }
+
+    return bob.obj();
+}
+}
+
+ReplyBuilderInterface& ReplyBuilderInterface::setCommandReply(StatusWith<BSONObj> commandReply) {
+    auto reply = commandReply.isOK() ? std::move(commandReply.getValue()) : BSONObj();
+    return setRawCommandReply(augmentReplyWithStatus(commandReply.getStatus(), reply));
+}
+
+ReplyBuilderInterface& ReplyBuilderInterface::setCommandReply(Status nonOKStatus,
+                                                              const BSONObj& extraErrorInfo) {
+    invariant(!nonOKStatus.isOK());
+    return setRawCommandReply(augmentReplyWithStatus(nonOKStatus, extraErrorInfo));
+}
 
 }  // namespace rpc
 }  // namespace mongo

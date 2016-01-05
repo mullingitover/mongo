@@ -31,339 +31,237 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/shared_ptr.hpp>
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_connection.h"
 
 namespace mongo {
 
-    class DBClientCursorHolder;
-    class Shard;
-    class StaleConfigException;
-    class ParallelConnectionMetadata;
+class DBClientCursorHolder;
+class OperationContext;
+class StaleConfigException;
+class ParallelConnectionMetadata;
 
 
-    class CommandInfo {
-    public:
-        std::string versionedNS;
-        BSONObj cmdFilter;
+class CommandInfo {
+public:
+    std::string versionedNS;
+    BSONObj cmdFilter;
 
-        CommandInfo() {}
-        CommandInfo( const std::string& vns, const BSONObj& filter ) : versionedNS( vns ), cmdFilter( filter ) {}
+    CommandInfo() {}
+    CommandInfo(const std::string& vns, const BSONObj& filter)
+        : versionedNS(vns), cmdFilter(filter) {}
 
-        bool isEmpty(){
-            return versionedNS.size() == 0;
-        }
+    bool isEmpty() {
+        return versionedNS.size() == 0;
+    }
 
-        std::string toString() const {
-            return str::stream() << "CInfo " << BSON( "v_ns" << versionedNS << "filter" << cmdFilter );
-        }
-    };
+    std::string toString() const {
+        return str::stream() << "CInfo " << BSON("v_ns" << versionedNS << "filter" << cmdFilter);
+    }
+};
 
-    class DBClientCursor;
-    typedef boost::shared_ptr<DBClientCursor> DBClientCursorPtr;
+class DBClientCursor;
+typedef std::shared_ptr<DBClientCursor> DBClientCursorPtr;
 
-    class ParallelConnectionState {
-    public:
+class ParallelConnectionState {
+public:
+    ParallelConnectionState() : count(0), done(false) {}
 
-        ParallelConnectionState() :
-            count( 0 ), done( false ) { }
+    // Please do not reorder. cursor destructor can use conn.
+    // On a related note, never attempt to cleanup these pointers manually.
+    ShardConnectionPtr conn;
+    DBClientCursorPtr cursor;
 
-        // Please do not reorder. cursor destructor can use conn.
-        // On a related note, never attempt to cleanup these pointers manually.
-        ShardConnectionPtr conn;
-        DBClientCursorPtr cursor;
+    // Version information
+    ChunkManagerPtr manager;
+    std::shared_ptr<Shard> primary;
 
-        // Version information
-        ChunkManagerPtr manager;
-        boost::shared_ptr<Shard> primary;
+    // Cursor status information
+    long long count;
+    bool done;
 
-        // Cursor status information
-        long long count;
-        bool done;
+    BSONObj toBSON() const;
 
-        BSONObj toBSON() const;
+    std::string toString() const {
+        return str::stream() << "PCState : " << toBSON();
+    }
+};
 
-        std::string toString() const {
-            return str::stream() << "PCState : " << toBSON();
-        }
-    };
+typedef ParallelConnectionState PCState;
+typedef std::shared_ptr<PCState> PCStatePtr;
 
-    typedef ParallelConnectionState PCState;
-    typedef boost::shared_ptr<PCState> PCStatePtr;
+class ParallelConnectionMetadata {
+public:
+    ParallelConnectionMetadata()
+        : retryNext(false), initialized(false), finished(false), completed(false), errored(false) {}
 
-    class ParallelConnectionMetadata {
-    public:
+    ~ParallelConnectionMetadata() {
+        cleanup(true);
+    }
 
-        ParallelConnectionMetadata() :
-            retryNext( false ), initialized( false ), finished( false ), completed( false ), errored( false ) { }
+    void cleanup(bool full = true);
 
-        ~ParallelConnectionMetadata(){
-            cleanup( true );
-        }
+    PCStatePtr pcState;
 
-        void cleanup( bool full = true );
+    bool retryNext;
 
-        PCStatePtr pcState;
+    bool initialized;
+    bool finished;
+    bool completed;
 
-        bool retryNext;
+    bool errored;
 
-        bool initialized;
-        bool finished;
-        bool completed;
+    BSONObj toBSON() const;
 
-        bool errored;
+    std::string toString() const {
+        return str::stream() << "PCMData : " << toBSON();
+    }
+};
 
-        BSONObj toBSON() const;
+typedef ParallelConnectionMetadata PCMData;
+typedef std::shared_ptr<PCMData> PCMDataPtr;
 
-        std::string toString() const {
-            return str::stream() << "PCMData : " << toBSON();
-        }
-    };
+/**
+ * Runs a query in parallel across N servers, enforcing compatible chunk versions for queries
+ * across all shards.
+ *
+ * If CommandInfo is provided, the ParallelCursor does not use the direct .$cmd namespace in the
+ * query spec, but instead enforces versions across another namespace specified by CommandInfo.
+ * This is to support commands like:
+ * db.runCommand({ fileMD5 : "<coll name>" })
+ *
+ * There is a deprecated legacy mode as well which effectively does a merge-sort across a number
+ * of servers, but does not correctly enforce versioning (used only in mapreduce).
+ */
+class ParallelSortClusteredCursor {
+public:
+    ParallelSortClusteredCursor(const QuerySpec& qSpec, const CommandInfo& cInfo = CommandInfo());
 
-    typedef ParallelConnectionMetadata PCMData;
-    typedef boost::shared_ptr<PCMData> PCMDataPtr;
+    // DEPRECATED legacy constructor for pure mergesort functionality - do not use
+    ParallelSortClusteredCursor(const std::set<std::string>& servers,
+                                const std::string& ns,
+                                const Query& q,
+                                int options = 0,
+                                const BSONObj& fields = BSONObj());
 
-    /**
-     * Runs a query in parallel across N servers, enforcing compatible chunk versions for queries
-     * across all shards.
-     *
-     * If CommandInfo is provided, the ParallelCursor does not use the direct .$cmd namespace in the
-     * query spec, but instead enforces versions across another namespace specified by CommandInfo.
-     * This is to support commands like:
-     * db.runCommand({ fileMD5 : "<coll name>" })
-     *
-     * There is a deprecated legacy mode as well which effectively does a merge-sort across a number
-     * of servers, but does not correctly enforce versioning (used only in mapreduce).
-     */
-    class ParallelSortClusteredCursor {
-    public:
+    ~ParallelSortClusteredCursor();
 
-        ParallelSortClusteredCursor( const QuerySpec& qSpec, const CommandInfo& cInfo = CommandInfo() );
+    /** call before using */
+    void init(OperationContext* txn);
 
-        // DEPRECATED legacy constructor for pure mergesort functionality - do not use
-        ParallelSortClusteredCursor( const std::set<std::string>& servers , const std::string& ns ,
-                                     const Query& q , int options=0, const BSONObj& fields=BSONObj() );
-
-        ~ParallelSortClusteredCursor();
-
-        std::string getNS();
-
-        /** call before using */
-        void init();
-
-        bool more();
-        BSONObj next();
-        std::string type() const { return "ParallelSort"; }
-
-        void fullInit();
-        void startInit();
-        void finishInit();
-
-        bool isCommand(){ return NamespaceString( _qSpec.ns() ).isCommand(); }
-        bool isExplain(){ return _qSpec.isExplain(); }
-
-        /**
-         * Sets the batch size on all underlying cursors to 'newBatchSize'.
-         */
-        void setBatchSize(int newBatchSize);
-
-        /**
-         * Returns whether the collection was sharded when the cursors were established.
-         */
-        bool isSharded();
-
-        /**
-         * Returns the number of shards with open cursors.
-         */
-        int getNumQueryShards();
-
-        /**
-         * Returns the set of shards with open cursors.
-         */
-        void getQueryShards(std::set<Shard>& shards);
-
-        /**
-         * Returns the single shard with an open cursor.
-         * It is an error to call this if getNumQueryShards() > 1
-         */
-        boost::shared_ptr<Shard> getQueryShard();
-
-        /**
-         * Returns primary shard with an open cursor.
-         * It is an error to call this if the collection is sharded.
-         */
-        boost::shared_ptr<Shard> getPrimary();
-
-        ChunkManagerPtr getChunkManager( const Shard& shard );
-        DBClientCursorPtr getShardCursor( const Shard& shard );
-
-        BSONObj toBSON() const;
-        std::string toString() const;
-
-        void explain(BSONObjBuilder& b);
-
-    private:
-        void _finishCons();
-
-        void _explain( std::map< std::string,std::list<BSONObj> >& out );
-
-        void _markStaleNS( const NamespaceString& staleNS, const StaleConfigException& e, bool& forceReload, bool& fullReload );
-        void _handleStaleNS( const NamespaceString& staleNS, bool forceReload, bool fullReload );
-
-        bool _didInit;
-        bool _done;
-
-        QuerySpec _qSpec;
-        CommandInfo _cInfo;
-
-        // Count round-trips req'd for namespaces and total
-        std::map<std::string,int> _staleNSMap;
-        int _totalTries;
-
-        std::map<Shard,PCMData> _cursorMap;
-
-        // LEGACY BELOW
-        int _numServers;
-        int _lastFrom;
-        std::set<std::string> _servers;
-        BSONObj _sortKey;
-
-        DBClientCursorHolder * _cursors;
-        int _needToSkip;
-
-        /**
-         * Setups the shard version of the connection. When using a replica
-         * set connection and the primary cannot be reached, the version
-         * will not be set if the slaveOk flag is set.
-         */
-        void setupVersionAndHandleSlaveOk( PCStatePtr state /* in & out */,
-                           const Shard& shard,
-                           boost::shared_ptr<Shard> primary /* in */,
-                           const NamespaceString& ns,
-                           const std::string& vinfo,
-                           ChunkManagerPtr manager /* in */ );
-
-        // LEGACY init - Needed for map reduce
-        void _oldInit();
-
-        // LEGACY - Needed ONLY for _oldInit
-        std::string _ns;
-        BSONObj _query;
-        int _options;
-        BSONObj _fields;
-        int _batchSize;
-    };
-
+    bool more();
+    BSONObj next();
 
     /**
-     * Helper class to manage ownership of opened cursors while merging results.
-     *
-     * TODO:  Choose one set of ownership semantics so that this isn't needed - merge sort via
-     * mapreduce is the main issue since it has no metadata and this holder owns the cursors.
+     * Returns the set of shards with open cursors.
      */
-    class DBClientCursorHolder {
-    public:
+    void getQueryShardIds(std::set<ShardId>& shardIds);
 
-        DBClientCursorHolder() {}
-        ~DBClientCursorHolder() {}
+    DBClientCursorPtr getShardCursor(const ShardId& shardId);
 
-        void reset(DBClientCursor* cursor, ParallelConnectionMetadata* pcmData) {
-            _cursor.reset(cursor);
-            _pcmData.reset(pcmData);
-        }
+private:
+    void fullInit(OperationContext* txn);
+    void startInit(OperationContext* txn);
+    void finishInit(OperationContext* txn);
 
-        DBClientCursor* get() { return _cursor.get(); }
-        ParallelConnectionMetadata* getMData() { return _pcmData.get(); }
+    bool isCommand() {
+        return NamespaceString(_qSpec.ns()).isCommand();
+    }
 
-        void release() {
-            _cursor.release();
-            _pcmData.release();
-        }
+    void _finishCons();
 
-    private:
+    void _markStaleNS(const NamespaceString& staleNS,
+                      const StaleConfigException& e,
+                      bool& forceReload,
+                      bool& fullReload);
+    void _handleStaleNS(OperationContext* txn,
+                        const NamespaceString& staleNS,
+                        bool forceReload,
+                        bool fullReload);
 
-        std::auto_ptr<DBClientCursor> _cursor;
-        std::auto_ptr<ParallelConnectionMetadata> _pcmData;
-    };
+    bool _didInit;
+    bool _done;
+
+    QuerySpec _qSpec;
+    CommandInfo _cInfo;
+
+    // Count round-trips req'd for namespaces and total
+    std::map<std::string, int> _staleNSMap;
+
+    int _totalTries;
+    bool _cmChangeAttempted;
+
+    std::map<ShardId, PCMData> _cursorMap;
+
+    // LEGACY BELOW
+    int _numServers;
+    int _lastFrom;
+    std::set<std::string> _servers;
+    BSONObj _sortKey;
+
+    DBClientCursorHolder* _cursors;
+    int _needToSkip;
 
     /**
-     * Generally clients should be using Strategy::commandOp() wherever possible - the Future API
-     * does not handle versioning.
-     *
-     * tools for doing asynchronous operations
-     * right now uses underlying sync network ops and uses another thread
-     * should be changed to use non-blocking io
+     * Setups the shard version of the connection. When using a replica
+     * set connection and the primary cannot be reached, the version
+     * will not be set if the slaveOk flag is set.
      */
-    class Future {
-    public:
-        class CommandResult {
-        public:
+    void setupVersionAndHandleSlaveOk(OperationContext* txn,
+                                      PCStatePtr state /* in & out */,
+                                      const ShardId& shardId,
+                                      std::shared_ptr<Shard> primary /* in */,
+                                      const NamespaceString& ns,
+                                      const std::string& vinfo,
+                                      ChunkManagerPtr manager /* in */);
 
-            std::string getServer() const { return _server; }
+    // LEGACY init - Needed for map reduce
+    void _oldInit();
 
-            bool isDone() const { return _done; }
-
-            bool ok() const {
-                verify( _done );
-                return _ok;
-            }
-
-            BSONObj result() const {
-                verify( _done );
-                return _res;
-            }
-
-            /**
-               blocks until command is done
-               returns ok()
-             */
-            bool join( int maxRetries = 1 );
-
-        private:
-
-            CommandResult( const std::string& server,
-                           const std::string& db,
-                           const BSONObj& cmd,
-                           int options,
-                           DBClientBase * conn,
-                           bool useShardedConn );
-            void init();
-
-            std::string _server;
-            std::string _db;
-            int _options;
-            BSONObj _cmd;
-            DBClientBase * _conn;
-            boost::scoped_ptr<AScopedConnection> _connHolder; // used if not provided a connection
-            bool _useShardConn;
-
-            boost::scoped_ptr<DBClientCursor> _cursor;
-
-            BSONObj _res;
-            bool _ok;
-            bool _done;
-
-            friend class Future;
-        };
+    // LEGACY - Needed ONLY for _oldInit
+    std::string _ns;
+    BSONObj _query;
+    int _options;
+    BSONObj _fields;
+    int _batchSize;
+};
 
 
-        /**
-         * @param server server name
-         * @param db db name
-         * @param cmd cmd to exec
-         * @param conn optional connection to use.  will use standard pooled if non-specified
-         * @param useShardConn use ShardConnection
-         */
-        static boost::shared_ptr<CommandResult> spawnCommand( const std::string& server,
-                                                       const std::string& db,
-                                                       const BSONObj& cmd,
-                                                       int options,
-                                                       DBClientBase * conn = 0,
-                                                       bool useShardConn = false );
-    };
+/**
+ * Helper class to manage ownership of opened cursors while merging results.
+ *
+ * TODO:  Choose one set of ownership semantics so that this isn't needed - merge sort via
+ * mapreduce is the main issue since it has no metadata and this holder owns the cursors.
+ */
+class DBClientCursorHolder {
+public:
+    DBClientCursorHolder() {}
+    ~DBClientCursorHolder() {}
 
-}
+    void reset(DBClientCursor* cursor, ParallelConnectionMetadata* pcmData) {
+        _cursor.reset(cursor);
+        _pcmData.reset(pcmData);
+    }
 
+    DBClientCursor* get() {
+        return _cursor.get();
+    }
+    ParallelConnectionMetadata* getMData() {
+        return _pcmData.get();
+    }
+
+    void release() {
+        _cursor.release();
+        _pcmData.release();
+    }
+
+private:
+    std::unique_ptr<DBClientCursor> _cursor;
+    std::unique_ptr<ParallelConnectionMetadata> _pcmData;
+};
+
+void throwCursorStale(DBClientCursor* cursor);
+
+}  // namespace mongo

@@ -36,235 +36,265 @@
 
 namespace {
 
-    using namespace mongo;
-    using namespace mongo::repl;
-    using executor::NetworkInterfaceMock;
+using namespace mongo;
+using namespace mongo::repl;
+using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 
-    class MockProgressManager : public ReplicationProgressManager {
-        public:
-            void updateMap(int memberId, const Timestamp& ts) {
-                progressMap[memberId] = ts;
-            }
+class MockProgressManager {
+public:
+    void updateMap(int memberId, const Timestamp& ts) {
+        progressMap[memberId] = ts;
+    }
 
-            bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) {
-                cmdBuilder->append("replSetUpdatePosition", 1);
-                BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
-                for (auto itr = progressMap.begin(); itr != progressMap.end(); ++itr) {
-                    BSONObjBuilder entry(arrayBuilder.subobjStart());
-                    entry.append("optime", itr->second);
-                    entry.append("memberId", itr->first);
-                    entry.append("cfgver", 1);
-                }
-                return true;
-            }
-        private: 
-            std::map<int, Timestamp> progressMap;
+    void setResult(bool newResult) {
+        _result = newResult;
+    }
+
+    bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) {
+        if (!_result) {
+            return _result;
+        }
+        cmdBuilder->append("replSetUpdatePosition", 1);
+        BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
+        for (auto itr = progressMap.begin(); itr != progressMap.end(); ++itr) {
+            BSONObjBuilder entry(arrayBuilder.subobjStart());
+            entry.append("optime", itr->second);
+            entry.append("memberId", itr->first);
+            entry.append("cfgver", 1);
+        }
+        return true;
+    }
+
+private:
+    std::map<int, Timestamp> progressMap;
+    bool _result = true;
+};
+
+class ReporterTest : public ReplicationExecutorTest {
+public:
+    ReporterTest();
+    void scheduleNetworkResponse(const BSONObj& obj);
+    void scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason);
+    void finishProcessingNetworkResponse();
+
+protected:
+    void setUp() override;
+    void tearDown() override;
+
+    std::unique_ptr<Reporter> reporter;
+    std::unique_ptr<MockProgressManager> posUpdater;
+    Reporter::PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn;
+};
+
+ReporterTest::ReporterTest() {}
+
+void ReporterTest::setUp() {
+    ReplicationExecutorTest::setUp();
+    posUpdater.reset(new MockProgressManager());
+    prepareReplSetUpdatePositionCommandFn = [this]() -> StatusWith<BSONObj> {
+        BSONObjBuilder bob;
+        if (posUpdater->prepareReplSetUpdatePositionCommand(&bob)) {
+            return bob.obj();
+        }
+        return Status(ErrorCodes::OperationFailed,
+                      "unable to prepare replSetUpdatePosition command object");
     };
+    reporter.reset(new Reporter(&getReplExecutor(),
+                                [this]() { return prepareReplSetUpdatePositionCommandFn(); },
+                                HostAndPort("h1")));
+    launchExecutorThread();
+}
 
-    class ReporterTest : public ReplicationExecutorTest {
-    public:
-        static Status getDetectableErrorStatus();
-        ReporterTest();
-        void setUp() override;
-        void tearDown() override;
-        void scheduleNetworkResponse(const BSONObj& obj);
-        void scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason);
-        void finishProcessingNetworkResponse();
+void ReporterTest::tearDown() {
+    ReplicationExecutorTest::tearDown();
+    // Executor may still invoke reporter's callback before shutting down.
+    posUpdater.reset();
+    reporter.reset();
+}
 
-    protected:
-        std::unique_ptr<Reporter> reporter;
-        std::unique_ptr<MockProgressManager> posUpdater;
+void ReporterTest::scheduleNetworkResponse(const BSONObj& obj) {
+    NetworkInterfaceMock* net = getNet();
+    ASSERT_TRUE(net->hasReadyRequests());
+    Milliseconds millis(0);
+    RemoteCommandResponse response(obj, BSONObj(), millis);
+    ReplicationExecutor::ResponseStatus responseStatus(response);
+    net->scheduleResponse(net->getNextReadyRequest(), net->now(), responseStatus);
+}
 
-    };
+void ReporterTest::scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
+    NetworkInterfaceMock* net = getNet();
+    ASSERT_TRUE(net->hasReadyRequests());
+    ReplicationExecutor::ResponseStatus responseStatus(code, reason);
+    net->scheduleResponse(net->getNextReadyRequest(), net->now(), responseStatus);
+}
 
-    ReporterTest::ReporterTest() {}
+TEST_F(ReporterTest, InvalidConstruction) {
+    // null PrepareReplSetUpdatePositionCommandFn
+    ASSERT_THROWS(Reporter(&getReplExecutor(),
+                           Reporter::PrepareReplSetUpdatePositionCommandFn(),
+                           HostAndPort("h1")),
+                  UserException);
 
-    Status ReporterTest::getDetectableErrorStatus() {
-        return Status(ErrorCodes::InternalError, "Not mutated");
-    }
+    // null ReplicationExecutor
+    ASSERT_THROWS(Reporter(nullptr, prepareReplSetUpdatePositionCommandFn, HostAndPort("h1")),
+                  UserException);
 
-    void ReporterTest::setUp() {
-        ReplicationExecutorTest::setUp();
-        posUpdater.reset(new MockProgressManager());
-        reporter.reset(new Reporter(&getExecutor(), posUpdater.get(), HostAndPort("h1")));
-        launchExecutorThread();
-    }
+    // empty HostAndPort
+    ASSERT_THROWS(
+        Reporter(&getReplExecutor(), prepareReplSetUpdatePositionCommandFn, HostAndPort()),
+        UserException);
+}
 
-    void ReporterTest::tearDown() {
-        ReplicationExecutorTest::tearDown();
-        // Executor may still invoke reporter's callback before shutting down.
-        posUpdater.reset();
-        reporter.reset();
-    }
+TEST_F(ReporterTest, IsActiveOnceScheduled) {
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+}
 
-    void ReporterTest::scheduleNetworkResponse(const BSONObj& obj) {
-        NetworkInterfaceMock* net = getNet();
-        ASSERT_TRUE(net->hasReadyRequests());
-        Milliseconds millis(0);
-        RemoteCommandResponse response(obj, millis);
-        ReplicationExecutor::ResponseStatus responseStatus(response);
-        net->scheduleResponse(net->getNextReadyRequest(), net->now(), responseStatus);
-    }
+TEST_F(ReporterTest, CancelWithoutScheduled) {
+    ASSERT_FALSE(reporter->isActive());
+    reporter->cancel();
+    ASSERT_FALSE(reporter->isActive());
+}
 
-    void ReporterTest::scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
-        NetworkInterfaceMock* net = getNet();
-        ASSERT_TRUE(net->hasReadyRequests());
-        ReplicationExecutor::ResponseStatus responseStatus(code, reason);
-        net->scheduleResponse(net->getNextReadyRequest(), net->now(), responseStatus);
-    }
+TEST_F(ReporterTest, ShutdownBeforeSchedule) {
+    getExecutor().shutdown();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, reporter->trigger());
+    ASSERT_FALSE(reporter->isActive());
+}
 
-    TEST_F(ReporterTest, InvalidConstruction) {
-        // null ReplicationProgressManager
-        ASSERT_THROWS(Reporter(&getExecutor(), nullptr, HostAndPort("h1")), UserException);
+// If an error is returned, it should be recorded in the Reporter and be returned when triggered
+TEST_F(ReporterTest, ErrorsAreStoredInTheReporter) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
+    getNet()->runReadyNetworkOperations();
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->trigger());
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+}
 
-        // null ReplicationExecutor
-        ASSERT_THROWS(Reporter(nullptr, posUpdater.get(), HostAndPort("h1")), UserException);
+// If an error is returned, it should be recorded in the Reporter and not run again.
+TEST_F(ReporterTest, ErrorsStopTheReporter) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
 
-        // empty HostAndPort
-        ASSERT_THROWS(Reporter(&getExecutor(), posUpdater.get(), HostAndPort()), UserException);
-    }
+    scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
+    getNet()->runReadyNetworkOperations();
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+}
 
-    TEST_F(ReporterTest, IsActiveOnceScheduled) {
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-    }
+// Schedule while we are already scheduled, it should set willRunAgain, then automatically
+// schedule itself after finishing.
+TEST_F(ReporterTest, DoubleScheduleShouldCauseRescheduleImmediatelyAfterRespondedTo) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
 
-    TEST_F(ReporterTest, CancelWithoutScheduled) {
-        ASSERT_FALSE(reporter->isActive());
-        reporter->cancel();
-        ASSERT_FALSE(reporter->isActive());
-    }
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
 
-    TEST_F(ReporterTest, ShutdownBeforeSchedule) {
-        getExecutor().shutdown();
-        ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, reporter->trigger());
-        ASSERT_FALSE(reporter->isActive());
-    }
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+}
 
-    // If an error is returned, it should be recorded in the Reporter and be returned when triggered
-    TEST_F(ReporterTest, ErrorsAreStoredInTheReporter) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
-        getNet()->runReadyNetworkOperations();
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->trigger());
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-    }
+// Schedule multiple times while we are already scheduled, it should set willRunAgain,
+// then automatically schedule itself after finishing, but not a third time since the latter
+// two will contain the same batch of updates.
+TEST_F(ReporterTest, TripleScheduleShouldCauseRescheduleImmediatelyAfterRespondedToOnlyOnce) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
 
-    // If an error is returned, it should be recorded in the Reporter and not run again.
-    TEST_F(ReporterTest, ErrorsStopTheReporter) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
 
-        scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
-        getNet()->runReadyNetworkOperations();
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-    }
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+}
 
-    // Schedule while we are already scheduled, it should set willRunAgain, then automatically
-    // schedule itself after finishing.
-    TEST_F(ReporterTest, DoubleScheduleShouldCauseRescheduleImmediatelyAfterRespondedTo) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
+TEST_F(ReporterTest, CancelWhileScheduled) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
 
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getNet()->runReadyNetworkOperations();
-        ASSERT_TRUE(getNet()->hasReadyRequests());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
+    reporter->cancel();
+    getNet()->runReadyNetworkOperations();
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
 
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getNet()->runReadyNetworkOperations();
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-    }
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
+}
 
-    // Schedule multiple times while we are already scheduled, it should set willRunAgain,
-    // then automatically schedule itself after finishing, but not a third time since the latter two
-    // will contian the same batch of updates.
-    TEST_F(ReporterTest, TripleScheduleShouldCauseRescheduleImmediatelyAfterRespondedToOnlyOnce) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
+TEST_F(ReporterTest, CancelAfterFirstReturns) {
+    posUpdater->updateMap(0, Timestamp(3, 0));
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_OK(reporter->trigger());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_TRUE(reporter->willRunAgain());
 
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getNet()->runReadyNetworkOperations();
-        ASSERT_TRUE(getNet()->hasReadyRequests());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
+    scheduleNetworkResponse(BSON("ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    ASSERT_TRUE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
 
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getNet()->runReadyNetworkOperations();
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-    }
+    reporter->cancel();
+    getNet()->runReadyNetworkOperations();
+    ASSERT_FALSE(reporter->isActive());
+    ASSERT_FALSE(reporter->willRunAgain());
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
 
-    TEST_F(ReporterTest, CancelWhileScheduled) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
+}
 
-        reporter->cancel();
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
+TEST_F(ReporterTest, ProgressManagerFails) {
+    posUpdater->setResult(false);
+    ASSERT_EQUALS(ErrorCodes::NodeNotFound, reporter->trigger().code());
+}
 
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
-    }
-
-    TEST_F(ReporterTest, CancelAfterFirstReturns) {
-        posUpdater->updateMap(0, Timestamp(3,0));
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_OK(reporter->trigger());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_TRUE(reporter->willRunAgain());
-
-        scheduleNetworkResponse(BSON("ok" << 1));
-        getNet()->runReadyNetworkOperations();
-        ASSERT_TRUE(getNet()->hasReadyRequests());
-        ASSERT_TRUE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-
-        reporter->cancel();
-        ASSERT_FALSE(reporter->isActive());
-        ASSERT_FALSE(reporter->willRunAgain());
-        ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
-
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
-    }
-
-} // namespace
+}  // namespace

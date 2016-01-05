@@ -33,32 +33,34 @@
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
+using boost::intrusive_ptr;
 
-    void AccumulatorLast::processInternal(const Value& input, bool merging) {
-        /* always remember the last value seen */
-        _last = input;
-        _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
-    }
+REGISTER_ACCUMULATOR(last, AccumulatorLast::create);
 
-    Value AccumulatorLast::getValue(bool toBeMerged) const {
-        return _last;
-    }
+const char* AccumulatorLast::getOpName() const {
+    return "$last";
+}
 
-    AccumulatorLast::AccumulatorLast() {
-        _memUsageBytes = sizeof(*this);
-    }
+void AccumulatorLast::processInternal(const Value& input, bool merging) {
+    /* always remember the last value seen */
+    _last = input;
+    _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
+}
 
-    void AccumulatorLast::reset() {
-        _memUsageBytes = sizeof(*this);
-        _last = Value();
-    }
+Value AccumulatorLast::getValue(bool toBeMerged) const {
+    return _last;
+}
 
-    intrusive_ptr<Accumulator> AccumulatorLast::create() {
-        return new AccumulatorLast();
-    }
+AccumulatorLast::AccumulatorLast() {
+    _memUsageBytes = sizeof(*this);
+}
 
-    const char *AccumulatorLast::getOpName() const {
-        return "$last";
-    }
+void AccumulatorLast::reset() {
+    _memUsageBytes = sizeof(*this);
+    _last = Value();
+}
+
+intrusive_ptr<Accumulator> AccumulatorLast::create() {
+    return new AccumulatorLast();
+}
 }

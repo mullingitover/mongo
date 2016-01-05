@@ -32,96 +32,95 @@
 
 #include "mongo/dbtests/config_server_fixture.h"
 
-#include <boost/scoped_ptr.hpp>
 #include <list>
 
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
-#include "mongo/s/d_state.h"
-#include "mongo/s/type_config_version.h"
+#include "mongo/s/catalog/type_config_version.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    using boost::scoped_ptr;
-    using std::endl;
-    using std::list;
-    using std::string;
+using std::unique_ptr;
+using std::list;
+using std::string;
 
-    ConfigServerFixture::ConfigServerFixture()
-        : _client(&_txn),
-          _connectHook(NULL) {
+ConfigServerFixture::ConfigServerFixture() : _client(&_txn), _connectHook(NULL) {}
 
-    }
+string ConfigServerFixture::shardName() {
+    return "TestShardName";
+}
 
-    string ConfigServerFixture::shardName() {
-        return "TestShardName";
-    }
+void ConfigServerFixture::setUp() {
+    shardConnectionPool.clear();
+    DBException::traceExceptions = true;
 
-    void ConfigServerFixture::setUp() {
-        DBException::traceExceptions = true;
+    // Make all connections redirect to the direct client
+    _connectHook = new CustomConnectHook(&_txn);
+    ConnectionString::setConnectionHook(_connectHook);
 
-        // Make all connections redirect to the direct client
-        _connectHook = new CustomConnectHook(&_txn);
-        ConnectionString::setConnectionHook(_connectHook);
+    // Create the default config database before querying, necessary for direct connections
+    clearServer();
+    _client.insert("config.test",
+                   BSON("hello"
+                        << "world"));
+    _client.dropCollection("config.test");
 
-        // Create the default config database before querying, necessary for direct connections
-        clearServer();
-        _client.insert("config.test", BSON( "hello" << "world" ));
-        _client.dropCollection("config.test");
+    // Create an index over the chunks, to allow correct diffing
+    ASSERT_OK(
+        dbtests::createIndex(&_txn,
+                             ChunkType::ConfigNS,
+                             BSON(ChunkType::ns() << 1 << ChunkType::DEPRECATED_lastmod() << 1)));
 
-        // Create an index over the chunks, to allow correct diffing
-        ASSERT_OK(dbtests::createIndex(&_txn,
-                                       ChunkType::ConfigNS,
-                                       BSON( ChunkType::ns() << 1 <<
-                                             ChunkType::DEPRECATED_lastmod() << 1 )));
+    const ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
 
-        ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
-        shardingState.initialize(connStr.toString());
-        shardingState.gotShardName(shardName());
-    }
+    ShardingState::get(&_txn)->initialize(&_txn, connStr.toString());
+    ShardingState::get(&_txn)->setShardName(shardName());
+}
 
-    void ConfigServerFixture::clearServer() {
-        _client.dropDatabase("config");
-    }
+void ConfigServerFixture::clearServer() {
+    _client.dropDatabase("config");
+}
 
-    void ConfigServerFixture::clearVersion() {
-        _client.dropCollection(VersionType::ConfigNS);
-    }
+void ConfigServerFixture::clearVersion() {
+    _client.dropCollection(VersionType::ConfigNS);
+}
 
-    void ConfigServerFixture::dumpServer() {
-        log() << "Dumping virtual config server to log..." << endl;
+void ConfigServerFixture::dumpServer() {
+    log() << "Dumping virtual config server to log...";
 
-        list<string> collectionNames(_client.getCollectionNames("config"));
+    list<string> collectionNames(_client.getCollectionNames("config"));
 
-        for (list<string>::iterator it = collectionNames.begin(); it != collectionNames.end(); ++it)
-        {
-            const string& collection = *it;
+    for (list<string>::iterator it = collectionNames.begin(); it != collectionNames.end(); ++it) {
+        const string& collection = *it;
 
-            scoped_ptr<DBClientCursor> cursor(_client.query(collection, BSONObj()).release());
-            ASSERT(cursor.get() != NULL);
+        unique_ptr<DBClientCursor> cursor(_client.query(collection, BSONObj()).release());
+        ASSERT(cursor.get() != NULL);
 
-            log() << "Dumping collection " << collection << endl;
+        log() << "Dumping collection " << collection;
 
-            while (cursor->more()) {
-                BSONObj obj = cursor->nextSafe();
-                log() << obj.toString() << endl;
-            }
+        while (cursor->more()) {
+            BSONObj obj = cursor->nextSafe();
+            log() << obj.toString();
         }
     }
-
-    void ConfigServerFixture::tearDown() {
-        shardingState.clearCollectionMetadata();
-        clearServer();
-
-        // Make all connections redirect to the direct client
-        ConnectionString::setConnectionHook(NULL);
-        delete _connectHook;
-        _connectHook = NULL;
-
-        DBException::traceExceptions = false;
-    }
-
 }
+
+void ConfigServerFixture::tearDown() {
+    ShardingState::get(&_txn)->clearCollectionMetadata();
+    clearServer();
+
+    // Make all connections redirect to the direct client
+    ConnectionString::setConnectionHook(NULL);
+    delete _connectHook;
+    _connectHook = NULL;
+
+    DBException::traceExceptions = false;
+}
+
+}  // namespace mongo

@@ -63,20 +63,6 @@
                                                           c.options.temp === true; }));
 
     //
-    // Test that collections are returned in sorted name order.
-    //
-
-    assert.commandWorked(mydb.dropDatabase());
-    assert.commandWorked(mydb.createCollection("baz"));
-    assert.commandWorked(mydb.createCollection("foo"));
-    assert.commandWorked(mydb.createCollection("quux"));
-    assert.commandWorked(mydb.createCollection("bar"));
-    var collectionNames = getListCollectionsCursor().toArray().filter(function(c) {
-        return c.name === "foo" || c.name === "bar" || c.name === "baz" || c.name === "quux";
-    }).map(function(c) { return c.name; });
-    assert.eq(["bar", "baz", "foo", "quux"], collectionNames);
-
-    //
     // Test basic usage of "filter" option.
     //
 
@@ -152,8 +138,8 @@
     // Ensure that the server accepts an empty object for "cursor".  This is equivalent to not
     // specifying "cursor" at all.
     //
-    // We do not test for objsLeftInBatch() here, since the default batch size for this command is
-    // not specified.
+    // We do not test for objsLeftInBatch() here, since the default batch size for this command
+    // is not specified.
     cursor = getListCollectionsCursor({cursor: {}});
     assert.eq(2, cursorCountMatching(cursor, function(c) { return c.name === "foo" ||
                                                                   c.name === "bar"; }));

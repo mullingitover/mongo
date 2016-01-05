@@ -70,22 +70,35 @@
 // No need to set WINVER, SdkDdkVer.h does that for us, we double check this below.
 
 // for rand_s() usage:
-# define _CRT_RAND_S
-# ifndef NOMINMAX
-#  define NOMINMAX
-# endif
+#define _CRT_RAND_S
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 // Do not complain that about standard library functions that Windows believes should have
 // underscores in front of them, such as unlink().
 #define _CRT_NONSTDC_NO_DEPRECATE
 
 // tell windows.h not to include a bunch of headers we don't need:
-# define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 
-# include <winsock2.h> //this must be included before the first windows.h include
-# include <ws2tcpip.h>
-# include <wspiapi.h>
-# include <windows.h>
+// Tell windows.h not to define any NT status codes, so that we can
+// get the definitions from ntstatus.h, which has a more complete list.
+#define WIN32_NO_STATUS
+
+#include <winsock2.h>  //this must be included before the first windows.h include
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#undef WIN32_NO_STATUS
+
+// Obtain a definition for the ntstatus type.
+#include <winternl.h>
+
+// Add back in the status definitions so that macro expansions for
+// things like STILL_ACTIVE and WAIT_OBJECT_O can be resolved (they
+// expand to STATUS_ codes).
+#include <ntstatus.h>
 
 // Should come either from the command line, or if not set there, the inclusion of sdkddkver.h
 // via windows.h above should set it based in _WIN32_WINNT, which is assuredly set by now.

@@ -34,76 +34,88 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/command_request.h"
+#include "mongo/rpc/command_request_builder.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    TEST(RequestTest, ParseAllFields) {
-        std::vector<char> opCommandData;
+TEST(CommandRequest, ParseAllFields) {
+    std::vector<char> opCommandData;
 
-        using std::begin;
-        using std::end;
+    using std::begin;
+    using std::end;
 
-        auto writeString = [&opCommandData](const std::string& str) {
-            opCommandData.insert(end(opCommandData), begin(str), end(str));
-            opCommandData.push_back('\0');
-        };
+    auto writeString = [&opCommandData](const std::string& str) {
+        opCommandData.insert(end(opCommandData), begin(str), end(str));
+        opCommandData.push_back('\0');
+    };
 
-        auto writeObj = [&opCommandData](const BSONObj& obj) {
-            opCommandData.insert(end(opCommandData), obj.objdata(),
-                                 obj.objdata() + obj.objsize());
-        };
+    auto writeObj = [&opCommandData](const BSONObj& obj) {
+        opCommandData.insert(end(opCommandData), obj.objdata(), obj.objdata() + obj.objsize());
+    };
 
-        auto database = std::string{"ookokokokok"};
-        writeString(database);
+    auto database = std::string{"ookokokokok"};
+    writeString(database);
 
-        auto commandName = std::string{"abababa"};
-        writeString(commandName);
+    auto commandName = std::string{"abababa"};
+    writeString(commandName);
 
-        BSONObjBuilder metadataBob{};
-        metadataBob.append("foo", "bar");
-        auto metadata = metadataBob.done();
-        writeObj(metadata);
+    BSONObjBuilder commandArgsBob{};
+    commandArgsBob.append("baz", "garply");
+    auto commandArgs = commandArgsBob.done();
+    writeObj(commandArgs);
 
-        BSONObjBuilder commandArgsBob{};
-        commandArgsBob.append("baz", "garply");
-        auto commandArgs = commandArgsBob.done();
-        writeObj(commandArgs);
+    BSONObjBuilder metadataBob{};
+    metadataBob.append("foo", "bar");
+    auto metadata = metadataBob.done();
+    writeObj(metadata);
 
-        BSONObjBuilder inputDoc1Bob{};
-        inputDoc1Bob.append("meep", "boop").append("meow", "chirp");
-        auto inputDoc1 = inputDoc1Bob.done();
-        writeObj(inputDoc1);
+    BSONObjBuilder inputDoc1Bob{};
+    inputDoc1Bob.append("meep", "boop").append("meow", "chirp");
+    auto inputDoc1 = inputDoc1Bob.done();
+    writeObj(inputDoc1);
 
-        BSONObjBuilder inputDoc2Bob{};
-        inputDoc1Bob.append("bleep", "bop").append("woof", "squeak");
-        auto inputDoc2 = inputDoc2Bob.done();
-        writeObj(inputDoc2);
+    BSONObjBuilder inputDoc2Bob{};
+    inputDoc1Bob.append("bleep", "bop").append("woof", "squeak");
+    auto inputDoc2 = inputDoc2Bob.done();
+    writeObj(inputDoc2);
 
-        Message toSend;
-        toSend.setData(dbCommand, opCommandData.data(), opCommandData.size());
+    Message toSend;
+    toSend.setData(dbCommand, opCommandData.data(), opCommandData.size());
 
-        rpc::CommandRequest opCmd{&toSend};
+    rpc::CommandRequest opCmd{&toSend};
 
-        ASSERT_EQUALS(opCmd.getCommandName(), commandName);
-        ASSERT_EQUALS(opCmd.getDatabase(), database);
-        ASSERT_EQUALS(opCmd.getMetadata(), metadata);
-        ASSERT_EQUALS(opCmd.getCommandArgs(), commandArgs);
+    ASSERT_EQUALS(opCmd.getCommandName(), commandName);
+    ASSERT_EQUALS(opCmd.getDatabase(), database);
+    ASSERT_EQUALS(opCmd.getMetadata(), metadata);
+    ASSERT_EQUALS(opCmd.getCommandArgs(), commandArgs);
 
-        auto inputDocRange = opCmd.getInputDocs();
-        auto inputDocRangeIter = inputDocRange.begin();
+    auto inputDocRange = opCmd.getInputDocs();
+    auto inputDocRangeIter = inputDocRange.begin();
 
-        ASSERT_EQUALS(*inputDocRangeIter, inputDoc1);
-        // can't use assert equals since we don't have an op to print the iter.
-        ASSERT_FALSE(inputDocRangeIter == inputDocRange.end());
-        ++inputDocRangeIter;
-        ASSERT_EQUALS(*inputDocRangeIter, inputDoc2);
-        ASSERT_FALSE(inputDocRangeIter == inputDocRange.end());
-        ++inputDocRangeIter;
+    ASSERT_EQUALS(*inputDocRangeIter, inputDoc1);
+    // can't use assert equals since we don't have an op to print the iter.
+    ASSERT_FALSE(inputDocRangeIter == inputDocRange.end());
+    ++inputDocRangeIter;
+    ASSERT_EQUALS(*inputDocRangeIter, inputDoc2);
+    ASSERT_FALSE(inputDocRangeIter == inputDocRange.end());
+    ++inputDocRangeIter;
 
-        ASSERT_TRUE(inputDocRangeIter == inputDocRange.end());
-    }
+    ASSERT_TRUE(inputDocRangeIter == inputDocRange.end());
+}
+
+TEST(CommandRequest, InvalidNSThrows) {
+    rpc::CommandRequestBuilder crb;
+    crb.setDatabase("foo////!!!!<><><>");
+    crb.setCommandName("foo");
+    crb.setCommandArgs(BSON("ping" << 1));
+    crb.setMetadata(BSONObj());
+    auto msg = crb.done();
+    ASSERT_THROWS(rpc::CommandRequest{&msg}, AssertionException);
+}
+
 }  // namespace

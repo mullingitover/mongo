@@ -29,32 +29,73 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    struct ReadPreferenceSetting;
-    struct HostAndPort;
-    template<typename T> class StatusWith;
+class ConnectionString;
+class OperationContext;
+struct ReadPreferenceSetting;
+struct HostAndPort;
+template <typename T>
+class StatusWith;
 
+/**
+ * Interface encapsulating the targeting logic for a given replica set or a standalone host.
+ */
+class RemoteCommandTargeter {
+    MONGO_DISALLOW_COPYING(RemoteCommandTargeter);
+
+public:
+    virtual ~RemoteCommandTargeter() = default;
 
     /**
-     * Interface encapsulating the targeting logic for a given replica set or a standalone host.
+     * Retrieves the full connection string for the replica set or standalone host which are
+     * represented by this targeter. This value is always constant for a standalone host and may
+     * vary for replica sets as hosts are added, discovered and removed during the lifetime of the
+     * set.
      */
-    class RemoteCommandTargeter {
-        MONGO_DISALLOW_COPYING(RemoteCommandTargeter);
-    public:
-        virtual ~RemoteCommandTargeter() = default;
+    virtual ConnectionString connectionString() = 0;
 
-        /**
-         * Obtains a host, which matches the read preferences specified by readPref.
-         *
-         * Returns OK and a host and port to use for the specified read preference. Otherwise may
-         *      return any ErrorCode.
-         */
-        virtual StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref) = 0;
+    /**
+     * Obtains a host, which matches the read preferences specified by readPref, blocking for the
+     * specified maxWait milliseconds, if a match cannot be found immediately.
+     *
+     * Specifying a maxWait of zero means non-blocking. I.e., the call will just check the in-memory
+     * cached view of the replica set's host state and won't wait for it to be refreshed if it is
+     * found to be stale.
+     *
+     * Returns OK and a host and port to use for the specified read preference or an ErrorCode.
+     * Known error codes are:
+     *   All error codes which can be returned by ReplicaSetMonitor::getHostOrRefresh.
+     */
+    virtual StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                             Milliseconds maxWait = Milliseconds(0)) = 0;
 
-    protected:
-        RemoteCommandTargeter() = default;
-    };
+    /**
+     * Reports to the targeter that a NotMaster response was received when communicating with
+     * "host', and so it should update its bookkeeping to avoid giving out the host again on a
+     * subsequent request for the primary.
+     */
+    virtual void markHostNotMaster(const HostAndPort& host) = 0;
 
-} // namespace mongo
+    /**
+     * Similar to markHostNotMaster(). Reports to the targeter that a HostUnreachable response was
+     * received when communicating with "host". The targeter should update its bookkeeping to avoid
+     * giving out the same host on a subsequent request.
+     */
+    virtual void markHostUnreachable(const HostAndPort& host) = 0;
+
+    /**
+     * Based on the remaining time of the operation and the default max wait time for findHost,
+     * selects an appropriate value to pass to the maxWait argument of the findHost method, so it
+     * has high likelyhood in returning on time and also leaving time for the rest of the call to
+     * complete.
+     */
+    static Milliseconds selectFindHostMaxWaitTime(OperationContext* txn);
+
+protected:
+    RemoteCommandTargeter() = default;
+};
+
+}  // namespace mongo

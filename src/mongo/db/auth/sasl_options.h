@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -36,27 +37,27 @@
 namespace mongo {
 
 namespace optionenvironment {
-    class OptionSection;
-    class Environment;
-} // namespace optionenvironment
+class OptionSection;
+class Environment;
+}  // namespace optionenvironment
 
-    namespace moe = optionenvironment;
+namespace moe = optionenvironment;
 
-    struct SASLGlobalParams {
+struct SASLGlobalParams {
+    std::vector<std::string> authenticationMechanisms;
+    std::string hostName;
+    std::string serviceName;
+    std::string authdPath;
+    std::atomic<int> scramIterationCount;  // NOLINT
+    std::atomic<int> authFailedDelay;      // NOLINT
 
-        std::vector<std::string> authenticationMechanisms;
-        std::string hostName;
-        std::string serviceName;
-        std::string authdPath;
-        int scramIterationCount;
+    SASLGlobalParams();
+};
 
-        SASLGlobalParams();
-    };
+extern SASLGlobalParams saslGlobalParams;
 
-    extern SASLGlobalParams saslGlobalParams;
+Status addSASLOptions(moe::OptionSection* options);
 
-    Status addSASLOptions(moe::OptionSection* options);
+Status storeSASLOptions(const moe::Environment& params);
 
-    Status storeSASLOptions(const moe::Environment& params);
-
-} // namespace mongo
+}  // namespace mongo

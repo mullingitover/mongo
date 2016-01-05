@@ -28,7 +28,7 @@ Concepts
 A database contains one or more collections, each with a number of indexes, and a catalog listing
 them. All MongoDB collections are implemented with record stores: one for the documents themselves,
 and one for each index. By using the KVEngine class, you only have to deal with the abstraction, as
-the KVStorageEngine] implements the StorageEngine interface, using record stores for catalogs and
+the KVStorageEngine implements the StorageEngine interface, using record stores for catalogs and
 indexes.
 
 #### Record Identities
@@ -107,8 +107,8 @@ details.
 
 * KVEngine
 * RecordStore
-* RecordIterator
 * RecoveryUnit
+* SeekableRecordCursor
 * SortedDataInterface
 * ServerStatusSection
 * ServerParameter
@@ -120,4 +120,3 @@ details.
 [replica set]: http://docs.mongodb.org/manual/replication/
 [Storage FAQ]: http://docs.mongodb.org/manual/faq/storage
 [two-phase locking]: http://en.wikipedia.org/wiki/Two-phase_locking
-

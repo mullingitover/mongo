@@ -30,8 +30,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/weak_ptr.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -41,64 +39,61 @@
 
 namespace mongo {
 
+/**
+ * Stage for pulling results out from an aggregation pipeline.
+ */
+class PipelineProxyStage final : public PlanStage {
+public:
+    PipelineProxyStage(OperationContext* opCtx,
+                       boost::intrusive_ptr<Pipeline> pipeline,
+                       const std::shared_ptr<PlanExecutor>& child,
+                       WorkingSet* ws);
+
+    PlanStage::StageState work(WorkingSetID* out) final;
+
+    bool isEOF() final;
+
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
+
+    //
+    // Manage our OperationContext.
+    //
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
     /**
-     * Stage for pulling results out from an aggregation pipeline.
+     * Return a shared pointer to the PlanExecutor that feeds the pipeline. The returned
+     * pointer may be NULL.
      */
-    class PipelineProxyStage : public PlanStage {
-    public:
-        PipelineProxyStage(boost::intrusive_ptr<Pipeline> pipeline,
-                           const boost::shared_ptr<PlanExecutor>& child,
-                           WorkingSet* ws);
+    std::shared_ptr<PlanExecutor> getChildExecutor();
 
-        virtual PlanStage::StageState work(WorkingSetID* out);
+    // Returns empty PlanStageStats object
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual bool isEOF();
 
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // Not used.
+    SpecificStats* getSpecificStats() const final {
+        return NULL;
+    }
 
-        //
-        // Manage our OperationContext. We intentionally don't propagate to the child
-        // Runner as that is handled by DocumentSourceCursor as it needs to.
-        //
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
+    // Not used.
+    StageType stageType() const final {
+        return STAGE_PIPELINE_PROXY;
+    }
 
-        /**
-         * Make obj the next object returned by getNext().
-         */
-        void pushBack(const BSONObj& obj);
+    static const char* kStageType;
 
-        /**
-         * Return a shared pointer to the PlanExecutor that feeds the pipeline. The returned
-         * pointer may be NULL.
-         */
-        boost::shared_ptr<PlanExecutor> getChildExecutor();
+private:
+    boost::optional<BSONObj> getNextBson();
 
-        //
-        // These should not be used.
-        //
+    // Things in the _stash should be returned before pulling items from _pipeline.
+    const boost::intrusive_ptr<Pipeline> _pipeline;
+    std::vector<BSONObj> _stash;
+    const bool _includeMetaData;
+    std::weak_ptr<PlanExecutor> _childExec;
 
-        virtual PlanStageStats* getStats() { return NULL; }
-        virtual CommonStats* getCommonStats() const { return NULL; }
-        virtual SpecificStats* getSpecificStats() const { return NULL; }
+    // Not owned by us.
+    WorkingSet* _ws;
+};
 
-        // Not used.
-        virtual std::vector<PlanStage*> getChildren() const;
-
-        // Not used.
-        virtual StageType stageType() const { return STAGE_PIPELINE_PROXY; }
-
-    private:
-        boost::optional<BSONObj> getNextBson();
-
-        // Things in the _stash sould be returned before pulling items from _pipeline.
-        const boost::intrusive_ptr<Pipeline> _pipeline;
-        std::vector<BSONObj> _stash;
-        const bool _includeMetaData;
-        boost::weak_ptr<PlanExecutor> _childExec;
-
-        // Not owned by us.
-        WorkingSet* _ws;
-    };
-
-} // namespace mongo
+}  // namespace mongo

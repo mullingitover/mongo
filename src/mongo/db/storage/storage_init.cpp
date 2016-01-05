@@ -28,30 +28,37 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
 
 // TODO: Does this belong here?
 namespace {
 
-        class StorageSSS : public ServerStatusSection {
-        public:
-            StorageSSS() : ServerStatusSection( "storageEngine" ) {
-            }
+class StorageSSS : public ServerStatusSection {
+public:
+    StorageSSS() : ServerStatusSection("storageEngine") {}
 
-            virtual ~StorageSSS() {}
+    virtual ~StorageSSS() {}
 
-            virtual bool includeByDefault() const { return true; }
+    virtual bool includeByDefault() const {
+        return true;
+    }
 
-            virtual BSONObj generateSection(OperationContext* txn,
-                                            const BSONElement& configElement) const {
+    virtual BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+        auto engine = txn->getClient()->getServiceContext()->getGlobalStorageEngine();
+        return BSON("name" << storageGlobalParams.engine << "supportsCommittedReads"
+                           << bool(engine->getSnapshotManager()));
+    }
 
-                return BSON( "name" << storageGlobalParams.engine );
-            }
-
-        } storageSSS;
+} storageSSS;
 
 }  // namespace
 }  // namespace mongo

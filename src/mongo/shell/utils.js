@@ -19,6 +19,22 @@ function reconnect(db) {
                 });
 };
 
+function _getErrorWithCode(codeOrObj, message) {
+    var e = new Error(message);
+    if (codeOrObj != undefined) {
+        if (codeOrObj.writeError) {
+            e.code = codeOrObj.writeError.code;
+        } else if (codeOrObj.code) {
+            e.code = codeOrObj.code;
+        } else {
+            // At this point assume codeOrObj is a number type
+            e.code = codeOrObj;
+        }
+    }
+
+    return e;
+}
+
 // Please consider using bsonWoCompare instead of this as much as possible.
 friendlyEqual = function( a , b ){
     if ( a == b )
@@ -119,6 +135,23 @@ shellPrint = function( x ){
     }
 }
 
+print.captureAllOutput = function (fn, args) {
+    var res = {};
+    res.output = [];
+    var __orig_print = print;
+    print = function () {
+        Array.prototype.push.apply(res.output, Array.prototype.slice.call(arguments).join(" ").split("\n"));
+    };
+    try {
+        res.result = fn.apply(undefined, args);
+    }
+    finally {
+        // Stop capturing print() output
+        print = __orig_print;
+    }
+    return res;
+};
+
 if ( typeof TestData == "undefined" ){
     TestData = undefined
 }
@@ -157,7 +190,20 @@ jsTestOptions = function(){
                               authPassword : TestData.keyFileData,
                               authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
-                              adminPassword : TestData.adminPassword || "password"});
+                              adminPassword : TestData.adminPassword || "password",
+                              useLegacyConfigServers: TestData.useLegacyConfigServers || false,
+                              useLegacyReplicationProtocol:
+                                    TestData.useLegacyReplicationProtocol || false,
+                              enableMajorityReadConcern: TestData.enableMajorityReadConcern,
+                              enableEncryption: TestData.enableEncryption,
+                              encryptionKeyFile: TestData.encryptionKeyFile,
+                              auditDestination: TestData.auditDestination,
+                              minPort: TestData.minPort,
+                              maxPort: TestData.maxPort,
+                              // Note: does not support the array version
+                              mongosBinVersion: TestData.mongosBinVersion || "",
+                            }
+                        );
     }
     return _jsTestOptions;
 }
@@ -184,12 +230,6 @@ jsTest.adminUserRoles = ["root"]
 
 jsTest.dir = function(){
     return jsTest.path().replace( /\/[^\/]+$/, "/" )
-}
-
-jsTest.randomize = function( seed ) {
-    if( seed == undefined ) seed = new Date().getTime()
-    Random.srand( seed )
-    print( "Random seed for test : " + seed ) 
 }
 
 jsTest.authenticate = function(conn) {
@@ -241,6 +281,21 @@ jsTest.isMongos = function(conn) {
 
 defaultPrompt = function() {
     var status = db.getMongo().authStatus;
+    var prefix = db.getMongo().promptPrefix;
+
+    if (typeof prefix == 'undefined') {
+        prefix = "";
+        var buildInfo = db.runCommand({buildInfo: 1});
+        try {
+            if (buildInfo.modules.indexOf("enterprise") > -1) {
+                prefix = "MongoDB Enterprise "
+            }
+        } catch (e) {
+            // Don't do anything here. Just throw the error away.
+        }
+        db.getMongo().promptPrefix = prefix;
+    }
+
     try {
         // try to use repl set prompt -- no status or auth detected yet
         if (!status || !status.authRequired) {
@@ -248,7 +303,7 @@ defaultPrompt = function() {
                 var prompt = replSetMemberStatePrompt();
                 // set our status that it was good
                 db.getMongo().authStatus = {replSetGetStatus:true, isMaster: true};
-                return prompt;
+                return prefix + prompt;
             } catch (e) {
                 // don't have permission to run that, or requires auth
                 //print(e);
@@ -264,7 +319,7 @@ defaultPrompt = function() {
                 // set our status that it was good
                 status.replSetGetStatus = true;
                 db.getMongo().authStatus = status;
-                return prompt;
+                return prefix + prompt;
             } catch (e) {
                 // don't have permission to run that, or requires auth
                 //print(e);
@@ -279,7 +334,7 @@ defaultPrompt = function() {
                 var prompt = isMasterStatePrompt();
                 status.isMaster = true;
                 db.getMongo().authStatus = status;
-                return prompt;
+                return prefix + prompt;
             } catch (e) {
                 status.authRequired = true;
                 status.isMaster = false;
@@ -292,7 +347,7 @@ defaultPrompt = function() {
     }
 
     db.getMongo().authStatus = status;
-    return "> ";
+    return prefix + "> ";
 }
 
 replSetMemberStatePrompt = function() {
@@ -315,7 +370,7 @@ replSetMemberStatePrompt = function() {
          if ( info && info.length < 20 ) {
              state = info; // "mongos", "configsvr"
          } else {
-             throw Error("Failed:" + info);
+             throw _getErrorWithCode(stateInfo, "Failed:" + info);
          }
     }
     return state + '> ';
@@ -345,7 +400,7 @@ isMasterStatePrompt = function() {
         }
         state = state + role;
     } else {
-        throw Error("Failed: " + tojson(isMaster));
+        throw _getErrorWithCode(isMaster, "Failed: " + tojson(isMaster));
     }
     return state + '> ';
 }
@@ -362,7 +417,7 @@ if (typeof(_writeMode) == 'undefined') {
 
 if (typeof(_readMode) == 'undefined') {
     // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
-    _readMode = function() { return "compatibility"; };
+    _readMode = function() { return "legacy"; };
 };
 
 shellPrintHelper = function (x) {
@@ -390,6 +445,9 @@ shellPrintHelper = function (x) {
         print("null");
         return;
     }
+
+    if (x === MinKey || x === MaxKey)
+        return x.tojson();
 
     if (typeof x != "object")
         return print(x);
@@ -427,6 +485,9 @@ shellAutocomplete = function ( /*prefix*/ ) { // outer scope function called on 
     builtinMethods[BinData] = "hex base64 length subtype".split(' ');
 
     var extraGlobals = "Infinity NaN undefined null true false decodeURI decodeURIComponent encodeURI encodeURIComponent escape eval isFinite isNaN parseFloat parseInt unescape Array Boolean Date Math Number RegExp String print load gc MinKey MaxKey Mongo NumberInt NumberLong ObjectId DBPointer UUID BinData HexData MD5 Map Timestamp JSON".split( ' ' );
+    if (typeof NumberDecimal !== 'undefined') {
+        extraGlobals[extraGlobals.length] = "NumberDecimal";
+    }
 
     var isPrivate = function( name ) {
         if ( shellAutocomplete.showPrivate ) return false;
@@ -745,53 +806,85 @@ Math.sigFig = function( x , N ){
     return Math.round(x*p)/p;
 }
 
-Random = function() {}
+var Random = (function() {
+    var initialized = false;
+    var errorMsg = "The random number generator hasn't been seeded yet; " +
+                   "call Random.setRandomSeed()";
 
-// set random seed
-Random.srand = function( s ) { _srand( s ); }
+    // Set the random generator seed.
+    function srand(s) {
+        initialized = true;
+        return _srand(s);
+    }
 
-// random number 0 <= r < 1
-Random.rand = function() { return _rand(); }
+    // Set the random generator seed & print the result.
+    function setRandomSeed(s) {
+        var seed = srand(s);
+        print("setting random seed: " + seed);
+    }
 
-// random integer 0 <= r < n
-Random.randInt = function( n ) { return Math.floor( Random.rand() * n ); }
+    // Generate a random number 0 <= r < 1.
+    function rand() {
+        if (!initialized) {
+            throw new Error(errorMsg);
+        }
+        return _rand();
+    }
 
-Random.setRandomSeed = function( s ) {
-    s = s || new Date().getTime();
-    print( "setting random seed: " + s );
-    Random.srand( s );
-}
+    // Generate a random integer 0 <= r < n.
+    function randInt(n) {
+        if (!initialized) {
+            throw new Error(errorMsg);
+        }
+        return Math.floor(rand() * n);
+    }
 
-// generate a random value from the exponential distribution with the specified mean
-Random.genExp = function( mean ) {
-    var r = Random.rand();
-    if ( r == 0 ) {
-        r = Random.rand();
-        if ( r == 0 ) {
-            r = 0.000001;
+    // Generate a random value from the exponential distribution with the specified mean.
+    function genExp(mean) {
+        if (!initialized) {
+            throw new Error(errorMsg);
+        }
+        var r = rand();
+        if (r == 0) {
+            r = rand();
+            if (r == 0) {
+                r = 0.000001;
+            }
+        }
+        return -Math.log(r) * mean;
+    }
+
+    /**
+     * Generate a random value from the normal distribution with specified 'mean' and
+     * 'standardDeviation'.
+     */
+    function genNormal(mean, standardDeviation) {
+        if (!initialized) {
+            throw new Error(errorMsg);
+        }
+        // See http://en.wikipedia.org/wiki/Marsaglia_polar_method
+        while ( true ) {
+            var x = (2 * rand()) - 1;
+            var y = (2 * rand()) - 1;
+            var s = (x * x) + (y * y);
+
+            if (s > 0 && s < 1) {
+                var standardNormal = x * Math.sqrt(-2 * Math.log(s) / s);
+                return mean + (standardDeviation * standardNormal);
+            }
         }
     }
-    return -Math.log( r ) * mean;
-}
 
-/**
- * Generate a random value from the normal distribution with specified 'mean' and
- * 'standardDeviation'.
- */
-Random.genNormal = function( mean, standardDeviation ) {    
+    return {
+        genExp: genExp,
+        genNormal: genNormal,
+        rand: rand,
+        randInt: randInt,
+        setRandomSeed: setRandomSeed,
+        srand: srand,
+    };
 
-    // See http://en.wikipedia.org/wiki/Marsaglia_polar_method
-    while ( true ) {
-        var x = ( 2 * Random.rand() ) - 1;
-        var y = ( 2 * Random.rand() ) - 1;
-        var s = ( x * x ) + ( y * y );
-
-        if ( s > 0 && s < 1 ) {
-            var standardNormal = x * Math.sqrt( -2 * Math.log( s ) / s );
-            return mean + ( standardDeviation * standardNormal );
-        }
-    }
-}
+})();
 
 Geo = {};
 Geo.distance = function( a , b ){

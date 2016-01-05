@@ -3,8 +3,8 @@ selector:
     roots:
     - jstests/dur/*.js
     exclude_files:
-    # Skip the passthrough test because it is run separately.
-    - jstests/dur/dur_jscore_passthrough.js
+    # SERVER-19124 closeall.js causes the task to time out in Evergreen.
+    - jstests/dur/closeall.js
 
 # Durability tests start their own mongod's.
 executor:
@@ -15,3 +15,4 @@ executor:
           TestData:
             storageEngine: mmapv1
         nodb: ''
+        readMode: commands

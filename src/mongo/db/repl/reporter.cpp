@@ -38,116 +38,127 @@
 namespace mongo {
 namespace repl {
 
-    ReplicationProgressManager::~ReplicationProgressManager() {}
+using executor::RemoteCommandRequest;
 
-    Reporter::Reporter(ReplicationExecutor* executor,
-                       ReplicationProgressManager* ReplicationProgressManager,
-                       const HostAndPort& target)
-        : _executor(executor),
-          _updatePositionSource(ReplicationProgressManager),
-          _target(target),
-          _status(Status::OK()),
-          _willRunAgain(false),
-          _active(false) {
+Reporter::Reporter(ReplicationExecutor* executor,
+                   PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn,
+                   const HostAndPort& target)
+    : _executor(executor),
+      _prepareReplSetUpdatePositionCommandFn(prepareReplSetUpdatePositionCommandFn),
+      _target(target),
+      _status(Status::OK()),
+      _willRunAgain(false),
+      _active(false) {
+    uassert(ErrorCodes::BadValue, "null replication executor", executor);
+    uassert(ErrorCodes::BadValue,
+            "null function to create replSetUpdatePosition command object",
+            prepareReplSetUpdatePositionCommandFn);
+    uassert(ErrorCodes::BadValue, "target name cannot be empty", !target.empty());
+}
 
-        uassert(ErrorCodes::BadValue, "null replication executor", executor);
-        uassert(ErrorCodes::BadValue,
-                "null replication progress manager",
-                ReplicationProgressManager);
-        uassert(ErrorCodes::BadValue, "target name cannot be empty", !target.empty());
+Reporter::~Reporter() {
+    DESTRUCTOR_GUARD(cancel(););
+}
+
+void Reporter::cancel() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    if (!_active) {
+        return;
     }
 
-    Reporter::~Reporter() {
-        cancel();
-    }
+    _status = Status(ErrorCodes::CallbackCanceled, "Reporter no longer valid");
+    _willRunAgain = false;
+    invariant(_remoteCommandCallbackHandle.isValid());
+    _executor->cancel(_remoteCommandCallbackHandle);
+}
 
-    void Reporter::cancel() {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-
+void Reporter::wait() {
+    ReplicationExecutor::CallbackHandle handle;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         if (!_active) {
             return;
         }
-
-        _status = Status(ErrorCodes::CallbackCanceled, "Reporter no longer valid");
-        _active = false;
-        _willRunAgain = false;
-        invariant(_remoteCommandCallbackHandle.isValid());
-        _executor->cancel(_remoteCommandCallbackHandle);
+        if (!_remoteCommandCallbackHandle.isValid()) {
+            return;
+        }
+        handle = _remoteCommandCallbackHandle;
     }
+    _executor->wait(handle);
+}
 
-    void Reporter::wait() {
-        boost::unique_lock<boost::mutex> lk(_mutex);
-        if(_remoteCommandCallbackHandle.isValid()) {
-            _executor->wait(_remoteCommandCallbackHandle);
-        }
-    }
+Status Reporter::trigger() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _schedule_inlock();
+}
 
-    Status Reporter::trigger() {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        return _schedule_inlock();
-    }
-
-    Status Reporter::_schedule_inlock() {
-        if (!_status.isOK()) {
-            return _status;
-        }
-
-        if (_active) {
-            _willRunAgain = true;
-            return _status;
-        }
-
-        LOG(2) << "Reporter scheduling report to : " << _target;
-
-        _willRunAgain = false;
-
-        BSONObjBuilder cmd;
-        _updatePositionSource->prepareReplSetUpdatePositionCommand(&cmd);
-        StatusWith<ReplicationExecutor::CallbackHandle> scheduleResult =
-            _executor->scheduleRemoteCommand(
-                RemoteCommandRequest(_target, "admin", cmd.obj()),
-                stdx::bind(&Reporter::_callback, this, stdx::placeholders::_1));
-
-        if (!scheduleResult.isOK()) {
-            _status = scheduleResult.getStatus();
-            LOG(2) << "Reporter failed to schedule with status: " << _status;
-
-            return _status;
-        }
-
-        _active = true;
-        _remoteCommandCallbackHandle = scheduleResult.getValue();
-        return Status::OK();
-    }
-
-    void Reporter::_callback(const ReplicationExecutor::RemoteCommandCallbackData& rcbd) {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-
-        _status = rcbd.response.getStatus();
-        _active = false;
-
-        LOG(2) << "Reporter ended with status: " << _status << " after reporting to " << _target;
-        if (_status.isOK() && _willRunAgain) {
-            _schedule_inlock();
-        }
-        else {
-            _willRunAgain = false;
-        }
-    }
-
-    Status Reporter::getStatus() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
+Status Reporter::_schedule_inlock() {
+    if (!_status.isOK()) {
         return _status;
     }
 
-    bool Reporter::isActive() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        return _active;
+    if (_active) {
+        _willRunAgain = true;
+        return _status;
     }
 
-    bool Reporter::willRunAgain() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        return _willRunAgain;
+    LOG(2) << "Reporter scheduling report to : " << _target;
+
+    auto prepareResult = _prepareReplSetUpdatePositionCommandFn();
+
+    if (!prepareResult.isOK()) {
+        // Returning NodeNotFound because currently this is the only way
+        // prepareReplSetUpdatePositionCommand() can fail in production.
+        return Status(ErrorCodes::NodeNotFound,
+                      "Reporter failed to create replSetUpdatePositionCommand command.");
     }
-} // namespace repl
-} // namespace mongo
+    auto cmdObj = prepareResult.getValue();
+    StatusWith<ReplicationExecutor::CallbackHandle> scheduleResult =
+        _executor->scheduleRemoteCommand(
+            RemoteCommandRequest(_target, "admin", cmdObj),
+            stdx::bind(&Reporter::_callback, this, stdx::placeholders::_1));
+
+    if (!scheduleResult.isOK()) {
+        _status = scheduleResult.getStatus();
+        LOG(2) << "Reporter failed to schedule with status: " << _status;
+
+        return _status;
+    }
+
+    _active = true;
+    _willRunAgain = false;
+    _remoteCommandCallbackHandle = scheduleResult.getValue();
+    return Status::OK();
+}
+
+void Reporter::_callback(const ReplicationExecutor::RemoteCommandCallbackArgs& rcbd) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    _status = rcbd.response.getStatus();
+    _active = false;
+
+    LOG(2) << "Reporter ended with status: " << _status << " after reporting to " << _target;
+    if (_status.isOK() && _willRunAgain) {
+        _schedule_inlock();
+    } else {
+        _willRunAgain = false;
+    }
+}
+
+Status Reporter::getStatus() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _status;
+}
+
+bool Reporter::isActive() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _active;
+}
+
+bool Reporter::willRunAgain() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _willRunAgain;
+}
+}  // namespace repl
+}  // namespace mongo

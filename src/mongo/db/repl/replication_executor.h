@@ -28,552 +28,398 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
-#include <boost/thread/condition_variable.hpp>
-#include <boost/thread/mutex.hpp>
 #include <string>
-#include <thread>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_runner.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/repl/task_runner.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/random.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/list.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    class NamespaceString;
-    class OperationContext;
+class BSONObjBuilder;
+class NamespaceString;
+class OperationContext;
 
-namespace executor{
-    class NetworkInterface;
-} // namespace executor
+namespace executor {
+struct ConnectionPoolStats;
+class NetworkInterface;
+}  // namespace executor
 
 namespace repl {
 
-    class StorageInterface;
+class StorageInterface;
+
+/**
+ * Implementation of the TaskExecutor interface for providing an event loop for driving state
+ * machines in replication.
+ *
+ * Usage: Instantiate an executor, schedule a work item, call run().
+ *
+ * Implementation details:
+ *
+ * The executor is composed of several WorkQueues, which are queues of WorkItems.  WorkItems
+ * describe units of work -- a callback and state needed to track its lifecycle.  The iterators
+ * pointing to WorkItems are spliced between the WorkQueues, rather than copying WorkItems
+ * themselves.  Further, those WorkQueue::iterators are never invalidated during the life of an
+ * executor.  They may be recycled to represent new work items, but when that happens, a counter
+ * on the WorkItem is incremented, to disambiguate.
+ *
+ * All work executed by the run() method of the executor is popped off the front of the
+ * _readyQueue.  Remote commands blocked on the network can be found in the
+ * _networkInProgressQueue.  Callbacks waiting for a timer to expire are in the _sleepersQueue.
+ * When the network returns or the timer expires, items from these two queues are transferred to
+ * the back of the _readyQueue.
+ *
+ * The _exclusiveLockInProgressQueue, which represents work items to execute while holding the
+ * GlobalWrite lock, is exceptional.  WorkItems in that queue execute in unspecified order with
+ * respect to work in the _readyQueue or other WorkItems in the _exclusiveLockInProgressQueue,
+ * but they are executed in a single serial order with respect to those other WorkItems.  The
+ * _terribleExLockSyncMutex is used to provide this serialization, until such time as the global
+ * lock may be passed from one thread to another.
+ */
+class ReplicationExecutor final : public executor::TaskExecutor {
+    MONGO_DISALLOW_COPYING(ReplicationExecutor);
+
+public:
+    /**
+     * Constructs a new executor.
+     *
+     * Takes ownership of the passed NetworkInterface object.
+     */
+    ReplicationExecutor(executor::NetworkInterface* netInterface,
+                        StorageInterface* storageInterface,
+                        int64_t pnrgSeed);
 
     /**
-     * Event loop for driving state machines in replication.
-     *
-     * The event loop has notions of events and callbacks.
-     *
-     * Callbacks are function objects representing work to be performed in some sequential order by
-     * the executor.  They may be scheduled by client threads or by other callbacks.  Methods that
-     * schedule callbacks return a CallbackHandle if they are able to enqueue the callback in the
-     * appropriate work queue.  Every CallbackHandle represents an invocation of a function that
-     * will happen before the executor returns from run().  Calling cancel(CallbackHandle) schedules
-     * the specified callback to run with a flag indicating that it is "canceled," but it will run.
-     * Client threads may block waiting for a callback to execute by calling wait(CallbackHandle).
-     *
-     * Events are level-triggered and may only be signaled one time.  Client threads and callbacks
-     * may schedule callbacks to be run by the executor after the event is signaled, and client
-     * threads may ask the executor to block them until after the event is signaled.
-     *
-     * If an event is unsignaled when shutdown is called, the executor will ensure that any threads
-     * blocked in waitForEvent() eventually return.
-     *
-     * Logically, Callbacks and Events exist for the life of the executor.  That means that while
-     * the executor is in scope, no CallbackHandle or EventHandle is stale.
-     *
-     * Usage: Instantiate an executor, schedule a work item, call run().
-     *
-     * Implementation details:
-     *
-     * The executor is composed of several WorkQueues, which are queues of WorkItems.  WorkItems
-     * describe units of work -- a callback and state needed to track its lifecycle.  The iterators
-     * pointing to WorkItems are spliced between the WorkQueues, rather than copying WorkItems
-     * themselves.  Further, those WorkQueue::iterators are never invalidated during the life of an
-     * executor.  They may be recycled to represent new work items, but when that happens, a counter
-     * on the WorkItem is incremented, to disambiguate.  Handles referencing WorkQueue::iterators,
-     * called CallbackHandles, are thus valid for the life of the executor, simplifying lifecycle
-     * management.
-     *
-     * All work executed by the run() method of the executor is popped off the front of the
-     * _readyQueue.  Remote commands blocked on the network can be found in the
-     * _networkInProgressQueue.  Callbacks waiting for a timer to expire are in the _sleepersQueue.
-     * When the network returns or the timer expires, items from these two queues are transferred to
-     * the back of the _readyQueue.
-     *
-     * The _exclusiveLockInProgressQueue, which represents work items to execute while holding the
-     * GlobalWrite lock, is exceptional.  WorkItems in that queue execute in unspecified order with
-     * respect to work in the _readyQueue or other WorkItems in the _exclusiveLockInProgressQueue,
-     * but they are executed in a single serial order with respect to those other WorkItems.  The
-     * _terribleExLockSyncMutex is used to provide this serialization, until such time as the global
-     * lock may be passed from one thread to another.
-     *
-     * Events work similiarly to WorkItems, and EventList is akin to WorkQueue.
+     * Destroys an executor.
      */
-    class ReplicationExecutor {
-        MONGO_DISALLOW_COPYING(ReplicationExecutor);
-    public:
-        struct CallbackData;
-        class CallbackHandle;
-        class EventHandle;
-        struct RemoteCommandCallbackData;
-        typedef StatusWith<RemoteCommandResponse> ResponseStatus;
+    virtual ~ReplicationExecutor();
 
-        /**
-         * Type of a regular callback function.
-         *
-         * The status argument passed at invocation will have code ErrorCodes::CallbackCanceled if
-         * the callback was canceled for any reason (including shutdown).  Otherwise, it should have
-         * Status::OK().
-         */
-        typedef stdx::function<void (const CallbackData&)> CallbackFn;
+    std::string getDiagnosticString() override;
+    BSONObj getDiagnosticBSON();
+    Date_t now() override;
+    void startup() override;
+    void shutdown() override;
+    void join() override;
+    void signalEvent(const EventHandle& event) override;
+    StatusWith<EventHandle> makeEvent() override;
+    StatusWith<CallbackHandle> onEvent(const EventHandle& event, const CallbackFn& work) override;
+    void waitForEvent(const EventHandle& event) override;
+    StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
+                                                     const RemoteCommandCallbackFn& cb) override;
+    void cancel(const CallbackHandle& cbHandle) override;
+    void wait(const CallbackHandle& cbHandle) override;
 
-        /**
-         * Type of a callback from a request to run a command on a remote MongoDB node.
-         *
-         * The StatusWith<const BSONObj> will have ErrorCodes::CallbackCanceled if the callback was
-         * canceled.  Otherwise, its status will represent any failure to execute the command.
-         * If the command executed and a response came back, then the status object will contain
-         * the BSONObj returned by the command, with the "ok" field indicating the success of the
-         * command in the usual way.
-         */
-        typedef stdx::function<void (const RemoteCommandCallbackData&)> RemoteCommandCallbackFn;
-
-        /**
-         * Constructs a new executor.
-         *
-         * Takes ownership of the passed NetworkInterface object.
-         */
-        ReplicationExecutor(executor::NetworkInterface* netInterface,
-                            StorageInterface* storageInterface,
-                            int64_t pnrgSeed);
-
-        /**
-         * Destroys an executor.
-         */
-        ~ReplicationExecutor();
-
-        /**
-         * Returns diagnostic information.
-         */
-        std::string getDiagnosticString();
-
-        /**
-         * Gets the current time as reported by the network interface.
-         */
-        Date_t now();
-
-        /**
-         * Executes the run loop.  May be called up to one time.
-         *
-         * Returns after the executor has been shutdown and is safe to delete.
-         */
-        void run();
-
-        /**
-         * Signals to the executor that it should shut down.  The only reliable indication
-         * that shutdown has completed is that the run() method returns.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        void shutdown();
-
-        /**
-         * Creates a new event.  Returns a handle to the event, or ErrorCodes::ShutdownInProgress if
-         * makeEvent() fails because the executor is shutting down.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<EventHandle> makeEvent();
-
-        /**
-         * Signals the event, making waiting client threads and callbacks runnable.
-         *
-         * May be called up to one time per event.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        void signalEvent(const EventHandle&);
-
-        /**
-         * Schedules a callback, "work", to run after "event" is signaled.  If "event"
-         * has already been signaled, marks "work" as immediately runnable.
-         *
-         * If "event" has yet to be signaled when "shutdown()" is called, "work" will
-         * be scheduled with a status of ErrorCodes::CallbackCanceled.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> onEvent(const EventHandle& event, const CallbackFn& work);
-
-        /**
-         * Blocks the calling thread until after "event" is signaled.  Also returns
-         * if the event is never signaled but shutdown() is called on the executor.
-         *
-         * NOTE: Do not call from a callback running in the executor.
-         *
-         * TODO(schwerin): Change return type so that the caller can know which of the two reasons
-         * led to this method returning.
-         */
-        void waitForEvent(const EventHandle& event);
-
-        /**
-         * Schedules "work" to be run by the executor ASAP.
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work);
-
-        /**
-         * Schedules "work" to be run by the executor no sooner than "when".
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work);
-
-        /**
-         * Schedules DB "work" to be run by the executor..
-         *
-         * Takes no locks for caller - global, database or collection.
-         *
-         * The "work" will run exclusively with other DB work items. All DB work items
-         * are run the in order they are scheduled.
-         *
-         * The "work" may run concurrently with other non-DB work items,
-         * but there are no ordering guarantees provided with respect to
-         * any other work item.
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work);
-
-        /**
-         * Schedules DB "work" to be run by the executor while holding the collection lock.
-         *
-         * Takes collection lock in specified mode (and slightly more permissive lock for the
-         * database lock) but not the global exclusive lock.
-         *
-         * The "work" will run exclusively with other DB work items. All DB work items
-         * are run the in order they are scheduled.
-         *
-         * The "work" may run concurrently with other non-DB work items,
-         * but there are no ordering guarantees provided with respect to
-         * any other work item.
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work,
-                                                  const NamespaceString& nss,
-                                                  LockMode mode);
-
-        /**
-         * Schedules "work" to be run by the executor while holding the global exclusive lock.
-         *
-         * Takes collection lock in specified mode (and slightly more permissive lock for the
-         * database lock) but not the global exclusive lock.
-         *
-         * The "work" will run exclusively, as though it were executed by the main
-         * run loop, but there are no ordering guarantees provided with respect to
-         * any other work item.
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleWorkWithGlobalExclusiveLock(
-                const CallbackFn& work);
-
-        /**
-         * Schedules "cb" to be run by the executor with the result of executing the remote command
-         * described by "request".
-         *
-         * Returns a handle for waiting on or canceling the callback, or
-         * ErrorCodes::ShutdownInProgress.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        StatusWith<CallbackHandle> scheduleRemoteCommand(
-                const RemoteCommandRequest& request,
-                const RemoteCommandCallbackFn& cb);
-
-        /**
-         * If the callback referenced by "cbHandle" hasn't already executed, marks it as
-         * canceled and runnable.
-         *
-         * May be called by client threads or callbacks running in the executor.
-         */
-        void cancel(const CallbackHandle& cbHandle);
-
-        /**
-         * Blocks until the executor finishes running the callback referenced by "cbHandle".
-         *
-         * Because callbacks all run during shutdown if they weren't run beforehand, there is no need
-         * to indicate the reason for returning from wait(CallbackHandle).  It is always that the
-         * callback ran.
-         *
-         * NOTE: Do not call from a callback running in the executor.
-         */
-        void wait(const CallbackHandle& cbHandle);
-
-        /**
-         * Returns an int64_t generated by the prng with a max value of "limit".
-         */
-        int64_t nextRandomInt64(int64_t limit);
-
-        /**
-         * Returns true if executing in the "run" thread, which should not block with IO
-         */
-        bool isRunThread() const;
-
-    private:
-        struct Event;
-        struct WorkItem;
-
-        /**
-         * A linked list of WorkItem objects.
-         *
-         * WorkItems get moved among lists by splicing iterators of work lists together,
-         * not by copying underlying WorkItem objects.
-         */
-        typedef stdx::list<WorkItem> WorkQueue;
-
-        /**
-         * A linked list of Event objects, like WorkQueue, above.
-         */
-        typedef stdx::list<Event> EventList;
-
-        /**
-         * Returns diagnostic info
-         */
-        std::string _getDiagnosticString_inlock() const;
-        /**
-         * Implementation of makeEvent() for use when _mutex is already held.
-         */
-        StatusWith<EventHandle> makeEvent_inlock();
-
-        /**
-         * Gets a single piece of work to execute.
-         *
-         * If the "callback" member of the returned WorkItem is falsey, that is a signal
-         * to the run loop to wait for shutdown.
-         */
-        std::pair<WorkItem, CallbackHandle> getWork();
-
-        /**
-         * Marks as runnable any sleepers whose ready date has passed as of "now".
-         * Returns the date when the next sleeper will be ready, or Date_t(~0ULL) if there are no
-         * remaining sleepers.
-         */
-        Date_t scheduleReadySleepers_inlock(Date_t now);
-
-        /**
-         * Enqueues "callback" into "queue".
-         *
-         * Assumes that "queue" is sorted by readyDate, and performs insertion sort, starting
-         * at the back of the "queue" working toward the front.
-         *
-         * Use Date_t(0) for readyDate to mean "ready now".
-         */
-        StatusWith<CallbackHandle> enqueueWork_inlock(WorkQueue* queue, const CallbackFn& callback);
-
-        /**
-         * Implementation of signalEvent() that assumes the caller owns _mutex.
-         */
-        void signalEvent_inlock(const EventHandle& event);
-
-        /**
-         * Notifies interested parties that shutdown has completed, if it has.
-         */
-        void maybeNotifyShutdownComplete_inlock();
-
-        /**
-         * Completes the shutdown process.  Called by run().
-         */
-        void finishShutdown();
-
-        void _finishRemoteCommand(
-                const RemoteCommandRequest& request,
-                const StatusWith<RemoteCommandResponse>& response,
-                const CallbackHandle& cbHandle,
-                const uint64_t expectedHandleGeneration,
-                const RemoteCommandCallbackFn& cb);
-
-        /**
-         * Executes the callback referenced by "cbHandle", and moves the underlying
-         * WorkQueue::iterator from "workQueue" into the _freeQueue.
-         *
-         * "txn" is a pointer to the OperationContext.
-         *
-         * "status" is the callback status from the task runner. Only possible values are
-         * Status::OK and ErrorCodes::CallbackCanceled (when task runner is canceled).
-         *
-         * If "terribleExLockSyncMutex" is not null, serializes execution of "cbHandle" with the
-         * execution of other callbacks.
-         */
-        void _doOperation(OperationContext* txn,
-                          const Status& taskRunnerStatus,
-                          const CallbackHandle& cbHandle,
-                          WorkQueue* workQueue,
-                          boost::mutex* terribleExLockSyncMutex);
-
-        // PRNG; seeded at class construction time.
-        PseudoRandom _random;
-
-        boost::scoped_ptr<executor::NetworkInterface> _networkInterface;
-        boost::scoped_ptr<StorageInterface> _storageInterface;
-        boost::mutex _mutex;
-        boost::mutex _terribleExLockSyncMutex;
-        boost::condition_variable _noMoreWaitingThreads;
-        WorkQueue _freeQueue;
-        WorkQueue _readyQueue;
-        WorkQueue _dbWorkInProgressQueue;
-        WorkQueue _exclusiveLockInProgressQueue;
-        WorkQueue _networkInProgressQueue;
-        WorkQueue _sleepersQueue;
-        EventList _unsignaledEvents;
-        EventList _signaledEvents;
-        int64_t _totalEventWaiters;
-        bool _inShutdown;
-        threadpool::ThreadPool _dblockWorkers;
-        TaskRunner _dblockTaskRunner;
-        TaskRunner _dblockExclusiveLockTaskRunner;
-        uint64_t _nextId;
-        std::thread::id _runThreadId;
-    };
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
     /**
-     * Reference to an event object in the executor.
+     * Executes the run loop. May be called up to one time.
+     *
+     * Doesn't need to be public, so do not call directly unless from unit-tests.
+     *
+     * Returns after the executor has been shutdown and is safe to delete.
      */
-    class ReplicationExecutor::EventHandle {
-        friend class ReplicationExecutor;
-    public:
-        EventHandle() : _generation(0), _id(0) {}
-
-        /**
-         * Returns true if the handle is valid, meaning that it identifies
-         */
-        bool isValid() const { return _id != 0; }
-
-        bool operator==(const EventHandle &other) const {
-            return (_id == other._id);
-        }
-
-        bool operator!=(const EventHandle &other) const {
-            return !(*this == other);
-        }
-
-    private:
-        EventHandle(const EventList::iterator& iter, const uint64_t id);
-
-        EventList::iterator _iter;
-        uint64_t _generation;
-        uint64_t _id;
-    };
+    void run();
 
     /**
-     * Reference to a scheduled callback.
+     * Schedules DB "work" to be run by the executor..
+     *
+     * Takes no locks for caller - global, database or collection.
+     *
+     * The "work" will run exclusively with other DB work items. All DB work items
+     * are run the in order they are scheduled.
+     *
+     * The "work" may run concurrently with other non-DB work items,
+     * but there are no ordering guarantees provided with respect to
+     * any other work item.
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
      */
-    class ReplicationExecutor::CallbackHandle {
-        friend class ReplicationExecutor;
-    public:
-        CallbackHandle() : _generation(0) {}
-
-        bool isValid() const { return _finishedEvent.isValid(); }
-
-        bool operator==(const CallbackHandle &other) const {
-            return (_finishedEvent == other._finishedEvent);
-        }
-
-        bool operator!=(const CallbackHandle &other) const {
-            return !(*this == other);
-        }
-
-    private:
-        explicit CallbackHandle(const WorkQueue::iterator& iter);
-
-        WorkQueue::iterator _iter;
-        uint64_t _generation;
-        EventHandle _finishedEvent;
-    };
-
-    struct ReplicationExecutor::CallbackData {
-        CallbackData(ReplicationExecutor* theExecutor,
-                     const CallbackHandle& theHandle,
-                     const Status& theStatus,
-                     OperationContext* txn = NULL);
-
-        ReplicationExecutor* executor;
-        CallbackHandle myHandle;
-        Status status;
-        OperationContext* txn;
-    };
-
-    typedef ReplicationExecutor::ResponseStatus ResponseStatus;
-
-    struct ReplicationExecutor::RemoteCommandCallbackData {
-        RemoteCommandCallbackData(ReplicationExecutor* theExecutor,
-                                  const CallbackHandle& theHandle,
-                                  const RemoteCommandRequest& theRequest,
-                                  const StatusWith<RemoteCommandResponse>& theResponse);
-
-        ReplicationExecutor* executor;
-        CallbackHandle myHandle;
-        RemoteCommandRequest request;
-        StatusWith<RemoteCommandResponse> response;
-    };
+    StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work);
 
     /**
-     * Description of a scheduled but not-yet-run work item.
+     * Schedules DB "work" to be run by the executor while holding the collection lock.
      *
-     * Once created, WorkItem objects remain in scope until the executor is destroyed.
-     * However, over their lifetime, they may represent many different work items.  This
-     * divorces the lifetime of CallbackHandles from the lifetime of WorkItem objects, but
-     * requires a unique generation identifier in CallbackHandles and WorkItem objects.
+     * Takes collection lock in specified mode (and slightly more permissive lock for the
+     * database lock) but not the global exclusive lock.
      *
-     * WorkItem is copyable so that it may be stored in a list.  However, in practice they
-     * should only be copied by getWork() and when allocating new entries into a WorkQueue (not
-     * when moving entries between work lists).
+     * The "work" will run exclusively with other DB work items. All DB work items
+     * are run the in order they are scheduled.
+     *
+     * The "work" may run concurrently with other non-DB work items,
+     * but there are no ordering guarantees provided with respect to
+     * any other work item.
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
      */
-    struct ReplicationExecutor::WorkItem {
-        WorkItem();
-        uint64_t generation;
-        CallbackFn callback;
-        EventHandle finishedEvent;
-        Date_t readyDate;
-        bool isNetworkOperation;
-        bool isCanceled;
-    };
+    StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work,
+                                              const NamespaceString& nss,
+                                              LockMode mode);
 
     /**
-     * Description of an unsignaled event.
+     * Schedules "work" to be run by the executor while holding the global exclusive lock.
      *
-     * Like WorkItem, above, but for events.  On signaling, the executor bumps the
-     * generation, marks all waiters as runnable, and moves the event from the "unsignaled"
-     * EventList to the "signaled" EventList, the latter being a free list of events.
+     * Takes collection lock in specified mode (and slightly more permissive lock for the
+     * database lock) but not the global exclusive lock.
+     *
+     * The "work" will run exclusively, as though it were executed by the main
+     * run loop, but there are no ordering guarantees provided with respect to
+     * any other work item.
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
      */
-    struct ReplicationExecutor::Event {
-        Event();
-        uint64_t generation;
-        bool isSignaled;
-        WorkQueue waiters;
-        boost::shared_ptr<boost::condition_variable> isSignaledCondition;
-    };
+    StatusWith<CallbackHandle> scheduleWorkWithGlobalExclusiveLock(const CallbackFn& work);
+
+    /**
+     * Returns an int64_t generated by the prng with a max value of "limit".
+     */
+    int64_t nextRandomInt64(int64_t limit);
+
+private:
+    class Callback;
+    class Event;
+    struct WorkItem;
+    friend class Callback;
+    friend class Event;
+
+
+    /**
+     * A linked list of WorkItem objects.
+     *
+     * WorkItems get moved among lists by splicing iterators of work lists together,
+     * not by copying underlying WorkItem objects.
+     */
+    typedef stdx::list<WorkItem> WorkQueue;
+
+    /**
+     * A linked list of EventHandles.
+     */
+    typedef stdx::list<EventHandle> EventList;
+
+    /**
+     * Returns diagnostic info
+     */
+    std::string _getDiagnosticString_inlock() const;
+
+    /**
+     * Implementation of makeEvent() for use when _mutex is already held.
+     */
+    StatusWith<EventHandle> makeEvent_inlock();
+
+    /**
+     * Implementation of signalEvent() for use when _mutex is already held.
+     */
+    void signalEvent_inlock(const EventHandle&);
+
+    /**
+     * Gets a single piece of work to execute.
+     *
+     * If the "callback" member of the returned WorkItem is falsey, that is a signal
+     * to the run loop to wait for shutdown.
+     */
+    std::pair<WorkItem, CallbackHandle> getWork();
+
+    /**
+     * Marks as runnable any sleepers whose ready date has passed as of "now".
+     * Returns the date when the next sleeper will be ready, or Date_t(~0ULL) if there are no
+     * remaining sleepers.
+     */
+    Date_t scheduleReadySleepers_inlock(Date_t now);
+
+    /**
+     * Enqueues "callback" into "queue".
+     */
+    StatusWith<CallbackHandle> enqueueWork_inlock(WorkQueue* queue, const CallbackFn& callback);
+
+    /**
+     * Notifies interested parties that shutdown has completed, if it has.
+     */
+    void maybeNotifyShutdownComplete_inlock();
+
+    /**
+     * Completes the shutdown process.  Called by run().
+     */
+    void finishShutdown();
+
+    void _finishRemoteCommand(const executor::RemoteCommandRequest& request,
+                              const StatusWith<executor::RemoteCommandResponse>& response,
+                              const CallbackHandle& cbHandle,
+                              const uint64_t expectedHandleGeneration,
+                              const RemoteCommandCallbackFn& cb);
+
+    /**
+     * Executes the callback referenced by "cbHandle", and moves the underlying
+     * WorkQueue::iterator from "workQueue" into the _freeQueue.
+     *
+     * "txn" is a pointer to the OperationContext.
+     *
+     * "status" is the callback status from the task runner. Only possible values are
+     * Status::OK and ErrorCodes::CallbackCanceled (when task runner is canceled).
+     *
+     * If "terribleExLockSyncMutex" is not null, serializes execution of "cbHandle" with the
+     * execution of other callbacks.
+     */
+    void _doOperation(OperationContext* txn,
+                      const Status& taskRunnerStatus,
+                      const CallbackHandle& cbHandle,
+                      WorkQueue* workQueue,
+                      stdx::mutex* terribleExLockSyncMutex);
+
+    /**
+     * Wrapper around TaskExecutor::getCallbackFromHandle that return an Event* instead of
+     * a generic EventState*.
+     */
+    Event* _getEventFromHandle(const EventHandle& eventHandle);
+
+    /**
+     * Wrapper around TaskExecutor::getCallbackFromHandle that return an Event* instead of
+     * a generic EventState*.
+     */
+    Callback* _getCallbackFromHandle(const CallbackHandle& callbackHandle);
+
+    // PRNG; seeded at class construction time.
+    PseudoRandom _random;
+
+    std::unique_ptr<executor::NetworkInterface> _networkInterface;
+    std::unique_ptr<StorageInterface> _storageInterface;
+
+    // Thread which executes the run method. Started by startup and must be jointed after shutdown.
+    stdx::thread _executorThread;
+
+    stdx::mutex _mutex;
+    stdx::mutex _terribleExLockSyncMutex;
+    stdx::condition_variable _noMoreWaitingThreads;
+    WorkQueue _freeQueue;
+    WorkQueue _readyQueue;
+    WorkQueue _dbWorkInProgressQueue;
+    WorkQueue _exclusiveLockInProgressQueue;
+    WorkQueue _networkInProgressQueue;
+    WorkQueue _sleepersQueue;
+    EventList _unsignaledEvents;
+    int64_t _totalEventWaiters = 0;
+
+    // Counters for metrics, for the whole life of this instance, protected by _mutex.
+    int64_t _counterWaitEvents = 0;
+    int64_t _counterCreatedEvents = 0;
+    int64_t _counterScheduledCommands = 0;
+    int64_t _counterScheduledExclusiveWorks = 0;
+    int64_t _counterScheduledDBWorks = 0;
+    int64_t _counterScheduledWorks = 0;
+    int64_t _counterScheduledWorkAts = 0;
+    int64_t _counterSchedulingFailures = 0;
+    int64_t _counterCancels = 0;
+    int64_t _counterWaits = 0;
+
+    bool _inShutdown;
+    OldThreadPool _dblockWorkers;
+    TaskRunner _dblockTaskRunner;
+    TaskRunner _dblockExclusiveLockTaskRunner;
+    uint64_t _nextId = 0;
+};
+
+class ReplicationExecutor::Callback : public executor::TaskExecutor::CallbackState {
+    friend class ReplicationExecutor;
+
+public:
+    Callback(ReplicationExecutor* executor,
+             const CallbackFn callbackFn,
+             const WorkQueue::iterator& iter,
+             const EventHandle& finishedEvent);
+    virtual ~Callback();
+
+    void cancel() override;
+    void waitForCompletion() override;
+    bool isCanceled() const override;
+
+private:
+    ReplicationExecutor* _executor;
+
+    // All members other than _executor are protected by the executor's _mutex.
+    CallbackFn _callbackFn;
+    bool _isCanceled;
+    bool _isSleeper;
+    WorkQueue::iterator _iter;
+    EventHandle _finishedEvent;
+};
+
+typedef ReplicationExecutor::ResponseStatus ResponseStatus;
+
+/**
+ * Description of a scheduled but not-yet-run work item.
+ *
+ * Once created, WorkItem objects remain in scope until the executor is destroyed.
+ * However, over their lifetime, they may represent many different work items.  This
+ * divorces the lifetime of CallbackHandles from the lifetime of WorkItem objects, but
+ * requires a unique generation identifier in CallbackHandles and WorkItem objects.
+ *
+ * WorkItem is copyable so that it may be stored in a list.  However, in practice they
+ * should only be copied by getWork() and when allocating new entries into a WorkQueue (not
+ * when moving entries between work lists).
+ */
+struct ReplicationExecutor::WorkItem {
+    WorkItem();
+    uint64_t generation;
+    CallbackHandle callback;
+    EventHandle finishedEvent;
+    Date_t readyDate;
+    bool isNetworkOperation;
+};
+
+/**
+ * Description of an event.
+ *
+ * Like WorkItem, above, but for events.  On signaling, the executor removes the event from the
+ * "unsignaled" EventList and schedules all work items in the _waiters list.
+ */
+class ReplicationExecutor::Event : public executor::TaskExecutor::EventState {
+    friend class ReplicationExecutor;
+
+public:
+    Event(ReplicationExecutor* executor, const EventList::iterator& iter);
+    virtual ~Event();
+
+    void signal() override;
+    void waitUntilSignaled() override;
+    bool isSignaled() override;
+
+private:
+    // Note that the caller is responsible for removing any references to any EventHandles
+    // pointing to this event.
+    void _signal_inlock();
+
+    ReplicationExecutor* _executor;
+
+    // All members other than _executor are protected by the executor's _mutex.
+    bool _isSignaled;
+    stdx::condition_variable _isSignaledCondition;
+    EventList::iterator _iter;
+    WorkQueue _waiters;
+};
 
 }  // namespace repl
 }  // namespace mongo

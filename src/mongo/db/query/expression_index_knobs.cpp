@@ -32,8 +32,13 @@
 
 namespace mongo {
 
-    MONGO_EXPORT_SERVER_PARAMETER(internalGeoPredicateQuery2DMaxCoveringCells, int, 16);
+MONGO_EXPORT_SERVER_PARAMETER(internalGeoPredicateQuery2DMaxCoveringCells, int, 16);
 
-    MONGO_EXPORT_SERVER_PARAMETER(internalGeoNearQuery2DMaxCoveringCells, int, 16);
+MONGO_EXPORT_SERVER_PARAMETER(internalGeoNearQuery2DMaxCoveringCells, int, 16);
+
+// At level 23 the average cell length is about 1m.
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryS2GeoFinestLevel, int, 23);
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryS2GeoCoarsestLevel, int, 0);
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryS2GeoMaxCells, int, 20);
 
 }  // namespace mongo

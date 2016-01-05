@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
@@ -42,27 +41,29 @@
 
 namespace mongo {
 
-    /**
-     * Matcher is a simple wrapper around a BSONObj and the MatchExpression created from it.
-     */
-    class Matcher {
-        MONGO_DISALLOW_COPYING(Matcher);
+/**
+ * Matcher is a simple wrapper around a BSONObj and the MatchExpression created from it.
+ */
+class Matcher {
+    MONGO_DISALLOW_COPYING(Matcher);
 
-    public:
-        explicit Matcher(const BSONObj& pattern, 
-                         const MatchExpressionParser::WhereCallback& whereCallback =
-                                    MatchExpressionParser::WhereCallback());
+public:
+    explicit Matcher(const BSONObj& pattern, const ExtensionsCallback& extensionsCallback);
 
-        bool matches(const BSONObj& doc, MatchDetails* details = NULL ) const;
+    bool matches(const BSONObj& doc, MatchDetails* details = NULL) const;
 
-        const BSONObj* getQuery() const { return &_pattern; };
-
-        std::string toString() const { return _pattern.toString(); }
-
-    private:
-        BSONObj _pattern;
-
-        boost::scoped_ptr<MatchExpression> _expression;
+    const BSONObj* getQuery() const {
+        return &_pattern;
     };
+
+    std::string toString() const {
+        return _pattern.toString();
+    }
+
+private:
+    BSONObj _pattern;
+
+    std::unique_ptr<MatchExpression> _expression;
+};
 
 }  // namespace mongo

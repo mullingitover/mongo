@@ -33,42 +33,47 @@
 
 namespace mongo {
 
-    class SimpleRecordStoreV1;
+class SimpleRecordStoreV1;
 
-    /**
-     * This class iterates over a non-capped collection identified by 'ns'.
-     * The collection must exist when the constructor is called.
-     *
-     * If start is not DiskLoc(), the iteration begins at that DiskLoc.
-     */
-    class SimpleRecordStoreV1Iterator : public RecordIterator {
-    public:
-        SimpleRecordStoreV1Iterator( OperationContext* txn,
-                                     const SimpleRecordStoreV1* records,
-                                     const RecordId& start,
-                                     const CollectionScanParams::Direction& dir );
-        virtual ~SimpleRecordStoreV1Iterator() { }
+/**
+ * This class iterates over a non-capped collection identified by 'ns'.
+ * The collection must exist when the constructor is called.
+ *
+ * If start is not DiskLoc(), the iteration begins at that DiskLoc.
+ */
+class SimpleRecordStoreV1Iterator final : public SeekableRecordCursor {
+public:
+    SimpleRecordStoreV1Iterator(OperationContext* txn,
+                                const SimpleRecordStoreV1* records,
+                                bool forward);
 
-        virtual bool isEOF();
-        virtual RecordId getNext();
-        virtual RecordId curr();
+    boost::optional<Record> next() final;
+    boost::optional<Record> seekExact(const RecordId& id) final;
+    void save() final;
+    bool restore() final;
+    void detachFromOperationContext() final {
+        _txn = nullptr;
+    }
+    void reattachToOperationContext(OperationContext* txn) final {
+        _txn = txn;
+    }
+    void invalidate(OperationContext* txn, const RecordId& dl) final;
+    std::unique_ptr<RecordFetcher> fetcherForNext() const final;
+    std::unique_ptr<RecordFetcher> fetcherForId(const RecordId& id) const final;
 
-        virtual void invalidate(const RecordId& dl);
-        virtual void saveState();
-        virtual bool restoreState(OperationContext* txn);
+private:
+    void advance();
+    bool isEOF() {
+        return _curr.isNull();
+    }
 
-        virtual RecordData dataFor( const RecordId& loc ) const;
+    // for getNext, not owned
+    OperationContext* _txn;
 
-    private:
-         // for getNext, not owned
-        OperationContext* _txn;
-
-        // The result returned on the next call to getNext().
-        DiskLoc _curr;
-
-        const SimpleRecordStoreV1* _recordStore;
-
-        CollectionScanParams::Direction _direction;
-    };
+    // The result returned on the next call to getNext().
+    DiskLoc _curr;
+    const SimpleRecordStoreV1* const _recordStore;
+    const bool _forward;
+};
 
 }  // namespace mongo

@@ -29,32 +29,30 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientmockcursor.h"
 
 namespace mongo {
 
+/**
+ * Simple adapter class for mongo::DBClientMockCursor to mongo::DBClientCursor.
+ * Only supports more and next, the behavior of other operations are undefined.
+ */
+class MockDBClientCursor : public mongo::DBClientCursor {
+public:
+    MockDBClientCursor(mongo::DBClientBase* client, const mongo::BSONArray& mockCollection);
+
+    bool more();
+
     /**
-     * Simple adapter class for mongo::DBClientMockCursor to mongo::DBClientCursor.
-     * Only supports more and next, the behavior of other operations are undefined.
+     * Note: has the same contract as DBClientCursor - returned BSONObj will
+     * become invalid when this cursor is destroyed.
      */
-    class MockDBClientCursor: public mongo::DBClientCursor {
-    public:
-        MockDBClientCursor(mongo::DBClientBase* client,
-                const mongo::BSONArray& mockCollection);
+    mongo::BSONObj next();
 
-        bool more();
-
-        /**
-         * Note: has the same contract as DBClientCursor - returned BSONObj will
-         * become invalid when this cursor is destroyed.
-         */
-        mongo::BSONObj next();
-
-    private:
-        boost::scoped_ptr<mongo::DBClientMockCursor> _cursor;
-        mongo::BSONObj _resultSet;
-    };
+private:
+    std::unique_ptr<mongo::DBClientMockCursor> _cursor;
+    mongo::BSONObj _resultSet;
+};
 }

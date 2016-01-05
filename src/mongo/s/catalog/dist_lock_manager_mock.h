@@ -32,41 +32,46 @@
 #include <vector>
 
 #include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
-    class DistLockManagerMock: public DistLockManager {
-    public:
-        DistLockManagerMock();
+class DistLockManagerMock : public DistLockManager {
+public:
+    DistLockManagerMock();
 
-        virtual ~DistLockManagerMock() = default;
+    virtual ~DistLockManagerMock() = default;
 
-        virtual void startUp() override;
-        virtual void shutDown() override;
+    virtual void startUp() override;
+    virtual void shutDown(OperationContext* txn, bool allowNetworking) override;
 
-        virtual StatusWith<DistLockManager::ScopedDistLock> lock(
-                StringData name,
-                StringData whyMessage,
-                stdx::chrono::milliseconds waitFor,
-                stdx::chrono::milliseconds lockTryInterval) override;
+    virtual StatusWith<DistLockManager::ScopedDistLock> lock(
+        OperationContext* txn,
+        StringData name,
+        StringData whyMessage,
+        stdx::chrono::milliseconds waitFor,
+        stdx::chrono::milliseconds lockTryInterval) override;
 
-        void setLockReturnStatus(Status status);
+    using LockFunc = stdx::function<void(StringData name,
+                                         StringData whyMessage,
+                                         stdx::chrono::milliseconds waitFor,
+                                         stdx::chrono::milliseconds lockTryInterval)>;
 
-    protected:
+    void expectLock(LockFunc checkerFunc, Status lockStatus);
 
-        virtual void unlock(const DistLockHandle& lockHandle) override;
+protected:
+    virtual void unlock(OperationContext* txn, const DistLockHandle& lockHandle) override;
 
-        virtual Status checkStatus(const DistLockHandle& lockHandle) override;
+    virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) override;
 
-    private:
-
-        struct LockInfo {
-            DistLockHandle lockID;
-            std::string name;
-        };
-
-        std::vector<LockInfo> _locks;
-        Status _lockReturnStatus;
+private:
+    struct LockInfo {
+        DistLockHandle lockID;
+        std::string name;
     };
 
+    std::vector<LockInfo> _locks;
+    Status _lockReturnStatus;
+    LockFunc _lockChecker;
+};
 }

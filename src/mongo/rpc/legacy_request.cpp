@@ -38,41 +38,46 @@
 namespace mongo {
 namespace rpc {
 
-    LegacyRequest::LegacyRequest(const Message *message)
-        : _message(std::move(message))
-        , _dbMessage(*message)
-        , _queryMessage(_dbMessage)
-        , _database(NamespaceString(_queryMessage.ns).db().toString()) {
+LegacyRequest::LegacyRequest(const Message* message)
+    : _message(std::move(message)), _dbMessage(*message), _queryMessage(_dbMessage) {
+    _database = nsToDatabaseSubstring(_queryMessage.ns);
 
-        std::tie(_upconvertedCommandArgs, _upconvertedMetadata) = uassertStatusOK(
-            rpc::upconvertRequestMetadata(std::move(_queryMessage.query),
-                                          std::move(_queryMessage.queryOptions))
-        );
-    }
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid database name: '" << _database << "'",
+            NamespaceString::validDBName(_database));
 
-    LegacyRequest::~LegacyRequest() = default;
+    std::tie(_upconvertedCommandArgs, _upconvertedMetadata) =
+        uassertStatusOK(rpc::upconvertRequestMetadata(std::move(_queryMessage.query),
+                                                      std::move(_queryMessage.queryOptions)));
+}
 
-    StringData LegacyRequest::getDatabase() const {
-        return _database;
-    }
+LegacyRequest::~LegacyRequest() = default;
 
-    StringData LegacyRequest::getCommandName() const {
-        return _upconvertedCommandArgs.firstElement().fieldNameStringData();
-    }
+StringData LegacyRequest::getDatabase() const {
+    return _database;
+}
 
-    const BSONObj& LegacyRequest::getMetadata() const {
-        // TODO SERVER-18236
-        return _upconvertedMetadata;
-    }
+StringData LegacyRequest::getCommandName() const {
+    return _upconvertedCommandArgs.firstElement().fieldNameStringData();
+}
 
-    const BSONObj& LegacyRequest::getCommandArgs() const {
-        return _upconvertedCommandArgs;
-    }
+const BSONObj& LegacyRequest::getMetadata() const {
+    // TODO SERVER-18236
+    return _upconvertedMetadata;
+}
 
-    DocumentRange LegacyRequest::getInputDocs() const {
-        // return an empty document range.
-        return DocumentRange{};
-    }
+const BSONObj& LegacyRequest::getCommandArgs() const {
+    return _upconvertedCommandArgs;
+}
+
+DocumentRange LegacyRequest::getInputDocs() const {
+    // return an empty document range.
+    return DocumentRange{};
+}
+
+Protocol LegacyRequest::getProtocol() const {
+    return rpc::Protocol::kOpQuery;
+}
 
 }  // namespace rpc
 }  // namespace mongo

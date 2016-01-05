@@ -12,12 +12,12 @@ executor:
     config:
       shell_options:
         eval: "testingReplication = true;"
+        readMode: commands
     hooks:
     - class: CheckReplDBHash
     fixture:
       class: MasterSlaveFixture
       mongod_options:
         oplogSize: 511
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1

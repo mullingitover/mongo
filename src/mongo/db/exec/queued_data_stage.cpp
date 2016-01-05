@@ -30,88 +30,69 @@
 
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
-    using std::vector;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
 
-    const char* QueuedDataStage::kStageType = "QUEUED_DATA";
+const char* QueuedDataStage::kStageType = "QUEUED_DATA";
 
-    QueuedDataStage::QueuedDataStage(WorkingSet* ws)
-        : _ws(ws),
-          _commonStats(kStageType)
-    {}
+QueuedDataStage::QueuedDataStage(OperationContext* opCtx, WorkingSet* ws)
+    : PlanStage(kStageType, opCtx), _ws(ws) {}
 
-    PlanStage::StageState QueuedDataStage::work(WorkingSetID* out) {
-        ++_commonStats.works;
+PlanStage::StageState QueuedDataStage::work(WorkingSetID* out) {
+    ++_commonStats.works;
 
-        // Adds the amount of time taken by work() to executionTimeMillis.
-        ScopedTimer timer(&_commonStats.executionTimeMillis);
+    // Adds the amount of time taken by work() to executionTimeMillis.
+    ScopedTimer timer(&_commonStats.executionTimeMillis);
 
-        if (isEOF()) { return PlanStage::IS_EOF; }
-
-        StageState state = _results.front();
-        _results.pop();
-
-        if (PlanStage::ADVANCED == state) {
-            ++_commonStats.advanced;
-            *out = _members.front();
-            _members.pop();
-        }
-        else if (PlanStage::NEED_TIME == state) {
-            ++_commonStats.needTime;
-        }
-
-        return state;
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
     }
 
-    bool QueuedDataStage::isEOF() { return _results.empty(); }
+    StageState state = _results.front();
+    _results.pop();
 
-    void QueuedDataStage::saveState() {
-        ++_commonStats.yields;
+    if (PlanStage::ADVANCED == state) {
+        ++_commonStats.advanced;
+        *out = _members.front();
+        _members.pop();
+    } else if (PlanStage::NEED_TIME == state) {
+        ++_commonStats.needTime;
     }
 
-    void QueuedDataStage::restoreState(OperationContext* opCtx) {
-        ++_commonStats.unyields;
-    }
+    return state;
+}
 
-    void QueuedDataStage::invalidate(OperationContext* txn,
-                                     const RecordId& dl,
-                                     InvalidationType type) {
-        ++_commonStats.invalidates;
-    }
+bool QueuedDataStage::isEOF() {
+    return _results.empty();
+}
 
-    PlanStageStats* QueuedDataStage::getStats() {
-        _commonStats.isEOF = isEOF();
-        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_QUEUED_DATA));
-        ret->specific.reset(new MockStats(_specificStats));
-        return ret.release();
-    }
+unique_ptr<PlanStageStats> QueuedDataStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_QUEUED_DATA);
+    ret->specific = make_unique<MockStats>(_specificStats);
+    return ret;
+}
 
-    const CommonStats* QueuedDataStage::getCommonStats() const { return &_commonStats; }
 
-    const SpecificStats* QueuedDataStage::getSpecificStats() const { return &_specificStats; }
+const SpecificStats* QueuedDataStage::getSpecificStats() const {
+    return &_specificStats;
+}
 
-    void QueuedDataStage::pushBack(const PlanStage::StageState state) {
-        invariant(PlanStage::ADVANCED != state);
-        _results.push(state);
-    }
+void QueuedDataStage::pushBack(const PlanStage::StageState state) {
+    invariant(PlanStage::ADVANCED != state);
+    _results.push(state);
+}
 
-    void QueuedDataStage::pushBack(const WorkingSetMember& member) {
-        _results.push(PlanStage::ADVANCED);
+void QueuedDataStage::pushBack(const WorkingSetID& id) {
+    _results.push(PlanStage::ADVANCED);
 
-        WorkingSetID id = _ws->allocate();
-        WorkingSetMember* ourMember = _ws->get(id);
-        WorkingSetCommon::initFrom(ourMember, member);
-
-        // member lives in _ws.  We'll return it when _results hits ADVANCED.
-        _members.push(id);
-    }
-
-    vector<PlanStage*> QueuedDataStage::getChildren() const {
-        vector<PlanStage*> empty;
-        return empty;
-    }
+    // member lives in _ws.  We'll return it when _results hits ADVANCED.
+    _members.push(id);
+}
 
 }  // namespace mongo

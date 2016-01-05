@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/db/index/index_access_method.h"
@@ -38,21 +37,21 @@
 
 namespace mongo {
 
-    class IndexDescriptor;
+class IndexDescriptor;
 
-    /**
-     * The IndexAccessMethod for a Btree index.
-     * Any index created with {field: 1} or {field: -1} uses this.
-     */
-    class BtreeAccessMethod : public IndexAccessMethod {
-    public:
-        BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree );
+/**
+ * The IndexAccessMethod for a Btree index.
+ * Any index created with {field: 1} or {field: -1} uses this.
+ */
+class BtreeAccessMethod : public IndexAccessMethod {
+public:
+    BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-    private:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
+private:
+    virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
 
-        // Our keys differ for V0 and V1.
-        boost::scoped_ptr<BtreeKeyGenerator> _keyGenerator;
-    };
+    // Our keys differ for V0 and V1.
+    std::unique_ptr<BtreeKeyGenerator> _keyGenerator;
+};
 
 }  // namespace mongo

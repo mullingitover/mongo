@@ -17,12 +17,10 @@ function aggregateNoOrder(coll, pipeline) {
 
 jsTestLog("Creating sharded cluster");
 var shardedAggTest = new ShardingTest({
-    shards: 2,
-    verbose: 2,
-    mongos: 1,
-    other: { chunksize : 1, enableBalancer: true }
-    }
-);
+        shards: 2,
+        mongos: 1,
+        other: { chunkSize: 1, enableBalancer: true }
+    });
 
 jsTestLog("Setting up sharded cluster");
 shardedAggTest.adminCommand( { enablesharding : "aggShard" } );
@@ -129,6 +127,10 @@ jsTestLog('sum of an arithmetic progression S(n) = (n/2)(a(1) + a(n));');
 assert.eq(a2[0].total, (nItems/2)*(1 + nItems),
        'agg sharded test counter sum failed');
 
+jsTestLog('A group combining all documents into one, averaging a null field.');
+assert.eq(aggregateOrdered(db.ts1, [{$group: {_id: null, avg: {$avg: "$missing"}}}]),
+          [{_id: null, avg: null}]);
+
 jsTestLog('an initial group starts the group in the shards, and combines them in mongos');
 var a3 = aggregateOrdered(db.ts1, [
     { $group: {
@@ -203,6 +205,33 @@ testSortLimit(10,  1);
 testSortLimit(10, -1);
 testSortLimit(100,  1);
 testSortLimit(100, -1);
+
+function testAvgStdDev() {
+    jsTestLog('testing $avg and $stdDevPop in sharded $group');
+    // Note: not using aggregateOrdered since it requires exact results. $stdDevPop can vary
+    // slightly between runs if a migration occurs. This is why we use assert.close below.
+    var res = db.ts1.aggregate([{$group: {_id: null,
+                                          avg: {$avg: '$counter'},
+                                          stdDevPop: {$stdDevPop: '$counter'},
+                                         }}]).toArray()
+    // http://en.wikipedia.org/wiki/Arithmetic_progression#Sum
+    var avg = (1 + nItems) / 2
+    assert.close(res[0].avg, avg, '', 10 /*decimal places*/);
+
+    // http://en.wikipedia.org/wiki/Arithmetic_progression#Standard_deviation
+    var stdDev = Math.sqrt(((nItems - 1) * (nItems + 1)) / 12);
+    assert.close(res[0].stdDevPop, stdDev, '', 10 /*decimal places*/);
+}
+testAvgStdDev();
+
+function testSample() {
+    jsTestLog('testing $sample');
+    [0, 1, 10, nItems, nItems + 1].forEach(function(size) {
+        var res = db.ts1.aggregate([{$sample: {size: size}}]).toArray();
+        assert.eq(res.length, Math.min(nItems, size));
+    });
+}
+testSample();
 
 jsTestLog('test $out by copying source collection verbatim to output');
 var outCollection = db.ts1_out;

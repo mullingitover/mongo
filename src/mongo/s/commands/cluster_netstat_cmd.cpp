@@ -30,52 +30,53 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-    class NetStatCmd : public Command {
-    public:
-        NetStatCmd() : Command("netstat", false, "netstat") { }
+class NetStatCmd : public Command {
+public:
+    NetStatCmd() : Command("netstat", false, "netstat") {}
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    virtual bool slaveOk() const {
+        return true;
+    }
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+    virtual bool adminOnly() const {
+        return true;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    virtual bool isWriteCommandForConfigServer() const {
+        return false;
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << " shows status/reachability of servers in the cluster";
-        }
+    virtual void help(std::stringstream& help) const {
+        help << " shows status/reachability of servers in the cluster";
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::netstat);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::netstat);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
+    virtual bool run(OperationContext* txn,
+                     const std::string& dbname,
+                     BSONObj& cmdObj,
+                     int options,
+                     std::string& errmsg,
+                     BSONObjBuilder& result) {
+        result.append("configserver",
+                      grid.shardRegistry()->getConfigServerConnectionString().toString());
+        result.append("isdbgrid", 1);
+        return true;
+    }
 
-            result.append("configserver", grid.catalogManager()->connectionString().toString());
-            result.append("isdbgrid", 1);
-            return true;
-        }
+} netstat;
 
-    } netstat;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

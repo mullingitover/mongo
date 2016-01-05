@@ -40,7 +40,7 @@ DB.prototype.commandHelp = function( name ){
     c.help = true;
     var res = this.runCommand( c );
     if ( ! res.ok )
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     return res.help;
 }
 
@@ -86,7 +86,7 @@ DB.prototype.commandHelp = function( name ){
 
  // Like runCommand but applies readPreference if one has been set
  // on the connection. Also sets slaveOk if a (non-primary) readPref has been set.
- DB.prototype.runReadCommand = function (obj, extra) {
+ DB.prototype.runReadCommand = function (obj, extra, queryOptions) {
      "use strict";
 
      // Support users who call this function with a string commandName, e.g.
@@ -96,15 +96,23 @@ DB.prototype.commandHelp = function( name ){
          this._attachReadPreferenceToCommand(mergedObj,
                                              this.getMongo().getReadPref());
 
-     var options = 0;
-     // We automatically set slaveOk if readPreference is anything but primary.
-     if (this.getMongo().getReadPrefMode() !== "primary") {
+     var options = (typeof(queryOptions) !== "undefined") ? queryOptions : this.getQueryOptions();
+     var readPrefMode = this.getMongo().getReadPrefMode();
+
+     // Set slaveOk if readPrefMode has been explicitly set with a readPreference other than
+     // primary.
+     if (!!readPrefMode && readPrefMode !== "primary") {
          options |= 4;
      }
 
      // The 'extra' parameter is not used as we have already created a merged command object.
      return this.runCommand(cmdObjWithReadPref, null, options);
  };
+
+ // runCommand uses this impl to actually execute the command
+ DB.prototype._runCommandImpl = function(name, obj, options){
+     return this.getMongo().runCommand(name, obj, options);
+ }
 
  DB.prototype.runCommand = function( obj, extra, queryOptions ){
      var mergedObj = (typeof(obj) === "string") ? this._mergeCommandOptions(obj, extra) : obj;
@@ -113,7 +121,7 @@ DB.prototype.commandHelp = function( name ){
      var options = (typeof(queryOptions) !== "undefined") ? queryOptions : this.getQueryOptions();
      var res;
      try {
-         res = this.getMongo().runCommand(this._name, mergedObj, options);
+         res = this._runCommandImpl(this._name, mergedObj, options);
      }
      catch (ex) {
          // When runCommand flowed through query, a connection error resulted in the message
@@ -121,13 +129,16 @@ DB.prototype.commandHelp = function( name ){
          // for a command failing due to a connection failure, we preserve it for backwards
          // compatibility. See SERVER-18334 for details.
          if (ex.message.indexOf("network error") >= 0) {
-             throw new Error("error doing query: failed");
+             throw new Error("error doing query: failed: " + ex.message);
          }
          throw ex;
      }
      return res;
  };
 
+DB.prototype.runCommandWithMetadata = function(commandName, commandArgs, metadata) {
+    return this.getMongo().runCommandWithMetadata(this._name, commandName, metadata, commandArgs);
+};
 
 DB.prototype._dbCommand = DB.prototype.runCommand;
 DB.prototype._dbReadCommand = DB.prototype.runReadCommand;
@@ -226,7 +237,7 @@ DB.prototype.createCollection = function(name, opt) {
  *  @return SOMETHING_FIXME or null on error
  */
 DB.prototype.getProfilingLevel  = function() {
-    var res = this._dbCommand( { profile: -1 } );
+    var res = assert.commandWorked(this._dbCommand( { profile: -1 } ));
     return res ? res.was : null;
 }
 
@@ -238,7 +249,7 @@ DB.prototype.getProfilingLevel  = function() {
 DB.prototype.getProfilingStatus  = function() {
     var res = this._dbCommand( { profile: -1 } );
     if ( ! res.ok )
-        throw Error( "profile command failed: " + tojson( res ) );
+        throw _getErrorWithCode(res, "profile command failed: " + tojson(res));
     delete res.ok
     return res;
 }
@@ -277,13 +288,13 @@ DB.prototype.shutdownServer = function(opts) {
     try {
         var res = this.runCommand(cmd);
         if (!res.ok) {
-            throw Error('shutdownServer failed: ' + tojson(res));
+            throw _getErrorWithCode(res, 'shutdownServer failed: ' + tojson(res));
         }
         throw Error('shutdownServer failed: server is still up.');
     }
     catch (e) {
         // we expect the command to not return a response, as the server will shut down immediately.
-        if (e.message === "error doing query: failed") {
+        if (e.message.indexOf("error doing query: failed") >= 0) {
             print('server should be down...');
             return;
         }
@@ -504,7 +515,7 @@ DB.prototype.setProfilingLevel = function(level,slowms) {
     var cmd = { profile: level };
     if ( isNumber( slowms ) )
         cmd["slowms"] = slowms;
-    return this._dbCommand( cmd );
+    return assert.commandWorked(this._dbCommand( cmd ));
 }
 
 /**
@@ -539,7 +550,7 @@ DB.prototype.eval = function(jsfunction) {
     var res = this._dbCommand( cmd );
     
     if (!res.ok)
-        throw Error( tojson( res ) );
+        throw _getErrorWithCode(res, tojson(res));
     
     return res.retval;
 }
@@ -623,7 +634,7 @@ DB.prototype.groupeval = function(parmsObj) {
 DB.prototype.groupcmd = function( parmsObj ){
     var ret = this.runCommand( { "group" : this._groupFixParms( parmsObj ) } );
     if ( ! ret.ok ){
-        throw Error( "group command failed: " + tojson( ret ) );
+        throw _getErrorWithCode(ret, "group command failed: " + tojson(ret));
     }
     return ret.retval;
 }
@@ -657,7 +668,7 @@ DB.prototype.forceError = function(){
 DB.prototype.getLastError = function( w , wtimeout ){
     var res = this.getLastErrorObj( w , wtimeout );
     if ( ! res.ok )
-        throw Error( "getlasterror failed: " + tojson( res ) );
+        throw _getErrorWithCode(ret, "getlasterror failed: " + tojson(res));
     return res.err;
 }
 DB.prototype.getLastErrorObj = function( w , wtimeout ){
@@ -670,7 +681,7 @@ DB.prototype.getLastErrorObj = function( w , wtimeout ){
     var res = this.runCommand( cmd );
 
     if ( ! res.ok )
-        throw Error( "getlasterror failed: " + tojson( res ) );
+        throw _getErrorWithCode(res, "getlasterror failed: " + tojson(res));
     return res;
 }
 DB.prototype.getLastErrorCmd = DB.prototype.getLastErrorObj;
@@ -732,12 +743,10 @@ DB.prototype._getCollectionInfosCommand = function(filter) {
             return null;
         }
 
-        throw Error( "listCollections failed: " + tojson( res ) );
+        throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
     }
 
-    // The listCollections command returns its results sorted by collection name.  There's no need
-    // to re-sort.
-    return new DBCommandCursor(this._mongo, res).toArray();
+    return new DBCommandCursor(this._mongo, res).toArray().sort(compareOn("name"));
 }
 
 /**
@@ -906,7 +915,12 @@ DB.prototype.getReplicationInfo = function() {
 DB.prototype.printReplicationInfo = function() {
     var result = this.getReplicationInfo();
     if( result.errmsg ) {
-        if (!this.isMaster().ismaster) {
+        var isMaster = this.isMaster();
+        if (isMaster.arbiterOnly) {
+            print("cannot provide replication status from an arbiter.");
+            return;
+        }
+        else if (!isMaster.ismaster) {
             print("this is a slave, printing slave replication info.");
             this.printSlaveReplicationInfo();
             return;
@@ -1139,7 +1153,10 @@ DB.prototype.getQueryOptions = function() {
 /* Loads any scripts contained in system.js into the client shell.
 */
 DB.prototype.loadServerScripts = function(){
-    this.system.js.find().forEach(function(u){eval(u._id + " = " + u.value);});
+    var global = Function('return this')();
+    this.system.js.find().forEach(function(u) {
+        global[u._id] = u.value;
+    });
 }
 
 
@@ -1205,7 +1222,7 @@ DB.prototype.createUser = function(userObj, writeConcern) {
                     "database will not be fully secured until replication finishes");
     }
 
-    throw Error("couldn't add user: " + res.errmsg);
+    throw _getErrorWithCode(res, "couldn't add user: " + res.errmsg);
 }
 
 function _hashPassword(username, password) {
@@ -1234,9 +1251,9 @@ DB.prototype._updateUserV1 = function(name, updateObject, writeConcern) {
 
     this.system.users.update({user : name, userSource : null},
                              {$set : setObj});
-    var err = this.getLastError(writeConcern['w'], writeConcern['wtimeout']);
-    if (err) {
-        throw Error("Updating user failed: " + err);
+    var errObj = this.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
+    if (errObj.err) {
+        throw _getErrorWithCode(errObj, "Updating user failed: " + errObj.err);
     }
 };
 
@@ -1256,7 +1273,7 @@ DB.prototype.updateUser = function(name, updateObject, writeConcern) {
         return;
     }
 
-    throw Error("Updating user failed: " + res.errmsg);
+    throw _getErrorWithCode(res, "Updating user failed: " + res.errmsg);
 };
 
 DB.prototype.changeUserPassword = function(username, password, writeConcern) {
@@ -1290,7 +1307,7 @@ DB.prototype.dropUser = function( username, writeConcern ){
         return this._removeUserV1(username, cmdObj['writeConcern']);
     }
 
-    throw Error(res.errmsg);
+    throw _getErrorWithCode(res, res.errmsg);
 }
 
 /**
@@ -1303,7 +1320,7 @@ DB.prototype._removeUserV1 = function(username, writeConcern) {
     var le = this.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
 
     if (le.err) {
-        throw Error( "Couldn't remove user: " + le.err );
+        throw _getErrorWithCode(le, "Couldn't remove user: " + le.err);
     }
 
     if (le.n == 1) {
@@ -1318,7 +1335,7 @@ DB.prototype.dropAllUsers = function(writeConcern) {
                                writeConcern: writeConcern ? writeConcern : _defaultWriteConcern});
 
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     return res.n;
@@ -1402,7 +1419,7 @@ DB.prototype.grantRolesToUser = function(username, roles, writeConcern) {
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1412,7 +1429,7 @@ DB.prototype.revokeRolesFromUser = function(username, roles, writeConcern) {
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1425,7 +1442,7 @@ DB.prototype.getUser = function(username, args) {
 
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     if (res.users.length == 0) {
@@ -1446,7 +1463,7 @@ DB.prototype.getUsers = function(args) {
             return this.system.users.find({}).toArray();
         }
 
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     return res.users;
@@ -1462,7 +1479,7 @@ DB.prototype.createRole = function(roleObj, writeConcern) {
     var res = this.runCommand(cmdObj);
 
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
     printjson(roleObj);
 }
@@ -1473,7 +1490,7 @@ DB.prototype.updateRole = function(name, updateObject, writeConcern) {
     cmdObj['writeConcern'] =  writeConcern ? writeConcern : _defaultWriteConcern;
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 };
 
@@ -1490,7 +1507,7 @@ DB.prototype.dropRole = function(name, writeConcern) {
         return false;
     }
 
-    throw Error(res.errmsg);
+    throw _getErrorWithCode(res, res.errmsg);
 };
 
 DB.prototype.dropAllRoles = function(writeConcern) {
@@ -1498,7 +1515,7 @@ DB.prototype.dropAllRoles = function(writeConcern) {
                                writeConcern: writeConcern ? writeConcern : _defaultWriteConcern});
 
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     return res.n;
@@ -1510,7 +1527,7 @@ DB.prototype.grantRolesToRole = function(rolename, roles, writeConcern) {
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1520,7 +1537,7 @@ DB.prototype.revokeRolesFromRole = function(rolename, roles, writeConcern) {
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1530,7 +1547,7 @@ DB.prototype.grantPrivilegesToRole = function(rolename, privileges, writeConcern
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1540,7 +1557,7 @@ DB.prototype.revokePrivilegesFromRole = function(rolename, privileges, writeConc
                   writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 }
 
@@ -1552,7 +1569,7 @@ DB.prototype.getRole = function(rolename, args) {
     Object.extend(cmdObj, args);
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     if (res.roles.length == 0) {
@@ -1566,7 +1583,7 @@ DB.prototype.getRoles = function(args) {
     Object.extend(cmdObj, args);
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
-        throw Error(res.errmsg);
+        throw _getErrorWithCode(res, res.errmsg);
     }
 
     return res.roles;

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -36,47 +35,39 @@
 
 namespace mongo {
 
-    /**
-     * This stage implements limit functionality.  It only returns 'limit' results before EOF.
-     *
-     * Sort has a baked-in limit, as it can optimize the sort if it has a limit.
-     *
-     * Preconditions: None.
-     */
-    class LimitStage : public PlanStage {
-    public:
-        LimitStage(int limit, WorkingSet* ws, PlanStage* child);
-        virtual ~LimitStage();
+/**
+ * This stage implements limit functionality.  It only returns 'limit' results before EOF.
+ *
+ * Sort has a baked-in limit, as it can optimize the sort if it has a limit.
+ *
+ * Preconditions: None.
+ */
+class LimitStage final : public PlanStage {
+public:
+    LimitStage(OperationContext* opCtx, long long limit, WorkingSet* ws, PlanStage* child);
+    ~LimitStage();
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    StageType stageType() const final {
+        return STAGE_LIMIT;
+    }
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual StageType stageType() const { return STAGE_LIMIT; }
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual PlanStageStats* getStats();
+    static const char* kStageType;
 
-        virtual const CommonStats* getCommonStats() const;
+private:
+    WorkingSet* _ws;
 
-        virtual const SpecificStats* getSpecificStats() const;
+    // We only return this many results.
+    long long _numToReturn;
 
-        static const char* kStageType;
-
-    private:
-        WorkingSet* _ws;
-        boost::scoped_ptr<PlanStage> _child;
-
-        // We only return this many results.
-        int _numToReturn;
-
-        // Stats
-        CommonStats _commonStats;
-        LimitStats _specificStats;
-    };
+    // Stats
+    LimitStats _specificStats;
+};
 
 }  // namespace mongo

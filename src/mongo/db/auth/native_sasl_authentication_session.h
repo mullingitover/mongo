@@ -28,44 +28,43 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <cstdint>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authentication_session.h"
-#include "mongo/platform/cstdint.h"
 #include "mongo/db/auth/sasl_authentication_session.h"
 #include "mongo/db/auth/sasl_server_conversation.h"
 
 namespace mongo {
 
-    /**
-     * Authentication session data for the server side of SASL authentication.
-     */
-    class NativeSaslAuthenticationSession : public SaslAuthenticationSession {
-        MONGO_DISALLOW_COPYING(NativeSaslAuthenticationSession);
-    public:
+/**
+ * Authentication session data for the server side of SASL authentication.
+ */
+class NativeSaslAuthenticationSession : public SaslAuthenticationSession {
+    MONGO_DISALLOW_COPYING(NativeSaslAuthenticationSession);
 
-        explicit NativeSaslAuthenticationSession(AuthorizationSession* authSession);
-        virtual ~NativeSaslAuthenticationSession();
+public:
+    explicit NativeSaslAuthenticationSession(AuthorizationSession* authSession);
+    virtual ~NativeSaslAuthenticationSession();
 
-        virtual Status start(StringData authenticationDatabase,
-                             StringData mechanism,
-                             StringData serviceName,
-                             StringData serviceHostname,
-                             int64_t conversationId,
-                             bool autoAuthorize);
+    virtual Status start(StringData authenticationDatabase,
+                         StringData mechanism,
+                         StringData serviceName,
+                         StringData serviceHostname,
+                         int64_t conversationId,
+                         bool autoAuthorize);
 
-        virtual Status step(StringData inputData, std::string* outputData);
+    virtual Status step(StringData inputData, std::string* outputData);
 
-        virtual std::string getPrincipalId() const;
+    virtual std::string getPrincipalId() const;
 
-        virtual const char* getMechanism() const;
+    virtual const char* getMechanism() const;
 
-    private:
-        std::string _mechanism;
-        boost::scoped_ptr<SaslServerConversation> _saslConversation;
-    };
+private:
+    std::string _mechanism;
+    std::unique_ptr<SaslServerConversation> _saslConversation;
+};
 }  // namespace mongo

@@ -31,68 +31,92 @@
 #include <tuple>
 
 #include "mongo/base/status_with.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
-    class BSONObj;
-    class BSONObjBuilder;
-    class OperationContext;
+class BSONObj;
+class BSONObjBuilder;
+class OperationContext;
+class StringData;
 
 /**
  * Utilities for converting metadata between the legacy OP_QUERY format and the new
  * OP_COMMAND format.
- *
- * Metadata consists of information independent of any particular command such as:
- *
- * Request/Reply/Both | (legacy) OP_QUERY format         | OP_COMMAND format
- *__________________________________________________________________________________________________
- * Request            | the slaveOk bit                  | $secondaryOk on metadata obj
- * Request            | $readPreference field of command | $readPreference on metadata obj
- * Request            | $impersonatedUsers on command obj| $impersonatedUsers on metadata obj
- * Request            | $impersonatedRoles on command obj| $impersonatedRoles on metadata obj
- * Request            | maxTimeMS on command obj         | $maxTimeMS on metadata obj
- * Reply              | $gleStats field on command reply | $gleStats on metadata obj
- *
- * TODO: currently only $secondaryOk (request only) is handled. SERVER-18236 will cover the rest.
  */
 namespace rpc {
 
-    /**
-     * Returns an empty metadata object.
-     */
-    BSONObj makeEmptyMetadata();
+/**
+ * Returns an empty metadata object.
+ */
+BSONObj makeEmptyMetadata();
 
-    /**
-     * Reads metadata from a metadata object and sets it on this OperationContext.
-     */
-    Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj);
+/**
+ * Reads metadata from a metadata object and sets it on this OperationContext.
+ */
+Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj);
 
-    /**
-     * Writes metadata from an OperationContext to a metadata object.
-     */
-    Status writeRequestMetadata(OperationContext* txn, BSONObjBuilder* metadataBob);
+/**
+ * Writes metadata from an OperationContext to a metadata object.
+ */
+Status writeRequestMetadata(OperationContext* txn, BSONObjBuilder* metadataBob);
 
-    /**
-     * A command object and a corresponding metadata object.
-     */
-    using CommandAndMetadata = std::tuple<BSONObj, BSONObj>;
+/**
+ * A command object and a corresponding metadata object.
+ */
+using CommandAndMetadata = std::tuple<BSONObj, BSONObj>;
 
-    /**
-     * A legacy command object and a corresponding query flags bitfield. The legacy command object
-     * may contain metadata fields, so it cannot safely be passed to a command's run method.
-     */
-    using LegacyCommandAndFlags = std::tuple<BSONObj, int>;
+/**
+ * A legacy command object and a corresponding query flags bitfield. The legacy command object
+ * may contain metadata fields, so it cannot safely be passed to a command's run method.
+ */
+using LegacyCommandAndFlags = std::tuple<BSONObj, int>;
 
-    /**
-     * Given a legacy command object and a query flags bitfield, attempts to parse and remove
-     * the metadata from the command object and construct a corresponding metadata object.
-     */
-    StatusWith<CommandAndMetadata> upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags);
+/**
+ * Given a legacy command object and a query flags bitfield, attempts to parse and remove
+ * the metadata from the command object and construct a corresponding metadata object.
+ */
+StatusWith<CommandAndMetadata> upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags);
 
-    /**
-     * Given a command object and a metadata object, attempts to construct a legacy command
-     * object and query flags bitfield augmented with the given metadata.
-     */
-    StatusWith<LegacyCommandAndFlags> downconvertRequestMetadata(BSONObj cmdObj, BSONObj metadata);
+/**
+ * Given a command object and a metadata object, attempts to construct a legacy command
+ * object and query flags bitfield augmented with the given metadata.
+ */
+StatusWith<LegacyCommandAndFlags> downconvertRequestMetadata(BSONObj cmdObj, BSONObj metadata);
+
+/**
+ * A command reply and associated metadata object.
+ */
+using CommandReplyWithMetadata = std::tuple<BSONObj, BSONObj>;
+
+/**
+ * Given a legacy command reply, attempts to strip the metadata from the reply and construct
+ * a metadata object.
+ */
+StatusWith<CommandReplyWithMetadata> upconvertReplyMetadata(const BSONObj& legacyReply);
+
+/**
+ * Given a command reply object and an associated metadata object,
+ * attempts to construct a legacy command object.
+ */
+StatusWith<BSONObj> downconvertReplyMetadata(const BSONObj& commandReply,
+                                             const BSONObj& replyMetadata);
+
+/**
+ * A function type for writing request metadata. The function takes a pointer to a
+ * BSONObjBuilder used to construct the metadata object and the server address of the
+ * target of the request and returns a Status indicating if the metadata was written successfully.
+ */
+using RequestMetadataWriter = stdx::function<Status(BSONObjBuilder*, StringData)>;
+
+/**
+ * A function type for reading reply metadata. The function takes a a reference to a
+ * metadata object received in a command reply and the server address of the
+ * host that executed the command and returns a Status indicating if the
+ * metadata was read successfully.
+ *
+ * TODO: would it be a layering violation if this hook took an OperationContext* ?
+ */
+using ReplyMetadataReader = stdx::function<Status(const BSONObj&, StringData)>;
 
 }  // namespace rpc
 }  // namespace mongo

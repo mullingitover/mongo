@@ -34,26 +34,29 @@
 
 namespace mongo {
 
-    class OperationContext;
-    class RecordData;
+class OperationContext;
+class RecordData;
+
+/**
+ * When a capped collection is modified (delete/insert/etc) then certain notifications need to
+ * be made, which this (pure virtual) interface exposes.
+ */
+class CappedCallback {
+public:
+    virtual ~CappedCallback() {}
 
     /**
-     * When a capped collection has to delete a document, it needs a way to tell the caller
-     * what its deleting so it can unindex or do any other cleanup.
-     * This is that way.
+     * This will be called right before loc is deleted when wrapping.
+     * If data is unowned, it is only valid inside of this call. If implementations wish to
+     * stash a pointer, they must copy it.
      */
-    class CappedDocumentDeleteCallback {
-    public:
-        virtual ~CappedDocumentDeleteCallback(){}
+    virtual Status aboutToDeleteCapped(OperationContext* txn,
+                                       const RecordId& loc,
+                                       RecordData data) = 0;
 
-        /**
-         * This will be called right before loc is deleted when wrapping.
-         * If data is unowned, it is only valid inside of this call. If implementations wish to
-         * stash a pointer, they must copy it.
-         */
-        virtual Status aboutToDeleteCapped( OperationContext* txn,
-                                            const RecordId& loc,
-                                            RecordData data ) = 0;
-    };
-
+    /**
+     * Used to notify any waiters when new documents may be visible in the capped collection.
+     */
+    virtual void notifyCappedWaitersIfNeeded() = 0;
+};
 }

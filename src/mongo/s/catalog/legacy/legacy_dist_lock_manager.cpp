@@ -32,194 +32,195 @@
 
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 
-#include "mongo/s/type_locks.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::unique_ptr;
-    using stdx::chrono::milliseconds;
+using std::string;
+using std::unique_ptr;
+using stdx::chrono::milliseconds;
 
 
 namespace {
-    const stdx::chrono::seconds kDefaultSocketTimeout(30);
-    const milliseconds kDefaultPingInterval(30 * 1000);
-} // unnamed namespace
+const stdx::chrono::seconds kDefaultSocketTimeout(30);
+const milliseconds kDefaultPingInterval(30 * 1000);
+}  // unnamed namespace
 
-    LegacyDistLockManager::LegacyDistLockManager(ConnectionString configServer):
-        _configServer(std::move(configServer)),
-        _isStopped(false),
-        _pingerEnabled(true) {
+LegacyDistLockManager::LegacyDistLockManager(ConnectionString configServer)
+    : _configServer(std::move(configServer)), _isStopped(false), _pingerEnabled(true) {}
+
+void LegacyDistLockManager::startUp() {
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    invariant(!_pinger);
+    _pinger = stdx::make_unique<LegacyDistLockPinger>();
+}
+
+void LegacyDistLockManager::shutDown(OperationContext* txn, bool allowNetworking) {
+    stdx::unique_lock<stdx::mutex> sl(_mutex);
+    _isStopped = true;
+
+    while (!_lockMap.empty()) {
+        _noLocksCV.wait(sl);
     }
 
-    void LegacyDistLockManager::startUp() {
-        boost::lock_guard<boost::mutex> sl(_mutex);
-        invariant(!_pinger);
-        _pinger = stdx::make_unique<LegacyDistLockPinger>();
+    if (_pinger) {
+        _pinger->shutdown(allowNetworking);
     }
+}
 
-    void LegacyDistLockManager::shutDown() {
-        boost::unique_lock<boost::mutex> sl(_mutex);
-        _isStopped = true;
+StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    milliseconds waitFor,
+    milliseconds lockTryInterval) {
+    auto distLock = stdx::make_unique<DistributedLock>(_configServer, name.toString());
 
-        while (!_lockMap.empty()) {
-            _noLocksCV.wait(sl);
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+
+        if (_isStopped) {
+            return Status(ErrorCodes::LockBusy, "legacy distlock manager is stopped");
         }
 
-        if (_pinger) {
-            _pinger->shutdown();
-        }
-    }
-
-    StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
-            StringData name,
-            StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
-
-        auto distLock = stdx::make_unique<DistributedLock>(_configServer, name.toString());
-
-        {
-            boost::lock_guard<boost::mutex> sl(_mutex);
-
-            if (_isStopped) {
-                return Status(ErrorCodes::LockBusy, "legacy distlock manager is stopped");
-            }
-
-            if (_pingerEnabled) {
-                auto pingStatus = _pinger->startPing(*(distLock.get()), kDefaultPingInterval);
-                if (!pingStatus.isOK()) {
-                    return pingStatus;
-                }
-            }
-        }
-
-        auto lastStatus = Status(ErrorCodes::LockBusy,
-                                 str::stream() << "timed out waiting for " << name);
-
-        Timer timer;
-        Timer msgTimer;
-        while (waitFor <= milliseconds::zero() || milliseconds(timer.millis()) < waitFor) {
-            bool acquired = false;
-            BSONObj lockDoc;
-            try {
-                acquired = distLock->lock_try(whyMessage.toString(),
-                                              &lockDoc,
-                                              kDefaultSocketTimeout.count());
-
-                if (!acquired) {
-                    lastStatus = Status(ErrorCodes::LockBusy,
-                                        str::stream() << "Lock for " << whyMessage
-                                                      << " is taken.");
-                }
-            }
-            catch (const LockException& lockExcep) {
-                OID needUnlockID(lockExcep.getMustUnlockID());
-                if (needUnlockID.isSet()) {
-                    _pinger->addUnlockOID(needUnlockID);
-                }
-
-                lastStatus = lockExcep.toStatus();
-            }
-            catch (...) {
-                lastStatus = exceptionToStatus();
-            }
-
-            if (acquired) {
-                verify(!lockDoc.isEmpty());
-
-                LocksType lock;
-                string errMsg;
-                if (!lock.parseBSON(lockDoc, &errMsg)) {
-                    return StatusWith<ScopedDistLock>(
-                            ErrorCodes::UnsupportedFormat,
-                            str::stream() << "error while parsing lock document: " << errMsg);
-                }
-
-                dassert(lock.isLockIDSet());
-
-                {
-                    boost::lock_guard<boost::mutex> sl(_mutex);
-                    _lockMap.insert(std::make_pair(lock.getLockID(), std::move(distLock)));
-                }
-
-                return ScopedDistLock(lock.getLockID(), this);
-            }
-
-            if (waitFor == milliseconds::zero()) break;
-
-            if (lastStatus != ErrorCodes::LockBusy) {
-                return lastStatus;
-            }
-
-            // Periodically message for debugging reasons
-            if (msgTimer.seconds() > 10) {
-                log() << "waited " << timer.seconds() << "s for distributed lock " << name
-                      << " for " << whyMessage << ": " << lastStatus.toString();
-
-                msgTimer.reset();
-            }
-
-            milliseconds timeRemaining =
-                    std::max(milliseconds::zero(), waitFor - milliseconds(timer.millis()));
-            sleepFor(std::min(lockTryInterval, timeRemaining));
-        }
-
-        return lastStatus;
-    }
-
-    void LegacyDistLockManager::unlock(const DistLockHandle& lockHandle) BOOST_NOEXCEPT {
-        unique_ptr<DistributedLock> distLock;
-
-        {
-            boost::lock_guard<boost::mutex> sl(_mutex);
-            auto iter = _lockMap.find(lockHandle);
-            invariant(iter != _lockMap.end());
-
-            distLock = std::move(iter->second);
-            _lockMap.erase(iter);
-        }
-
-        if (!distLock->unlock(lockHandle)) {
-            _pinger->addUnlockOID(lockHandle);
-        }
-
-        {
-            boost::lock_guard<boost::mutex> sl(_mutex);
-            if (_lockMap.empty()) {
-                _noLocksCV.notify_all();
+        if (_pingerEnabled) {
+            auto pingStatus = _pinger->startPing(*(distLock.get()), kDefaultPingInterval);
+            if (!pingStatus.isOK()) {
+                return pingStatus;
             }
         }
     }
 
-    Status LegacyDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
-        // Note: this should not happen when locks are managed through ScopedDistLock.
-        if (_pinger->willUnlockOID(lockHandle)) {
-            return Status(ErrorCodes::LockFailed,
-                          str::stream() << "lock " << lockHandle << " is not held and "
-                                        << "is currently being scheduled for lazy unlock");
+    auto lastStatus =
+        Status(ErrorCodes::LockBusy, str::stream() << "timed out waiting for " << name);
+
+    Timer timer;
+    Timer msgTimer;
+    while (waitFor <= milliseconds::zero() || milliseconds(timer.millis()) < waitFor) {
+        bool acquired = false;
+        BSONObj lockDoc;
+        OID lockID(OID::gen());
+
+        try {
+            acquired = distLock->lock_try(lockID,
+                                          whyMessage.toString(),
+                                          &lockDoc,
+                                          durationCount<Seconds>(kDefaultSocketTimeout));
+
+            if (!acquired) {
+                lastStatus = Status(ErrorCodes::LockBusy,
+                                    str::stream() << "Lock for " << whyMessage << " is taken.");
+                // cleanup failed attempt to acquire lock.
+                _pinger->addUnlockOID(lockID);
+            }
+        } catch (const LockException& lockExcep) {
+            OID needUnlockID(lockExcep.getMustUnlockID());
+            if (needUnlockID.isSet()) {
+                _pinger->addUnlockOID(needUnlockID);
+            }
+
+            lastStatus = lockExcep.toStatus();
+        } catch (...) {
+            lastStatus = exceptionToStatus();
+            _pinger->addUnlockOID(lockID);
         }
 
-        DistributedLock* distLock = nullptr;
+        if (acquired) {
+            verify(!lockDoc.isEmpty());
 
-        {
-            // Assumption: lockHandles are never shared across threads.
-            boost::lock_guard<boost::mutex> sl(_mutex);
-            auto iter = _lockMap.find(lockHandle);
-            invariant(iter != _lockMap.end());
+            auto locksTypeResult = LocksType::fromBSON(lockDoc);
+            if (!locksTypeResult.isOK()) {
+                return StatusWith<ScopedDistLock>(
+                    ErrorCodes::UnsupportedFormat,
+                    str::stream() << "error while parsing lock document: " << lockDoc << " : "
+                                  << locksTypeResult.getStatus().toString());
+            }
+            const LocksType& lock = locksTypeResult.getValue();
+            dassert(lock.isLockIDSet());
 
-            distLock = iter->second.get();
+            {
+                stdx::lock_guard<stdx::mutex> sl(_mutex);
+                _lockMap.insert(std::make_pair(lock.getLockID(), std::move(distLock)));
+            }
+
+            return ScopedDistLock(txn, lock.getLockID(), this);
         }
 
-        return distLock->checkStatus(kDefaultSocketTimeout.count());
+        if (waitFor == milliseconds::zero())
+            break;
+
+        if (lastStatus != ErrorCodes::LockBusy) {
+            return lastStatus;
+        }
+
+        // Periodically message for debugging reasons
+        if (msgTimer.seconds() > 10) {
+            log() << "waited " << timer.seconds() << "s for distributed lock " << name << " for "
+                  << whyMessage << ": " << lastStatus.toString();
+
+            msgTimer.reset();
+        }
+
+        milliseconds timeRemaining =
+            std::max(milliseconds::zero(), waitFor - milliseconds(timer.millis()));
+        sleepFor(std::min(lockTryInterval, timeRemaining));
     }
 
-    void LegacyDistLockManager::enablePinger(bool enable) {
-        boost::lock_guard<boost::mutex> sl(_mutex);
-        _pingerEnabled = enable;
+    return lastStatus;
+}
+
+void LegacyDistLockManager::unlock(OperationContext* txn,
+                                   const DistLockHandle& lockHandle) BOOST_NOEXCEPT {
+    unique_ptr<DistributedLock> distLock;
+
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        auto iter = _lockMap.find(lockHandle);
+        invariant(iter != _lockMap.end());
+
+        distLock = std::move(iter->second);
+        _lockMap.erase(iter);
     }
 
+    if (!distLock->unlock(lockHandle)) {
+        _pinger->addUnlockOID(lockHandle);
+    }
+
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        if (_lockMap.empty()) {
+            _noLocksCV.notify_all();
+        }
+    }
+}
+
+Status LegacyDistLockManager::checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) {
+    // Note: this should not happen when locks are managed through ScopedDistLock.
+    if (_pinger->willUnlockOID(lockHandle)) {
+        return Status(ErrorCodes::LockFailed,
+                      str::stream() << "lock " << lockHandle << " is not held and "
+                                    << "is currently being scheduled for lazy unlock");
+    }
+
+    DistributedLock* distLock = nullptr;
+
+    {
+        // Assumption: lockHandles are never shared across threads.
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        auto iter = _lockMap.find(lockHandle);
+        invariant(iter != _lockMap.end());
+
+        distLock = iter->second.get();
+    }
+
+    return distLock->checkStatus(durationCount<Seconds>(kDefaultSocketTimeout));
+}
+
+void LegacyDistLockManager::enablePinger(bool enable) {
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    _pingerEnabled = enable;
+}
 }

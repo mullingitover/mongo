@@ -219,6 +219,24 @@ var authCommandsLib = {
             ]
         },
         {
+            // Test that clusterManager role has permission to run addTagRange
+            testname: "addTagRange",
+            command: {  // addTagRange is not a "real command"; it updates config.tags
+                update: "tags",
+                updates: [ {
+                    q: {_id: { ns : "test.x" , min : 1 }},
+                    u: {_id: { ns : "test.x" , min : 1 },
+                    ns : "test.x"}
+                } ] },
+            skipStandalone: true,
+            testcases: [
+                {
+                    runOnDb: "config",
+                    roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager)
+                }
+            ]
+        },
+        {
             testname: "applyOps",
             command: {applyOps: "x"},
             testcases: [
@@ -309,6 +327,30 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "aggregate_indexStats",
+            command: {aggregate: "foo", pipeline: [{$indexStats: {}}]},
+            setup: function (db) {
+                db.createCollection("foo");
+            },
+            teardown: function (db) {
+                db.foo.drop();
+            },
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {
+                        clusterMonitor: 1,
+                        clusterAdmin: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        {resource: {anyResource: true}, actions: ["indexStats"]}
+                    ]
+                }
+            ]
+        },
+        {
             testname: "appendOplogNote",
             command: {appendOplogNote: 1, data: {a: 1}},
             skipSharded: true,
@@ -326,6 +368,25 @@ var authCommandsLib = {
                         { resource: {cluster: true}, actions: ["appendOplogNote"] }
                     ],
                     expectFail: true, // because no replication enabled
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "authSchemaUpgrade",
+            command: {authSchemaUpgrade: 1},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: {
+                        userAdminAnyDatabase: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["authSchemaUpgrade"] }
+                    ]
                 },
                 { runOnDb: firstDbName, roles: {} },
                 { runOnDb: secondDbName, roles: {} }
@@ -788,26 +849,6 @@ var authCommandsLib = {
             ]
         },
         {
-            testname: "cursorInfo",
-            command: {cursorInfo: 1},
-            testcases: [
-                {
-                    runOnDb: firstDbName,
-                    roles: roles_monitoring,
-                    privileges: [
-                        { resource: {cluster: true}, actions: ["cursorInfo"] }
-                    ]
-                },
-                {
-                    runOnDb: secondDbName,
-                    roles: roles_monitoring,
-                    privileges: [
-                        { resource: {cluster: true}, actions: ["cursorInfo"] }
-                    ]
-                }
-            ]
-        },
-        {
             testname: "dataSize_1",
             command: {dataSize: firstDbName + ".x"},
             testcases: [
@@ -1100,7 +1141,6 @@ var authCommandsLib = {
         {
             testname: "find",
             command: {find: "foo"},
-            skipSharded: true, // TODO: remove when find command is implemented in mongos
             testcases: [
                 {
                     runOnDb: firstDbName,
@@ -1116,6 +1156,21 @@ var authCommandsLib = {
                         { resource: {db: secondDbName, collection: "foo"}, actions: ["find"] }
                     ]
                 }
+            ]
+        },
+        {
+            testname: "findWithTerm",
+            command: {find: "foo", limit: -1, term: NumberLong(1)},
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {__system: 1},
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] },
+                        { resource: {cluster: true}, actions: ["internal"] }
+                    ],
+                    expectFail: true // because of invalid limit
+                },
             ]
         },
         {
@@ -1290,7 +1345,6 @@ var authCommandsLib = {
         {
             testname: "getMore",
             command: {getMore: NumberLong("1"), collection: "foo"},
-            skipSharded: true, // TODO: remove when getMore command is implemented in mongos
             testcases: [
                 {
                     runOnDb: firstDbName,
@@ -1305,6 +1359,21 @@ var authCommandsLib = {
                     roles: roles_readAny,
                     privileges: [
                         { resource: {db: secondDbName, collection: "foo"}, actions: ["find"] }
+                    ],
+                    expectFail: true
+                }
+            ]
+        },
+        {
+            testname: "getMoreWithTerm",
+            command: {getMore: NumberLong("1"), collection: "foo", term: NumberLong(1)},
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {__system: 1},
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] },
+                        { resource: {cluster: true}, actions: ["internal"] }
                     ],
                     expectFail: true
                 }
@@ -1440,34 +1509,6 @@ var authCommandsLib = {
                 }
             ]
         },
-/*      temporarily removed see SERVER-13555 
-        {
-            testname: "indexStats",
-            command: {indexStats: "x", index: "a_1"},
-            skipSharded: true, 
-            setup: function (db) {
-                db.x.save({a: 10});
-                db.x.ensureIndex({a: 1});
-            },
-            teardown: function (db) { db.x.drop(); },
-            testcases: [
-                {
-                    runOnDb: firstDbName,
-                    roles: roles_dbAdmin,
-                    privileges: [
-                        { resource: {db: firstDbName, collection: "x"}, actions: ["indexStats"] }
-                    ]
-                },
-                {
-                    runOnDb: secondDbName,
-                    roles: roles_dbAdminAny,
-                    privileges: [
-                        { resource: {db: secondDbName, collection: "x"}, actions: ["indexStats"] }
-                    ]
-                }
-            ]
-        },
-*/
         {
             testname: "isMaster",
             command: {isMaster: 1},
@@ -1475,6 +1516,48 @@ var authCommandsLib = {
                 { runOnDb: adminDbName, roles: roles_all, privileges: [ ] },
                 { runOnDb: firstDbName, roles: roles_all, privileges: [ ] },
                 { runOnDb: secondDbName, roles: roles_all, privileges: [ ] }
+            ]
+        },
+        {
+            testname: "killCursors",
+            command: {killCursors: "foo", cursors: [NumberLong("123")]},
+            skipSharded: true, // TODO enable when killCursors command is implemented on mongos
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {
+                        read: 1,
+                        readAnyDatabase: 1,
+                        readWrite: 1,
+                        readWriteAnyDatabase: 1,
+                        dbOwner: 1,
+                        hostManager: 1,
+                        clusterAdmin: 1,
+                        backup: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["killCursors"] }
+                    ],
+                    expectFail: true
+                },
+                {
+                    runOnDb: secondDbName,
+                    roles: {
+                        readAnyDatabase: 1,
+                        readWriteAnyDatabase: 1,
+                        hostManager: 1,
+                        clusterAdmin: 1,
+                        backup: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        { resource: {db: secondDbName, collection: "foo"}, actions: ["killCursors"] }
+                    ],
+                    expectFail: true
+                }
             ]
         },
         {
@@ -1581,7 +1664,7 @@ var authCommandsLib = {
                         }
                     ]
                 },
-                // test legacy (pre 3.0) way of authorizing listCollections
+                // Test legacy (pre 3.0) way of authorizing listCollections.
                 {
                     runOnDb: firstDbName,
                     privileges: [
@@ -1620,6 +1703,16 @@ var authCommandsLib = {
                         {
                             resource: {db: firstDbName, collection: ""},
                             actions: ["listIndexes"]
+                        }
+                    ]
+                },
+                // Test legacy (pre 3.0) way of authorizing listIndexes.
+                {
+                    runOnDb: firstDbName,
+                    privileges: [
+                        {
+                            resource: {db: firstDbName, collection: "system.indexes"},
+                            actions: ["find"]
                         }
                     ]
                 }
@@ -1724,7 +1817,7 @@ var authCommandsLib = {
             ]
         },
         {
-            testname: "mergeChunks",
+            testname: "s_mergeChunks",
             command: {mergeChunks: "test.x", bounds: [{i : 0}, {i : 5}]},
             skipStandalone: true,
             testcases: [
@@ -1741,14 +1834,49 @@ var authCommandsLib = {
             ]
         },
         {
-            testname: "moveChunk",
+            testname: "d_mergeChunks",
+            command: {mergeChunks: "test.x", bounds: [{i : 0}, {i : 5}]},
+            skipSharded: true,
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: { __system: 1 },
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["internal"] }
+                    ],
+                    expectFail: true
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "s_moveChunk",
             command: {moveChunk: "test.x"},
+            skipStandalone: true,
             testcases: [
                 {
                     runOnDb: adminDbName,
                     roles: roles_clusterManager,
                     privileges: [
                         { resource: {db: "test", collection: "x"}, actions: ["moveChunk"] }
+                    ],
+                    expectFail: true
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "d_moveChunk",
+            command: {moveChunk: "test.x"},
+            skipSharded: true,
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: { __system: 1 },
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["internal"] }
                     ],
                     expectFail: true
                 },
@@ -1903,6 +2031,7 @@ var authCommandsLib = {
                 {
                     runOnDb: firstDbName,
                     roles: {
+                        backup: 1,
                         dbAdmin: 1,
                         dbAdminAnyDatabase: 1,
                         dbOwner: 1,
@@ -1919,6 +2048,7 @@ var authCommandsLib = {
                 {
                     runOnDb: secondDbName,
                     roles: {
+                        backup: 1,
                         dbAdminAnyDatabase: 1,
                         clusterMonitor: 1,
                         clusterAdmin: 1,
@@ -2462,9 +2592,9 @@ var authCommandsLib = {
             testcases: [
                 {
                     runOnDb: adminDbName,
-                    roles: roles_clusterManager,
+                    roles: { __system: 1 },
                     privileges: [
-                        { resource: {db: "test", collection: "x"}, actions: ["splitChunk"] }
+                        { resource: {cluster: true}, actions: ["internal"] }
                     ],
                     expectFail: true
                 },
@@ -2502,7 +2632,7 @@ var authCommandsLib = {
                 }
             ]
         },
-/*      temporarily removed see SERVER-13555 
+/*      temporarily removed see SERVER-13555
          {
             testname: "storageDetails",
             command: {storageDetails: "x", analyze: "diskStorage"},
@@ -2608,6 +2738,20 @@ var authCommandsLib = {
                     privileges: [
                         { resource: {db: secondDbName, collection: "x"}, actions: ["validate"] }
                     ]
+                }
+            ]
+        },
+        {
+            // Test that the root role has the privilege to validate any system.* collection
+            testname: "validate_system",
+            command: {validate: "system.users"},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: {
+                        root: 1,
+                        __system: 1
+                    }
                 }
             ]
         },

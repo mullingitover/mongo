@@ -30,60 +30,59 @@
 
 #include "mongo/s/catalog/catalog_cache.h"
 
-#include <boost/make_shared.hpp>
 
 #include "mongo/base/status_with.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/config.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 
-    using boost::shared_ptr;
-    using std::string;
+using std::shared_ptr;
+using std::string;
 
 
-    CatalogCache::CatalogCache(CatalogManager* catalogManager)
-            : _catalogManager(catalogManager) {
+CatalogCache::CatalogCache() {}
 
-        invariant(_catalogManager);
+StatusWith<shared_ptr<DBConfig>> CatalogCache::getDatabase(OperationContext* txn,
+                                                           const string& dbName) {
+    stdx::lock_guard<stdx::mutex> guard(_mutex);
+
+    ShardedDatabasesMap::iterator it = _databases.find(dbName);
+    if (it != _databases.end()) {
+        return it->second;
     }
 
-    StatusWith<shared_ptr<DBConfig>> CatalogCache::getDatabase(const string& dbName) {
-        boost::lock_guard<boost::mutex> guard(_mutex);
-
-        ShardedDatabasesMap::iterator it = _databases.find(dbName);
-        if (it != _databases.end()) {
-            return it->second;
-        }
-
-        // Need to load from the store
-        StatusWith<DatabaseType> status = _catalogManager->getDatabase(dbName);
-        if (!status.isOK()) {
-            return status.getStatus();
-        }
-
-        shared_ptr<DBConfig> db = boost::make_shared<DBConfig>(dbName, status.getValue());
-        db->load();
-
-        invariant(_databases.insert(std::make_pair(dbName, db)).second);
-
-        return db;
+    // Need to load from the store
+    auto status = grid.catalogManager(txn)->getDatabase(txn, dbName);
+    if (!status.isOK()) {
+        return status.getStatus();
     }
 
-    void CatalogCache::invalidate(const string& dbName) {
-        boost::lock_guard<boost::mutex> guard(_mutex);
+    const auto dbOpTimePair = status.getValue();
+    shared_ptr<DBConfig> db =
+        std::make_shared<DBConfig>(dbName, dbOpTimePair.value, dbOpTimePair.opTime);
+    db->load(txn);
 
-        ShardedDatabasesMap::iterator it = _databases.find(dbName);
-        if (it != _databases.end()) {
-            _databases.erase(it);
-        }
+    invariant(_databases.insert(std::make_pair(dbName, db)).second);
+
+    return db;
+}
+
+void CatalogCache::invalidate(const string& dbName) {
+    stdx::lock_guard<stdx::mutex> guard(_mutex);
+
+    ShardedDatabasesMap::iterator it = _databases.find(dbName);
+    if (it != _databases.end()) {
+        _databases.erase(it);
     }
+}
 
-    void CatalogCache::invalidateAll() {
-        boost::lock_guard<boost::mutex> guard(_mutex);
+void CatalogCache::invalidateAll() {
+    stdx::lock_guard<stdx::mutex> guard(_mutex);
 
-        _databases.clear();
-    }
+    _databases.clear();
+}
 
-} // namespace mongo
+}  // namespace mongo

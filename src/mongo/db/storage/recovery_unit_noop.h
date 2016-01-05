@@ -28,41 +28,60 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "mongo/db/storage/recovery_unit.h"
 
 namespace mongo {
 
-    class OperationContext;
+class OperationContext;
 
-    class RecoveryUnitNoop : public RecoveryUnit {
-    public:
-        // TODO implement rollback
-        void beginUnitOfWork(OperationContext* opCtx) final {}
-        void commitUnitOfWork() final {}
-        void abortUnitOfWork() final {}
-
-        virtual void abandonSnapshot() {}
-
-        virtual bool waitUntilDurable() {
-            return true;
-        }
-
-        virtual void registerChange(Change* change) {
+class RecoveryUnitNoop : public RecoveryUnit {
+public:
+    void beginUnitOfWork(OperationContext* opCtx) final {}
+    void commitUnitOfWork() final {
+        for (auto& change : _changes) {
             try {
                 change->commit();
-                delete change;
-            }
-            catch (...) {
+            } catch (...) {
                 std::terminate();
             }
         }
-
-        virtual void* writingPtr(void* data, size_t len) {
-            return data;
+        _changes.clear();
+    }
+    void abortUnitOfWork() final {
+        for (auto it = _changes.rbegin(); it != _changes.rend(); ++it) {
+            try {
+                (*it)->rollback();
+            } catch (...) {
+                std::terminate();
+            }
         }
-        virtual void setRollbackWritesDisabled() {}
+        _changes.clear();
+    }
 
-        virtual SnapshotId getSnapshotId() const { return SnapshotId(); }
-    };
+    virtual void abandonSnapshot() {}
+
+    virtual bool waitUntilDurable() {
+        return true;
+    }
+
+    virtual void registerChange(Change* change) {
+        _changes.push_back(std::unique_ptr<Change>(change));
+    }
+
+    virtual void* writingPtr(void* data, size_t len) {
+        return data;
+    }
+    virtual void setRollbackWritesDisabled() {}
+
+    virtual SnapshotId getSnapshotId() const {
+        return SnapshotId();
+    }
+
+private:
+    std::vector<std::unique_ptr<Change>> _changes;
+};
 
 }  // namespace mongo

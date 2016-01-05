@@ -10,6 +10,9 @@
 'use strict';
 load('jstests/libs/parallelTester.js');
 
+Random.setRandomSeed();
+
+var awaitTimeout = 2*60*1000;
 // used to parse RAM log file
 var contains = function(logLines, func) {
     var i = logLines.length;
@@ -28,7 +31,7 @@ var conf = replTest.getReplSetConfig();
 conf.settings = {};
 conf.settings.chainingAllowed = false;
 replTest.initiate(conf);
-replTest.awaitSecondaryNodes();
+replTest.awaitSecondaryNodes(awaitTimeout);
 var primary = replTest.getPrimary();
 var coll = primary.getDB('test').cloner;
 coll.drop();
@@ -43,7 +46,7 @@ for (var i=0; i < numDocs; i++) {
 }
 batch.execute();
 
-replTest.awaitReplication(2*60*1000);
+replTest.awaitReplication(awaitTimeout);
 
 jsTestLog("Start remove/insert on primary");
 var insertAndRemove = function(host) {
@@ -73,8 +76,14 @@ worker.start();
 
 jsTestLog("add a new secondary");
 var secondary = replTest.add({});
-replTest.reInitiate(4*60*1000);
+replTest.reInitiate(awaitTimeout * 2);
 secondary.setSlaveOk();
+// Wait for the secondary to get ReplSetInitiate command.
+replTest.waitForState(secondary,
+                      [ReplSetTest.State.STARTUP_2,
+                       ReplSetTest.State.RECOVERING,
+                       ReplSetTest.State.SECONDARY],
+                      60 * 1000);
 
 // This fail point will cause the first intial sync to fail, and leave an op in the buffer to 
 // verify the fix from SERVER-17807
@@ -100,8 +109,8 @@ primary.getDB('test').stop.insert({});
 worker.join();
 //make sure all secondaries are caught up, after init sync
 reconnect(secondary.getDB("test"));
-replTest.awaitSecondaryNodes();
-replTest.awaitReplication(2*60*1000);
+replTest.awaitSecondaryNodes(awaitTimeout);
+replTest.awaitReplication(awaitTimeout);
 
 jsTestLog("check that secondary has correct counts");
 var secondaryColl = secondary.getDB('test').getCollection('cloner');

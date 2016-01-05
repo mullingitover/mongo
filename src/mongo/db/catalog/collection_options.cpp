@@ -35,180 +35,230 @@
 
 namespace mongo {
 
-    // static
-    bool CollectionOptions::validMaxCappedDocs( long long* max ) {
-        if ( *max <= 0 ||
-             *max == std::numeric_limits<long long>::max() ) {
-            *max = 0x7fffffff;
-            return true;
+// static
+bool CollectionOptions::validMaxCappedDocs(long long* max) {
+    if (*max <= 0 || *max == std::numeric_limits<long long>::max()) {
+        *max = 0x7fffffff;
+        return true;
+    }
+
+    if (*max < (0x1LL << 31)) {
+        return true;
+    }
+
+    return false;
+}
+
+namespace {
+
+Status checkStorageEngineOptions(const BSONElement& elem) {
+    invariant(elem.fieldNameStringData() == "storageEngine");
+
+    // Storage engine-specific collection options.
+    // "storageEngine" field must be of type "document".
+    // Every field inside "storageEngine" has to be a document.
+    // Format:
+    // {
+    //     ...
+    //     storageEngine: {
+    //         storageEngine1: {
+    //             ...
+    //         },
+    //         storageEngine2: {
+    //             ...
+    //         }
+    //     },
+    //     ...
+    // }
+    if (elem.type() != mongo::Object) {
+        return {ErrorCodes::BadValue, "'storageEngine' has to be a document."};
+    }
+
+    BSONForEach(storageEngineElement, elem.Obj()) {
+        StringData storageEngineName = storageEngineElement.fieldNameStringData();
+        if (storageEngineElement.type() != mongo::Object) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "'storageEngine." << storageEngineName
+                                  << "' has to be an embedded document."};
         }
-
-        if ( *max < ( 0x1LL << 31 ) ) {
-            return true;
-        }
-
-        return false;
     }
 
-    void CollectionOptions::reset() {
-        capped = false;
-        cappedSize = 0;
-        cappedMaxDocs = 0;
-        initialNumExtents = 0;
-        initialExtentSizes.clear();
-        autoIndexId = DEFAULT;
-        // For compatibility with previous versions if the user sets no flags,
-        // we set Flag_UsePowerOf2Sizes in case the user downgrades.
-        flags = Flag_UsePowerOf2Sizes;
-        flagsSet = false;
-        temp = false;
-        storageEngine = BSONObj();
-        validator = BSONObj();
-    }
+    return Status::OK();
+}
 
-    bool CollectionOptions::isValid() const {
-        return validate().isOK();
-    }
+}  // namespace
 
-    Status CollectionOptions::validate() const {
-        return CollectionOptions().parse(toBSON());
-    }
+void CollectionOptions::reset() {
+    capped = false;
+    cappedSize = 0;
+    cappedMaxDocs = 0;
+    initialNumExtents = 0;
+    initialExtentSizes.clear();
+    autoIndexId = DEFAULT;
+    // For compatibility with previous versions if the user sets no flags,
+    // we set Flag_UsePowerOf2Sizes in case the user downgrades.
+    flags = Flag_UsePowerOf2Sizes;
+    flagsSet = false;
+    temp = false;
+    storageEngine = BSONObj();
+    indexOptionDefaults = BSONObj();
+    validator = BSONObj();
+    validationLevel = "";
+    validationAction = "";
+}
 
-    Status CollectionOptions::parse(const BSONObj& options) {
-        reset();
+bool CollectionOptions::isValid() const {
+    return validate().isOK();
+}
 
-        // During parsing, ignore some validation errors in order to accept options objects that
-        // were valid in previous versions of the server.  SERVER-13737.
-        BSONObjIterator i( options );
-        while ( i.more() ) {
-            BSONElement e = i.next();
-            StringData fieldName = e.fieldName();
+Status CollectionOptions::validate() const {
+    return CollectionOptions().parse(toBSON());
+}
 
-            if ( fieldName == "capped" ) {
-                capped = e.trueValue();
+Status CollectionOptions::parse(const BSONObj& options) {
+    reset();
+
+    // During parsing, ignore some validation errors in order to accept options objects that
+    // were valid in previous versions of the server.  SERVER-13737.
+    BSONObjIterator i(options);
+    while (i.more()) {
+        BSONElement e = i.next();
+        StringData fieldName = e.fieldName();
+
+        if (fieldName == "capped") {
+            capped = e.trueValue();
+        } else if (fieldName == "size") {
+            if (!e.isNumber()) {
+                // Ignoring for backwards compatibility.
+                continue;
             }
-            else if ( fieldName == "size" ) {
-                if ( !e.isNumber() ) {
-                    // Ignoring for backwards compatibility.
-                    continue;
+            cappedSize = e.numberLong();
+            if (cappedSize < 0)
+                return Status(ErrorCodes::BadValue, "size has to be >= 0");
+            cappedSize += 0xff;
+            cappedSize &= 0xffffffffffffff00LL;
+        } else if (fieldName == "max") {
+            if (!options["capped"].trueValue() || !e.isNumber()) {
+                // Ignoring for backwards compatibility.
+                continue;
+            }
+            cappedMaxDocs = e.numberLong();
+            if (!validMaxCappedDocs(&cappedMaxDocs))
+                return Status(ErrorCodes::BadValue,
+                              "max in a capped collection has to be < 2^31 or not set");
+        } else if (fieldName == "$nExtents") {
+            if (e.type() == Array) {
+                BSONObjIterator j(e.Obj());
+                while (j.more()) {
+                    BSONElement inner = j.next();
+                    initialExtentSizes.push_back(inner.numberInt());
                 }
-                cappedSize = e.numberLong();
-                if ( cappedSize < 0 )
-                    return Status( ErrorCodes::BadValue, "size has to be >= 0" );
-                cappedSize += 0xff;
-                cappedSize &= 0xffffffffffffff00LL;
+            } else {
+                initialNumExtents = e.numberLong();
             }
-            else if ( fieldName == "max" ) {
-                if ( !options["capped"].trueValue() || !e.isNumber() ) {
-                    // Ignoring for backwards compatibility.
-                    continue;
-                }
-                cappedMaxDocs = e.numberLong();
-                if ( !validMaxCappedDocs( &cappedMaxDocs ) )
-                    return Status( ErrorCodes::BadValue,
-                                   "max in a capped collection has to be < 2^31 or not set" );
+        } else if (fieldName == "autoIndexId") {
+            if (e.trueValue())
+                autoIndexId = YES;
+            else
+                autoIndexId = NO;
+        } else if (fieldName == "flags") {
+            flags = e.numberInt();
+            flagsSet = true;
+        } else if (fieldName == "temp") {
+            temp = e.trueValue();
+        } else if (fieldName == "storageEngine") {
+            Status status = checkStorageEngineOptions(e);
+            if (!status.isOK()) {
+                return status;
             }
-            else if ( fieldName == "$nExtents" ) {
-                if ( e.type() == Array ) {
-                    BSONObjIterator j( e.Obj() );
-                    while ( j.more() ) {
-                        BSONElement inner = j.next();
-                        initialExtentSizes.push_back( inner.numberInt() );
+            storageEngine = e.Obj().getOwned();
+        } else if (fieldName == "indexOptionDefaults") {
+            if (e.type() != mongo::Object) {
+                return {ErrorCodes::TypeMismatch, "'indexOptionDefaults' has to be a document."};
+            }
+            BSONForEach(option, e.Obj()) {
+                if (option.fieldNameStringData() == "storageEngine") {
+                    Status status = checkStorageEngineOptions(option);
+                    if (!status.isOK()) {
+                        return {status.code(),
+                                str::stream() << "In indexOptionDefaults: " << status.reason()};
                     }
+                } else {
+                    // Return an error on first unrecognized field.
+                    return {ErrorCodes::InvalidOptions,
+                            str::stream() << "indexOptionDefaults." << option.fieldNameStringData()
+                                          << " is not a supported option."};
                 }
-                else {
-                    initialNumExtents = e.numberLong();
-                }
             }
-            else if ( fieldName == "autoIndexId" ) {
-                if ( e.trueValue() )
-                    autoIndexId = YES;
-                else
-                    autoIndexId = NO;
+            indexOptionDefaults = e.Obj().getOwned();
+        } else if (fieldName == "validator") {
+            if (e.type() != mongo::Object) {
+                return Status(ErrorCodes::BadValue, "'validator' has to be a document.");
             }
-            else if ( fieldName == "flags" ) {
-                flags = e.numberInt();
-                flagsSet = true;
-            }
-            else if ( fieldName == "temp" ) {
-                temp = e.trueValue();
-            }
-            else if (fieldName == "storageEngine") {
-                // Storage engine-specific collection options.
-                // "storageEngine" field must be of type "document".
-                // Every field inside "storageEngine" has to be a document.
-                // Format:
-                // {
-                //     ...
-                //     storageEngine: {
-                //         storageEngine1: {
-                //             ...
-                //         },
-                //         storageEngine2: {
-                //             ...
-                //         }
-                //     },
-                //     ...
-                // }
-                if (e.type() != mongo::Object) {
-                    return Status(ErrorCodes::BadValue, "'storageEngine' has to be a document.");
-                }
 
-                BSONForEach(storageEngineElement, e.Obj()) {
-                    StringData storageEngineName = storageEngineElement.fieldNameStringData();
-                    if (storageEngineElement.type() != mongo::Object) {
-                        return Status(ErrorCodes::BadValue, str::stream() << "'storageEngine." <<
-                                      storageEngineName << "' has to be an embedded document.");
-                    }
-                }
-
-                storageEngine = e.Obj().getOwned();
+            validator = e.Obj().getOwned();
+        } else if (fieldName == "validationAction") {
+            if (e.type() != mongo::String) {
+                return Status(ErrorCodes::BadValue, "'validationAction' has to be a string.");
             }
-            else if (fieldName == "validator") {
-                if (e.type() != mongo::Object) {
-                    return Status(ErrorCodes::BadValue, "'validator' has to be a document.");
-                }
 
-                validator = e.Obj().getOwned();
+            validationAction = e.String();
+        } else if (fieldName == "validationLevel") {
+            if (e.type() != mongo::String) {
+                return Status(ErrorCodes::BadValue, "'validationLevel' has to be a string.");
             }
+
+            validationLevel = e.String();
         }
-
-        return Status::OK();
     }
 
-    BSONObj CollectionOptions::toBSON() const {
-        BSONObjBuilder b;
-        if ( capped ) {
-            b.appendBool( "capped", true );
-            b.appendNumber( "size", cappedSize );
+    return Status::OK();
+}
 
-            if ( cappedMaxDocs )
-                b.appendNumber( "max", cappedMaxDocs );
-        }
+BSONObj CollectionOptions::toBSON() const {
+    BSONObjBuilder b;
+    if (capped) {
+        b.appendBool("capped", true);
+        b.appendNumber("size", cappedSize);
 
-        if ( initialNumExtents )
-            b.appendNumber( "$nExtents", initialNumExtents );
-        if ( !initialExtentSizes.empty() )
-            b.append( "$nExtents", initialExtentSizes );
-
-        if ( autoIndexId != DEFAULT )
-            b.appendBool( "autoIndexId", autoIndexId == YES );
-
-        if ( flagsSet )
-            b.append( "flags", flags );
-
-        if ( temp )
-            b.appendBool( "temp", true );
-
-        if (!storageEngine.isEmpty()) {
-            b.append("storageEngine", storageEngine);
-        }
-
-        if (!validator.isEmpty()) {
-            b.append("validator", validator);
-        }
-
-        return b.obj();
+        if (cappedMaxDocs)
+            b.appendNumber("max", cappedMaxDocs);
     }
 
+    if (initialNumExtents)
+        b.appendNumber("$nExtents", initialNumExtents);
+    if (!initialExtentSizes.empty())
+        b.append("$nExtents", initialExtentSizes);
+
+    if (autoIndexId != DEFAULT)
+        b.appendBool("autoIndexId", autoIndexId == YES);
+
+    if (flagsSet)
+        b.append("flags", flags);
+
+    if (temp)
+        b.appendBool("temp", true);
+
+    if (!storageEngine.isEmpty()) {
+        b.append("storageEngine", storageEngine);
+    }
+
+    if (!indexOptionDefaults.isEmpty()) {
+        b.append("indexOptionDefaults", indexOptionDefaults);
+    }
+
+    if (!validator.isEmpty()) {
+        b.append("validator", validator);
+    }
+
+    if (!validationLevel.empty()) {
+        b.append("validationLevel", validationLevel);
+    }
+
+    if (!validationAction.empty()) {
+        b.append("validationAction", validationAction);
+    }
+
+    return b.obj();
+}
 }

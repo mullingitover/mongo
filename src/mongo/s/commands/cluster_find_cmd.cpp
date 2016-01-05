@@ -28,113 +28,152 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional.hpp>
+
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/cluster_explain.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/s/query/cluster_find.h"
 #include "mongo/s/strategy.h"
-#include "mongo/util/timer.h"
 
 namespace mongo {
+namespace {
 
-    using std::auto_ptr;
-    using std::string;
-    using std::vector;
+using std::unique_ptr;
+using std::string;
+using std::vector;
+
+const char kTermField[] = "term";
+
+/**
+ * Implements the find command on mongos.
+ */
+class ClusterFindCmd : public Command {
+    MONGO_DISALLOW_COPYING(ClusterFindCmd);
+
+public:
+    ClusterFindCmd() : Command("find") {}
+
+    bool isWriteCommandForConfigServer() const final {
+        return false;
+    }
+
+    bool slaveOk() const final {
+        return false;
+    }
+
+    bool slaveOverrideOk() const final {
+        return true;
+    }
+
+    bool maintenanceOk() const final {
+        return false;
+    }
+
+    bool adminOnly() const final {
+        return false;
+    }
+
+    bool shouldAffectCommandCounter() const final {
+        return false;
+    }
+
+    void help(std::stringstream& help) const final {
+        help << "query for documents";
+    }
 
     /**
-     * Implements the find command on mongos.
-     *
-     * TODO: this is just a placeholder. It needs to be implemented for real under SERVER-15176.
+     * In order to run the find command, you must be authorized for the "find" action
+     * type on the collection.
      */
-    class ClusterFindCmd : public Command {
-        MONGO_DISALLOW_COPYING(ClusterFindCmd);
-    public:
-        ClusterFindCmd() : Command("find") { }
-
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-
-        virtual bool slaveOk() const { return false; }
-
-        virtual bool slaveOverrideOk() const { return true; }
-
-        virtual bool maintenanceOk() const { return false; }
-
-        virtual bool adminOnly() const { return false; }
-
-        virtual void help(std::stringstream& help) const {
-            help << "query for documents";
-        }
-
-        /**
-         * In order to run the find command, you must be authorized for the "find" action
-         * type on the collection.
-         */
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
-
-            if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
-                return Status::OK();
-            }
-
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-
-        virtual Status explain(OperationContext* txn,
+    Status checkAuthForCommand(ClientBasic* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               ExplainCommon::Verbosity verbosity,
-                               BSONObjBuilder* out) const {
+                               const BSONObj& cmdObj) final {
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        auto hasTerm = cmdObj.hasField(kTermField);
+        return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
+    }
 
-            const string fullns = parseNs(dbname, cmdObj);
-
-            // Parse the command BSON to a LiteParsedQuery.
-            LiteParsedQuery* rawLpq;
-            bool isExplain = true;
-            Status lpqStatus = LiteParsedQuery::make(fullns, cmdObj, isExplain, &rawLpq);
-            if (!lpqStatus.isOK()) {
-                return lpqStatus;
-            }
-            auto_ptr<LiteParsedQuery> lpq(rawLpq);
-
-            BSONObjBuilder explainCmdBob;
-            ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
-
-            // We will time how long it takes to run the commands on the shards.
-            Timer timer;
-
-            vector<Strategy::CommandResult> shardResults;
-            Strategy::commandOp(dbname,
-                                explainCmdBob.obj(),
-                                lpq->getOptions(),
-                                fullns,
-                                lpq->getFilter(),
-                                &shardResults);
-
-            long long millisElapsed = timer.millis();
-
-            const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, cmdObj);
-
-            return ClusterExplain::buildExplainResult(shardResults,
-                                                      mongosStageName,
-                                                      millisElapsed,
-                                                      out);
+    Status explain(OperationContext* txn,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                   BSONObjBuilder* out) const final {
+        const string fullns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(fullns);
+        if (!nss.isValid()) {
+            return {ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid collection name: " << nss.ns()};
         }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj, int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
-
-            // Currently only explains of finds run through the find command. Queries that are not
-            // explained use the legacy OP_QUERY path.
-            errmsg = "find command not yet implemented";
-            return false;
+        // Parse the command BSON to a LiteParsedQuery.
+        bool isExplain = true;
+        auto lpq = LiteParsedQuery::makeFromFindCommand(std::move(nss), cmdObj, isExplain);
+        if (!lpq.isOK()) {
+            return lpq.getStatus();
         }
 
-    } cmdFindCluster;
+        return Strategy::explainFind(
+            txn, cmdObj, *lpq.getValue(), verbosity, serverSelectionMetadata, out);
+    }
 
-} // namespace mongo
+    bool run(OperationContext* txn,
+             const std::string& dbname,
+             BSONObj& cmdObj,
+             int options,
+             std::string& errmsg,
+             BSONObjBuilder& result) final {
+        // We count find command as a query op.
+        globalOpCounters.gotQuery();
+
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        if (!nss.isValid()) {
+            return appendCommandStatus(result,
+                                       {ErrorCodes::InvalidNamespace,
+                                        str::stream() << "Invalid collection name: " << nss.ns()});
+        }
+
+        const bool isExplain = false;
+        auto lpq = LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain);
+        if (!lpq.isOK()) {
+            return appendCommandStatus(result, lpq.getStatus());
+        }
+
+        auto cq = CanonicalQuery::canonicalize(lpq.getValue().release(), ExtensionsCallbackNoop());
+        if (!cq.isOK()) {
+            return appendCommandStatus(result, cq.getStatus());
+        }
+
+        // Extract read preference. If no read preference is specified in the query, will we pass
+        // down a "primaryOnly" or "secondary" read pref, depending on the slaveOk setting.
+        auto readPref =
+            ClusterFind::extractUnwrappedReadPref(cmdObj, options & QueryOption_SlaveOk);
+        if (!readPref.isOK()) {
+            return appendCommandStatus(result, readPref.getStatus());
+        }
+
+        // Do the work to generate the first batch of results. This blocks waiting to get responses
+        // from the shard(s).
+        std::vector<BSONObj> batch;
+        auto cursorId = ClusterFind::runQuery(txn, *cq.getValue(), readPref.getValue(), &batch);
+        if (!cursorId.isOK()) {
+            return appendCommandStatus(result, cursorId.getStatus());
+        }
+
+        // Build the response document.
+        CursorResponseBuilder firstBatch(/*firstBatch*/ true, &result);
+        for (const auto& obj : batch) {
+            firstBatch.append(obj);
+        }
+        firstBatch.done(cursorId.getValue(), nss.ns());
+        return true;
+    }
+
+} cmdFindCluster;
+
+}  // namespace
+}  // namespace mongo

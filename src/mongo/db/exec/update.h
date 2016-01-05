@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -39,184 +38,179 @@
 
 namespace mongo {
 
-    class OperationContext;
+class OperationContext;
+struct PlanSummaryStats;
 
-    struct UpdateStageParams {
+struct UpdateStageParams {
+    UpdateStageParams(const UpdateRequest* r, UpdateDriver* d, OpDebug* o)
+        : request(r), driver(d), opDebug(o), canonicalQuery(NULL) {}
 
-        UpdateStageParams(const UpdateRequest* r,
-                          UpdateDriver* d,
-                          OpDebug* o)
-            : request(r),
-              driver(d),
-              opDebug(o),
-              canonicalQuery(NULL) { }
+    // Contains update parameters like whether it's a multi update or an upsert. Not owned.
+    // Must outlive the UpdateStage.
+    const UpdateRequest* request;
 
-        // Contains update parameters like whether it's a multi update or an upsert. Not owned.
-        // Must outlive the UpdateStage.
-        const UpdateRequest* request;
+    // Contains the logic for applying mods to documents. Not owned. Must outlive
+    // the UpdateStage.
+    UpdateDriver* driver;
 
-        // Contains the logic for applying mods to documents. Not owned. Must outlive
-        // the UpdateStage.
-        UpdateDriver* driver;
+    // Needed to pass to Collection::updateDocument(...).
+    OpDebug* opDebug;
 
-        // Needed to pass to Collection::updateDocument(...).
-        OpDebug* opDebug;
+    // Not owned here.
+    CanonicalQuery* canonicalQuery;
 
-        // Not owned here.
-        CanonicalQuery* canonicalQuery;
+private:
+    // Default constructor not allowed.
+    UpdateStageParams();
+};
 
-    private:
-        // Default constructor not allowed.
-        UpdateStageParams();
-    };
+/**
+ * Execution stage responsible for updates to documents and upserts. If the prior or
+ * newly-updated version of the document was requested to be returned, then ADVANCED is
+ * returned after updating or inserting a document. Otherwise, NEED_TIME is returned after
+ * updating or inserting a document.
+ *
+ * Callers of work() must be holding a write lock.
+ */
+class UpdateStage final : public PlanStage {
+    MONGO_DISALLOW_COPYING(UpdateStage);
+
+public:
+    UpdateStage(OperationContext* txn,
+                const UpdateStageParams& params,
+                WorkingSet* ws,
+                Collection* collection,
+                PlanStage* child);
+
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
+
+    void doRestoreState() final;
+
+    StageType stageType() const final {
+        return STAGE_UPDATE;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
 
     /**
-     * Execution stage responsible for updates to documents and upserts. If the prior or
-     * newly-updated version of the document was requested to be returned, then ADVANCED is
-     * returned after updating or inserting a document. Otherwise, NEED_TIME is returned after
-     * updating or inserting a document.
+     * Gets a pointer to the UpdateStats inside 'exec'.
      *
-     * Callers of work() must be holding a write lock.
+     * The 'exec' must have an UPDATE stage as its root stage, and the plan must be EOF before
+     * calling this method.
      */
-    class UpdateStage : public PlanStage {
-        MONGO_DISALLOW_COPYING(UpdateStage);
-    public:
-        UpdateStage(OperationContext* txn,
-                    const UpdateStageParams& params,
-                    WorkingSet* ws,
-                    Collection* collection,
-                    PlanStage* child);
+    static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    /**
+     * Populate 'opDebug' with stats from 'updateStats' and 'summaryStats' describing the execution
+     * of this update.
+     */
+    static void fillOutOpDebug(const UpdateStats* updateStats,
+                               const PlanSummaryStats* summaryStats,
+                               OpDebug* opDebug);
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    /**
+     * Converts 'updateStats' into an UpdateResult.
+     */
+    static UpdateResult makeUpdateResult(const UpdateStats* updateStats);
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    /**
+     * Computes the document to insert if the upsert flag is set to true and no matching
+     * documents are found in the database. The document to upsert is computing using the
+     * query 'cq' and the update mods contained in 'driver'.
+     *
+     * If 'cq' is NULL, which can happen for the idhack update fast path, then 'query' is
+     * used to compute the doc to insert instead of 'cq'.
+     *
+     * 'doc' is the mutable BSON document which you would like the update driver to use
+     * when computing the document to insert.
+     *
+     * Set 'isInternalRequest' to true if the upsert was issued by the replication or
+     * sharding systems.
+     *
+     * Fills out whether or not this is a fastmodinsert in 'stats'.
+     *
+     * Returns the document to insert in *out.
+     */
+    static Status applyUpdateOpsForInsert(const CanonicalQuery* cq,
+                                          const BSONObj& query,
+                                          UpdateDriver* driver,
+                                          UpdateLifecycle* lifecycle,
+                                          mutablebson::Document* doc,
+                                          bool isInternalRequest,
+                                          UpdateStats* stats,
+                                          BSONObj* out);
 
-        virtual StageType stageType() const { return STAGE_UPDATE; }
+private:
+    /**
+     * Computes the result of applying mods to the document 'oldObj' at RecordId 'loc' in
+     * memory, then commits these changes to the database. Returns a possibly unowned copy
+     * of the newly-updated version of the document.
+     */
+    BSONObj transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc);
 
-        virtual PlanStageStats* getStats();
+    /**
+     * Computes the document to insert and inserts it into the collection. Used if the
+     * user requested an upsert and no matching documents were found.
+     */
+    void doInsert();
 
-        virtual const CommonStats* getCommonStats() const;
+    /**
+     * Have we performed all necessary updates? Even if this is true, we might not be EOF,
+     * as we might still have to do an insert.
+     */
+    bool doneUpdating();
 
-        virtual const SpecificStats* getSpecificStats() const;
+    /**
+     * Examines the stats / update request and returns whether there is still an insert left
+     * to do. If so then this stage is not EOF yet.
+     */
+    bool needInsert();
 
-        static const char* kStageType;
+    /**
+     * Helper for restoring the state of this update.
+     */
+    Status restoreUpdateState();
 
-        /**
-         * Converts the execution stats (stored by the update stage as an UpdateStats) for the
-         * update plan represented by 'exec' into the UpdateResult format used to report the results
-         * of writes.
-         *
-         * Also responsible for filling out 'opDebug' with execution info.
-         *
-         * Should only be called once this stage is EOF.
-         */
-        static UpdateResult makeUpdateResult(PlanExecutor* exec, OpDebug* opDebug);
+    UpdateStageParams _params;
 
-        /**
-         * Computes the document to insert if the upsert flag is set to true and no matching
-         * documents are found in the database. The document to upsert is computing using the
-         * query 'cq' and the update mods contained in 'driver'.
-         *
-         * If 'cq' is NULL, which can happen for the idhack update fast path, then 'query' is
-         * used to compute the doc to insert instead of 'cq'.
-         *
-         * 'doc' is the mutable BSON document which you would like the update driver to use
-         * when computing the document to insert.
-         *
-         * Set 'isInternalRequest' to true if the upsert was issued by the replication or
-         * sharding systems.
-         *
-         * Fills out whether or not this is a fastmodinsert in 'stats'.
-         *
-         * Returns the document to insert in *out.
-         */
-        static Status applyUpdateOpsForInsert(const CanonicalQuery* cq,
-                                              const BSONObj& query,
-                                              UpdateDriver* driver,
-                                              UpdateLifecycle* lifecycle,
-                                              mutablebson::Document* doc,
-                                              bool isInternalRequest,
-                                              UpdateStats* stats,
-                                              BSONObj* out);
+    // Not owned by us.
+    WorkingSet* _ws;
 
-    private:
-        /**
-         * Computes the result of applying mods to the document 'oldObj' at RecordId 'loc' in
-         * memory, then commits these changes to the database. Returns a possibly unowned copy
-         * of the newly-updated version of the document.
-         */
-        BSONObj transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc);
+    // Not owned by us. May be NULL.
+    Collection* _collection;
 
-        /**
-         * Computes the document to insert and inserts it into the collection. Used if the
-         * user requested an upsert and no matching documents were found.
-         */
-        void doInsert();
+    // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
+    WorkingSetID _idRetrying;
 
-        /**
-         * Have we performed all necessary updates? Even if this is true, we might not be EOF,
-         * as we might still have to do an insert.
-         */
-        bool doneUpdating();
+    // If not WorkingSet::INVALID_ID, we return this member to our caller.
+    WorkingSetID _idReturning;
 
-        /**
-         * Examines the stats / update request and returns whether there is still an insert left
-         * to do. If so then this stage is not EOF yet.
-         */
-        bool needInsert();
+    // Stats
+    UpdateStats _specificStats;
 
-        /**
-         * Helper for restoring the state of this update.
-         */
-        Status restoreUpdateState(OperationContext* opCtx);
+    // If the update was in-place, we may see it again.  This only matters if we're doing
+    // a multi-update; if we're not doing a multi-update we stop after one update and we
+    // won't see any more docs.
+    //
+    // For example: If we're scanning an index {x:1} and performing {$inc:{x:5}}, we'll keep
+    // moving the document forward and it will continue to reappear in our index scan.
+    // Unless the index is multikey, the underlying query machinery won't de-dup.
+    //
+    // If the update wasn't in-place we may see it again.  Our query may return the new
+    // document and we wouldn't want to update that.
+    //
+    // So, no matter what, we keep track of where the doc wound up.
+    typedef unordered_set<RecordId, RecordId::Hasher> DiskLocSet;
+    const std::unique_ptr<DiskLocSet> _updatedLocs;
 
-        // Transactional context.  Not owned by us.
-        OperationContext* _txn;
-
-        UpdateStageParams _params;
-
-        // Not owned by us.
-        WorkingSet* _ws;
-
-        // Not owned by us. May be NULL.
-        Collection* _collection;
-
-        // Owned by us.
-        boost::scoped_ptr<PlanStage> _child;
-
-        // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
-        WorkingSetID _idRetrying;
-
-        // If not WorkingSet::INVALID_ID, we return this member to our caller.
-        WorkingSetID _idReturning;
-
-        // Stats
-        CommonStats _commonStats;
-        UpdateStats _specificStats;
-
-        // If the update was in-place, we may see it again.  This only matters if we're doing
-        // a multi-update; if we're not doing a multi-update we stop after one update and we
-        // won't see any more docs.
-        //
-        // For example: If we're scanning an index {x:1} and performing {$inc:{x:5}}, we'll keep
-        // moving the document forward and it will continue to reappear in our index scan.
-        // Unless the index is multikey, the underlying query machinery won't de-dup.
-        //
-        // If the update wasn't in-place we may see it again.  Our query may return the new
-        // document and we wouldn't want to update that.
-        //
-        // So, no matter what, we keep track of where the doc wound up.
-        typedef unordered_set<RecordId, RecordId::Hasher> DiskLocSet;
-        const boost::scoped_ptr<DiskLocSet> _updatedLocs;
-
-        // These get reused for each update.
-        mutablebson::Document& _doc;
-        mutablebson::DamageVector _damages;
-    };
+    // These get reused for each update.
+    mutablebson::Document& _doc;
+    mutablebson::DamageVector _damages;
+};
 
 }  // namespace mongo

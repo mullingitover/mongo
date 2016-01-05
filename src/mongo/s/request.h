@@ -27,7 +27,6 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
 #include "mongo/db/dbmessage.h"
@@ -35,51 +34,60 @@
 
 namespace mongo {
 
-    class Client;
+class Client;
+class OperationContext;
 
-    class Request {
-        MONGO_DISALLOW_COPYING(Request);
-    public:
-        Request(Message& m, AbstractMessagingPort* p);
+class Request {
+    MONGO_DISALLOW_COPYING(Request);
 
-        const char* getns() const {
-            return _d.getns();
-        }
+public:
+    Request(Message& m, AbstractMessagingPort* p);
 
-        int op() const {
-            return _m.operation();
-        }
+    const char* getns() const {
+        return _d.getns();
+    }
 
-        bool expectResponse() const {
-            return op() == dbQuery || op() == dbGetMore;
-        }
+    const char* getnsIfPresent() const {
+        return _d.messageShouldHaveNs() ? _d.getns() : "";
+    }
 
-        bool isCommand() const;
+    int op() const {
+        return _m.operation();
+    }
 
-        MSGID id() const {
-            return _id;
-        }
+    bool expectResponse() const {
+        return op() == dbQuery || op() == dbGetMore;
+    }
 
-        void reply(Message & response, const std::string& fromServer);
+    bool isCommand() const;
 
-        Message& m() { return _m; }
-        DbMessage& d() { return _d; }
-        AbstractMessagingPort* p() const { return _p; }
+    MSGID id() const {
+        return _id;
+    }
 
-        void process( int attempt = 0 );
+    Message& m() {
+        return _m;
+    }
+    DbMessage& d() {
+        return _d;
+    }
+    AbstractMessagingPort* p() const {
+        return _p;
+    }
 
-        void init();
+    void process(OperationContext* txn, int attempt = 0);
 
-    private:
-        Client* const _clientInfo;
+    void init(OperationContext* txn);
 
-        Message& _m;
-        DbMessage _d;
-        AbstractMessagingPort* const _p;
+private:
+    Client* const _clientInfo;
 
-        MSGID _id;
+    Message& _m;
+    DbMessage _d;
+    AbstractMessagingPort* const _p;
 
-        bool _didInit;
-    };
+    MSGID _id;
 
+    bool _didInit;
+};
 }

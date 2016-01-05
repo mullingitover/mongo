@@ -36,62 +36,53 @@
 
 namespace mongo {
 
-    /**
-     * This stage outputs the union of its children.  It optionally deduplicates on RecordId.
-     *
-     * Preconditions: Valid RecordId.
-     *
-     * If we're deduping, we may fail to dedup any invalidated RecordId properly.
-     */
-    class OrStage : public PlanStage {
-    public:
-        OrStage(WorkingSet* ws, bool dedup, const MatchExpression* filter);
-        virtual ~OrStage();
+/**
+ * This stage outputs the union of its children.  It optionally deduplicates on RecordId.
+ *
+ * Preconditions: Valid RecordId.
+ *
+ * If we're deduping, we may fail to dedup any invalidated RecordId properly.
+ */
+class OrStage final : public PlanStage {
+public:
+    OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter);
 
-        void addChild(PlanStage* child);
+    void addChild(PlanStage* child);
 
-        virtual bool isEOF();
+    bool isEOF() final;
 
-        virtual StageState work(WorkingSetID* out);
+    StageState work(WorkingSetID* out) final;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    StageType stageType() const final {
+        return STAGE_OR;
+    }
 
-        virtual StageType stageType() const { return STAGE_OR; }
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual PlanStageStats* getStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual const CommonStats* getCommonStats() const;
+    static const char* kStageType;
 
-        virtual const SpecificStats* getSpecificStats() const;
+private:
+    // Not owned by us.
+    WorkingSet* _ws;
 
-        static const char* kStageType;
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-    private:
-        // Not owned by us.
-        WorkingSet* _ws;
+    // Which of _children are we calling work(...) on now?
+    size_t _currentChild;
 
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
+    // True if we dedup on RecordId, false otherwise.
+    bool _dedup;
 
-        // Owned by us.
-        std::vector<PlanStage*> _children;
+    // Which RecordIds have we returned?
+    unordered_set<RecordId, RecordId::Hasher> _seen;
 
-        // Which of _children are we calling work(...) on now?
-        size_t _currentChild;
-
-        // True if we dedup on RecordId, false otherwise.
-        bool _dedup;
-
-        // Which RecordIds have we returned?
-        unordered_set<RecordId, RecordId::Hasher> _seen;
-
-        // Stats
-        CommonStats _commonStats;
-        OrStats _specificStats;
-    };
+    // Stats
+    OrStats _specificStats;
+};
 
 }  // namespace mongo

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/index/index_access_method.h"
@@ -40,87 +39,79 @@
 
 namespace mongo {
 
-    class IndexAccessMethod;
-    class IndexDescriptor;
-    class WorkingSet;
+class IndexAccessMethod;
+class IndexDescriptor;
+class WorkingSet;
 
-    struct DistinctParams {
-        DistinctParams() : descriptor(NULL),
-                           direction(1),
-                           fieldNo(0) { }
+struct DistinctParams {
+    DistinctParams() : descriptor(NULL), direction(1), fieldNo(0) {}
 
-        // What index are we traversing?
-        const IndexDescriptor* descriptor;
+    // What index are we traversing?
+    const IndexDescriptor* descriptor;
 
-        // And in what direction?
-        int direction;
+    // And in what direction?
+    int direction;
 
-        // What are the bounds?
-        IndexBounds bounds;
+    // What are the bounds?
+    IndexBounds bounds;
 
-        // What field in the index's key pattern is the one we're distinct-ing over?
-        // For example:
-        // If we have an index {a:1, b:1} we could use it to distinct over either 'a' or 'b'.
-        // If we distinct over 'a' the position is 0.
-        // If we distinct over 'b' the position is 1.
-        int fieldNo;
-    };
+    // What field in the index's key pattern is the one we're distinct-ing over?
+    // For example:
+    // If we have an index {a:1, b:1} we could use it to distinct over either 'a' or 'b'.
+    // If we distinct over 'a' the position is 0.
+    // If we distinct over 'b' the position is 1.
+    int fieldNo;
+};
 
-    /**
-     * Used by the distinct command.  Executes a mutated index scan over the provided bounds.
-     * However, rather than looking at every key in the bounds, it skips to the next value of the
-     * _params.fieldNo-th indexed field.  This is because distinct only cares about distinct values
-     * for that field, so there is no point in examining all keys with the same value for that
-     * field.
-     *
-     * Only created through the getExecutorDistinct path.  See db/query/get_executor.cpp
-     */
-    class DistinctScan : public PlanStage {
-    public:
-        DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet);
-        virtual ~DistinctScan() { }
+/**
+ * Used by the distinct command.  Executes a mutated index scan over the provided bounds.
+ * However, rather than looking at every key in the bounds, it skips to the next value of the
+ * _params.fieldNo-th indexed field.  This is because distinct only cares about distinct values
+ * for that field, so there is no point in examining all keys with the same value for that
+ * field.
+ *
+ * Only created through the getExecutorDistinct path.  See db/query/get_executor.cpp
+ */
+class DistinctScan final : public PlanStage {
+public:
+    DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet);
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    StageState work(WorkingSetID* out) final;
+    bool isEOF() final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    StageType stageType() const final {
+        return STAGE_DISTINCT_SCAN;
+    }
 
-        virtual StageType stageType() const { return STAGE_DISTINCT_SCAN; }
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual PlanStageStats* getStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual const CommonStats* getCommonStats() const;
+    static const char* kStageType;
 
-        virtual const SpecificStats* getSpecificStats() const;
+private:
+    // The WorkingSet we annotate with results.  Not owned by us.
+    WorkingSet* _workingSet;
 
-        static const char* kStageType;
+    // Index access.
+    const IndexDescriptor* _descriptor;  // owned by Collection -> IndexCatalog
+    const IndexAccessMethod* _iam;       // owned by Collection -> IndexCatalog
 
-    private:
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
+    // The cursor we use to navigate the tree.
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
-        // The WorkingSet we annotate with results.  Not owned by us.
-        WorkingSet* _workingSet;
+    DistinctParams _params;
 
-        // Index access.
-        const IndexDescriptor* _descriptor; // owned by Collection -> IndexCatalog
-        const IndexAccessMethod* _iam; // owned by Collection -> IndexCatalog
+    // _checker gives us our start key and ensures we stay in bounds.
+    IndexBoundsChecker _checker;
+    IndexSeekPoint _seekPoint;
 
-        // The cursor we use to navigate the tree.
-        std::unique_ptr<SortedDataInterface::Cursor> _cursor;
-
-        DistinctParams _params;
-
-        // _checker gives us our start key and ensures we stay in bounds.
-        IndexBoundsChecker _checker;
-        IndexSeekPoint _seekPoint;
-
-        // Stats
-        CommonStats _commonStats;
-        DistinctScanStats _specificStats;
-    };
+    // Stats
+    DistinctScanStats _specificStats;
+};
 
 }  // namespace mongo

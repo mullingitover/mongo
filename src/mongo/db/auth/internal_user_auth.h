@@ -29,40 +29,27 @@
 #pragma once
 
 namespace mongo {
-    class BSONObj;
-    class DBClientWithCommands;
+class BSONObj;
 
-    /**
-     * @return true if internal authentication parameters has been set up
-     */
-    bool isInternalAuthSet();
+/**
+ * @return true if internal authentication parameters has been set up
+ */
+bool isInternalAuthSet();
 
-    /**
-     * This method initializes the authParams object with authentication
-     * credentials to be used by authenticateInternalUser.
-     */
-    void setInternalUserAuthParams(const BSONObj& authParamsIn);
+/**
+ * This method initializes the authParams object with authentication
+ * credentials to be used by authenticateInternalUser.
+ */
+void setInternalUserAuthParams(const BSONObj& authParamsIn);
 
-    /**
-     * Returns a copy of the authParams object to be used by authenticateInternalUser
-     *
-     * The format of the return object is { authparams, fallbackParams:params}
-     *
-     * If SCRAM-SHA-1 is the internal auth mechanism the fallbackParams sub document is
-     * for MONGODB-CR auth is included. For MONGODB-XC509 no fallbackParams document is
-     * returned.
-     **/
-    BSONObj getInternalUserAuthParamsWithFallback();
-
-    /**
-     * Returns a copy of the fallback parameter portion of an internal auth parameter object
-     **/
-    BSONObj getFallbackAuthParams(BSONObj params);
-
-    /**
-    * Authenticates to another cluster member using appropriate authentication data.
-    * Uses getInternalUserAuthParams() to retrive authentication parameters.
-    * @return true if the authentication was succesful
-    */
-    bool authenticateInternalUser(DBClientWithCommands* conn);
-} // namespace mongo
+/**
+ * Returns a copy of the authParams object to be used by authenticateInternalUser
+ *
+ * The format of the return object is { authparams, fallbackParams:params}
+ *
+ * If SCRAM-SHA-1 is the internal auth mechanism the fallbackParams sub document is
+ * for MONGODB-CR auth is included. For MONGODB-XC509 no fallbackParams document is
+ * returned.
+ **/
+BSONObj getInternalUserAuthParamsWithFallback();
+}  // namespace mongo

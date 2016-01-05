@@ -53,16 +53,35 @@ class MasterSlaveFixture(interface.ReplFixture):
         self.slave = None
 
     def setup(self):
-        self.master = self._new_mongod_master()
+        if self.master is None:
+            self.master = self._new_mongod_master()
         self.master.setup()
         self.port = self.master.port
 
-        self.slave = self._new_mongod_slave()
+        if self.slave is None:
+            self.slave = self._new_mongod_slave()
         self.slave.setup()
 
     def await_ready(self):
         self.master.await_ready()
         self.slave.await_ready()
+
+        # Do a replicated write to ensure that the slave has finished with its initial sync before
+        # starting to run any tests.
+        client = utils.new_mongo_client(self.port)
+
+        # Keep retrying this until it times out waiting for replication.
+        def insert_fn(remaining_secs):
+            remaining_millis = int(round(remaining_secs * 1000))
+            client.resmoke.await_ready.insert({"awaiting": "ready"},
+                                              w=2,
+                                              wtimeout=remaining_millis)
+
+        try:
+            self.retry_until_wtimeout(insert_fn)
+        except pymongo.errors.WTimeoutError:
+            self.logger.info("Replication of write operation timed out.")
+            raise
 
     def teardown(self):
         running_at_start = self.is_running()

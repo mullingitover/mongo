@@ -4,6 +4,7 @@ Sharded cluster fixture for executing JSTests against.
 
 from __future__ import absolute_import
 
+import copy
 import os.path
 import time
 
@@ -73,14 +74,18 @@ class ShardedClusterFixture(interface.Fixture):
 
     def setup(self):
         if self.separate_configsvr:
-            self.configsvr = self._new_configsvr()
+            if self.configsvr is None:
+                self.configsvr = self._new_configsvr()
             self.configsvr.setup()
 
+        if not self.shards:
+            for i in xrange(self.num_shards):
+                shard = self._new_shard(i)
+                self.shards.append(shard)
+
         # Start up each of the shards
-        for i in xrange(self.num_shards):
-            shard = self._new_shard(i)
+        for shard in self.shards:
             shard.setup()
-            self.shards.append(shard)
 
     def await_ready(self):
         # Wait for the config server
@@ -91,8 +96,10 @@ class ShardedClusterFixture(interface.Fixture):
         for shard in self.shards:
             shard.await_ready()
 
+        if self.mongos is None:
+            self.mongos = self._new_mongos()
+
         # Start up the mongos
-        self.mongos = self._new_mongos()
         self.mongos.setup()
 
         # Wait for the mongos
@@ -171,18 +178,20 @@ class ShardedClusterFixture(interface.Fixture):
         logger_name = "%s:configsvr" % (self.logger.name)
         mongod_logger = logging.loggers.new_logger(logger_name, parent=self.logger)
 
-        mongod_options = self.mongod_options.copy()
+        mongod_options = copy.deepcopy(self.mongod_options)
         mongod_options["configsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "config")
         mongod_options["replSet"] = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
+        mongod_options["storageEngine"] = "wiredTiger"
 
         return replicaset.ReplicaSetFixture(mongod_logger,
                                             self.job_num,
                                             mongod_executable=self.mongod_executable,
                                             mongod_options=mongod_options,
                                             preserve_dbpath=self.preserve_dbpath,
-                                            num_nodes=1,
-                                            auth_options=self.auth_options)
+                                            num_nodes=3,
+                                            auth_options=self.auth_options,
+                                            replset_config_options={"configsvr": True})
 
     def _new_shard(self, index):
         """
@@ -193,7 +202,7 @@ class ShardedClusterFixture(interface.Fixture):
         logger_name = "%s:shard%d" % (self.logger.name, index)
         mongod_logger = logging.loggers.new_logger(logger_name, parent=self.logger)
 
-        mongod_options = self.mongod_options.copy()
+        mongod_options = copy.deepcopy(self.mongod_options)
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard%d" % (index))
 
         return standalone.MongoDFixture(mongod_logger,
@@ -211,7 +220,7 @@ class ShardedClusterFixture(interface.Fixture):
         logger_name = "%s:mongos" % (self.logger.name)
         mongos_logger = logging.loggers.new_logger(logger_name, parent=self.logger)
 
-        mongos_options = self.mongos_options.copy()
+        mongos_options = copy.deepcopy(self.mongos_options)
         if self.separate_configsvr:
             configdb_replset = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
             configdb_port = self.configsvr.port
@@ -262,8 +271,7 @@ class _MongoSFixture(interface.Fixture):
             self.mongos_options["chunkSize"] = 50
 
         if "port" not in self.mongos_options:
-            with core.network.UnusedPort() as port:
-                self.mongos_options["port"] = port.num
+            self.mongos_options["port"] = core.network.PortAllocator.next_fixture_port(self.job_num)
         self.port = self.mongos_options["port"]
 
         mongos = core.programs.mongos_program(self.logger,
@@ -304,7 +312,7 @@ class _MongoSFixture(interface.Fixture):
                         % (self.port, standalone.MongoDFixture.AWAIT_READY_TIMEOUT_SECS))
 
                 self.logger.info("Waiting to connect to mongos on port %d.", self.port)
-                time.sleep(1)  # Wait a little bit before trying again.
+                time.sleep(0.1)  # Wait a little bit before trying again.
 
         self.logger.info("Successfully contacted the mongos on port %d.", self.port)
 

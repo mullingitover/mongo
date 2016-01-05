@@ -13,7 +13,9 @@ wait = function(f,msg) {
         if (++n == 4) {
             print("" + f);
         }
-        assert(n < 200, 'tried 200 times, giving up on ' + msg );
+        if (n >= 200) {
+            throw new Error('tried 200 times, giving up on ' + msg);
+        }
         sleep(1000);
     }
 };
@@ -102,7 +104,7 @@ waitForAllMembers = function(master, timeout) {
 
 reconfig = function(rs, config, force) {
     "use strict";
-    var admin = rs.getMaster().getDB("admin");
+    var admin = rs.getPrimary().getDB("admin");
     var e;
     var master;
     try {
@@ -114,7 +116,7 @@ reconfig = function(rs, config, force) {
         }
     }
 
-    var master = rs.getMaster().getDB("admin");
+    var master = rs.getPrimary().getDB("admin");
     waitForAllMembers(master);
 
     return master;

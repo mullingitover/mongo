@@ -36,384 +36,353 @@
 
 namespace {
 
-    using mongo::ErrorCodes;
-    using mongo::Status;
+using mongo::ErrorCodes;
+using mongo::Status;
 
-    namespace moe = mongo::optionenvironment;
+namespace moe = mongo::optionenvironment;
 
-    class OptionsParserTester : public moe::OptionsParser {
-    public:
-        Status readConfigFile(const std::string& filename, std::string* config) {
-            if (filename != _filename) {
-                ::mongo::StringBuilder sb;
-                sb << "Parser using filename: " << filename <<
-                      " which does not match expected filename: " << _filename;
-                return Status(ErrorCodes::InternalError, sb.str());
-            }
-            *config = _config;
-            return Status::OK();
+class OptionsParserTester : public moe::OptionsParser {
+public:
+    Status readConfigFile(const std::string& filename, std::string* config) {
+        if (filename != _filename) {
+            ::mongo::StringBuilder sb;
+            sb << "Parser using filename: " << filename
+               << " which does not match expected filename: " << _filename;
+            return Status(ErrorCodes::InternalError, sb.str());
         }
-        void setConfig(const std::string& filename, const std::string& config) {
-            _filename = filename;
-            _config = config;
-        }
-    private:
-        std::string _filename;
-        std::string _config;
-    };
-
-    TEST(Verbosity, Default) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
-
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
-
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
-
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        std::map<std::string, std::string> env_map;
-
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
-
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
-
-        // Make sure the log level didn't change since we didn't specify any verbose options
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Info());
+        *config = _config;
+        return Status::OK();
+    }
+    void setConfig(const std::string& filename, const std::string& config) {
+        _filename = filename;
+        _config = config;
     }
 
-    TEST(Verbosity, CommandLineImplicit) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+private:
+    std::string _filename;
+    std::string _config;
+};
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+TEST(Verbosity, Default) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--verbose");
-        std::map<std::string, std::string> env_map;
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    std::map<std::string, std::string> env_map;
 
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
-
-        int verbosity = 1;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-    TEST(Verbosity, CommandLineString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    // Make sure the log level didn't change since we didn't specify any verbose options
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Info());
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, CommandLineImplicit) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--verbose");
-        argv.push_back("vvvv");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--verbose");
+    std::map<std::string, std::string> env_map;
 
-        int verbosity = 4;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-    TEST(Verbosity, CommandLineEmptyString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    int verbosity = 1;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, CommandLineString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--verbose");
-        argv.push_back("");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--verbose=vvvv");
+    std::map<std::string, std::string> env_map;
 
-        int verbosity = 0;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-    TEST(Verbosity, CommandLineBadString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    int verbosity = 4;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, CommandLineBadString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--verbose");
-        argv.push_back("beloud");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
-    }
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--verbose=beloud");
+    std::map<std::string, std::string> env_map;
 
-    TEST(Verbosity, INIConfigString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, INIConfigString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.ini");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        parser.setConfig("config.ini", "verbose=vvvv");
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.ini");
+    std::map<std::string, std::string> env_map;
 
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+    parser.setConfig("config.ini", "verbose=vvvv");
 
-        int verbosity = 4;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-    TEST(Verbosity, INIConfigBadString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    int verbosity = 4;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, INIConfigBadString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.ini");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        parser.setConfig("config.ini", "verbose=beloud");
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.ini");
+    std::map<std::string, std::string> env_map;
 
-        ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
-    }
+    parser.setConfig("config.ini", "verbose=beloud");
 
-    TEST(Verbosity, INIConfigEmptyString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
+    ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
+}
 
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+TEST(Verbosity, INIConfigEmptyString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.ini");
-        std::map<std::string, std::string> env_map;
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
 
-        parser.setConfig("config.ini", "verbose=");
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.ini");
+    std::map<std::string, std::string> env_map;
 
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+    parser.setConfig("config.ini", "verbose=");
 
-        int verbosity = 0;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
 
-    TEST(Verbosity, JSONConfigString) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
 
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
-
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    int verbosity = 0;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
 
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.json");
-        std::map<std::string, std::string> env_map;
-
-        parser.setConfig("config.json", "{ \"systemLog.verbosity\" : 4 }");
-
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
-
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
-
-        int verbosity = 4;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
-
-    TEST(Verbosity, MultipleSourcesMultipleOptions) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
-
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
-
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
-
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.json");
-        argv.push_back("--verbose");
-        argv.push_back("vvv");
-        std::map<std::string, std::string> env_map;
-
-        parser.setConfig("config.json", "{ \"systemLog.verbosity\" : 4 }");
-
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
-
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
-
-        int verbosity = 3;
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-    }
-
-    TEST(Verbosity, YAMLConfigStringLogComponent) {
-        OptionsParserTester parser;
-        moe::Environment environment;
-        moe::OptionSection options;
-
-        // Reset the log level before we test
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogSeverity::Info());
-        // Log level for Storage will be cleared by config file value.
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-                ::mongo::logger::LogComponent::kStorage,
-                ::mongo::logger::LogSeverity::Debug(1));
-
-        ASSERT_OK(::mongo::addGeneralServerOptions(&options));
-
-        std::vector<std::string> argv;
-        argv.push_back("binaryname");
-        argv.push_back("--config");
-        argv.push_back("config.yaml");
-        std::map<std::string, std::string> env_map;
-
-        parser.setConfig("config.yaml",
-                         "systemLog:\n"
-                         "    verbosity: 4\n"
-                         "    component:\n"
-                         "        accessControl:\n"
-                         "            verbosity: 0\n"
-                         "        storage:\n"
-                         "            verbosity: -1\n"
-                         "            journal:\n"
-                         "                verbosity: 2\n");
-
-        ASSERT_OK(parser.run(options, argv, env_map, &environment));
-
-        ASSERT_OK(::mongo::validateServerOptions(environment));
-        ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
-        ASSERT_OK(::mongo::storeServerOptions(environment, argv));
-
-        // Verify component log levels using global log domain.
-        int verbosity = 4;
-
-        // Default
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kDefault),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-
-        // AccessControl
-        ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kAccessControl));
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kAccessControl),
-                      ::mongo::logger::LogSeverity::Log());
-
-        // Query - not mentioned in configuration. should match default.
-        ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kStorage));
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kStorage),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-
-        // Storage - cleared by -1 value in configuration. should match default.
-        ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kStorage));
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kStorage),
-                      ::mongo::logger::LogSeverity::Debug(verbosity));
-
-        // Journaling - explicitly set to 2 in configuration.
-        ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kJournal));
-        ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                          ::mongo::logger::LogComponent::kJournal),
-                      ::mongo::logger::LogSeverity::Debug(2));
-    }
-
-} // unnamed namespace
+TEST(Verbosity, JSONConfigString) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.json");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.json", "{ \"systemLog.verbosity\" : 4 }");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+
+    int verbosity = 4;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
+
+TEST(Verbosity, MultipleSourcesMultipleOptions) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.json");
+    argv.push_back("--verbose=vvv");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.json", "{ \"systemLog.verbosity\" : 4 }");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+
+    int verbosity = 3;
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+}
+
+TEST(Verbosity, YAMLConfigStringLogComponent) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    // Reset the log level before we test
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogSeverity::Info());
+    // Log level for Storage will be cleared by config file value.
+    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
+        ::mongo::logger::LogComponent::kStorage, ::mongo::logger::LogSeverity::Debug(1));
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.yaml");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.yaml",
+                     "systemLog:\n"
+                     "    verbosity: 4\n"
+                     "    component:\n"
+                     "        accessControl:\n"
+                     "            verbosity: 0\n"
+                     "        storage:\n"
+                     "            verbosity: -1\n"
+                     "            journal:\n"
+                     "                verbosity: 2\n");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::storeServerOptions(environment, argv));
+
+    // Verify component log levels using global log domain.
+    int verbosity = 4;
+
+    // Default
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
+                      ::mongo::logger::LogComponent::kDefault),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+
+    // AccessControl
+    ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
+        ::mongo::logger::LogComponent::kAccessControl));
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
+                      ::mongo::logger::LogComponent::kAccessControl),
+                  ::mongo::logger::LogSeverity::Log());
+
+    // Query - not mentioned in configuration. should match default.
+    ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
+        ::mongo::logger::LogComponent::kStorage));
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
+                      ::mongo::logger::LogComponent::kStorage),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+
+    // Storage - cleared by -1 value in configuration. should match default.
+    ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
+        ::mongo::logger::LogComponent::kStorage));
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
+                      ::mongo::logger::LogComponent::kStorage),
+                  ::mongo::logger::LogSeverity::Debug(verbosity));
+
+    // Journaling - explicitly set to 2 in configuration.
+    ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
+        ::mongo::logger::LogComponent::kJournal));
+    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
+                      ::mongo::logger::LogComponent::kJournal),
+                  ::mongo::logger::LogSeverity::Debug(2));
+}
+
+}  // unnamed namespace

@@ -28,140 +28,75 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
+#include <string>
 
+#include "mongo/base/disallow_copying.h"
 #include "mongo/client/connection_string.h"
 
 namespace mongo {
 
-    class BSONObj;
+class BSONObj;
+class RemoteCommandTargeter;
+
+using ShardId = std::string;
+
+class Shard;
+using ShardPtr = std::shared_ptr<Shard>;
+
+/*
+ * Maintains the targeting and command execution logic for a single shard. Performs polling of
+ * the shard (if replica set).
+ */
+class Shard {
+    MONGO_DISALLOW_COPYING(Shard);
+
+public:
+    /**
+     * Instantiates a new shard connection management object for the specified shard.
+     */
+    Shard(const ShardId& id,
+          const ConnectionString& connStr,
+          std::unique_ptr<RemoteCommandTargeter> targeter);
+
+    ~Shard();
+
+    const ShardId getId() const {
+        return _id;
+    }
 
     /**
-     * Contains runtime information obtained from the shard.
+     * Returns true if this shard object represents the config server.
      */
-    class ShardStatus {
-    public:
-        ShardStatus(long long dataSizeBytes, const std::string& version);
+    bool isConfig() const;
 
-        long long dataSizeBytes() const { return _dataSizeBytes; }
-        const std::string& mongoVersion() const { return _mongoVersion; }
+    const ConnectionString getConnString() const {
+        return _cs;
+    }
 
-        std::string toString() const;
+    std::shared_ptr<RemoteCommandTargeter> getTargeter() const {
+        return _targeter;
+    }
 
-        bool operator< (const ShardStatus& other) const;
-
-    private:
-        long long _dataSizeBytes;
-        std::string _mongoVersion;
-    };
-
-
-    /*
-     * A "shard" one partition of the overall database (and a replica set typically).
+    /**
+     * Returns a string description of this shard entry.
      */
-    class Shard {
-    public:
-        Shard();
+    std::string toString() const;
 
-        Shard(const std::string& name,
-              const ConnectionString& connStr,
-              long long maxSizeMB,
-              bool isDraining);
+private:
+    /**
+     * Identifier of the shard as obtained from the configuration data (i.e. shard0000).
+     */
+    const ShardId _id;
 
-        /**
-         * Returns a Shard corresponding to 'ident', which can
-         * either be a shard name or a connection string.
-         * Assumes that a corresponding shard with name 'ident' already exists.
-         */
-        static Shard make( const std::string& ident ) {
-            Shard s;
-            s.reset( ident );
-            return s;
-        }
+    /**
+     * Connection string for the shard.
+     */
+    const ConnectionString _cs;
 
-        /**
-         * @param ident either name or address
-         */
-        void reset( const std::string& ident );
+    /**
+     * Targeter for obtaining hosts from which to read or to which to write.
+     */
+    const std::shared_ptr<RemoteCommandTargeter> _targeter;
+};
 
-        const std::string& getName() const { return _name; }
-        const ConnectionString& getConnString() const { return _cs; }
-
-        long long getMaxSizeMB() const {
-            return _maxSizeMB;
-        }
-
-        bool isDraining() const {
-            return _isDraining;
-        }
-
-        std::string toString() const {
-            return _name + ":" + _cs.toString();
-        }
-
-        friend std::ostream& operator << (std::ostream& out, const Shard& s) {
-            return (out << s.toString());
-        }
-
-        bool operator==( const Shard& s ) const {
-            if ( _name != s._name )
-                return false;
-            return _cs.sameLogicalEndpoint( s._cs );
-        }
-
-        bool operator!=( const Shard& s ) const {
-            return ! ( *this == s );
-        }
-
-        bool operator<(const Shard& o) const {
-            return _name < o._name;
-        }
-
-        bool ok() const { return _cs.isValid(); }
-
-        BSONObj runCommand(const std::string& db, const std::string& simple) const;
-        BSONObj runCommand(const std::string& db, const BSONObj& cmd) const;
-
-        bool runCommand(const std::string& db, const std::string& simple, BSONObj& res) const;
-        bool runCommand(const std::string& db, const BSONObj& cmd, BSONObj& res) const;
-
-        /**
-         * Returns metadata and stats for this shard.
-         */
-        ShardStatus getStatus() const;
-
-        /**
-         * mostly for replica set
-         * retursn true if node is the shard
-         * of if the replica set contains node
-         */
-        bool containsNode( const std::string& node ) const;
-
-        static Shard lookupRSName( const std::string& name);
-        
-        /**
-         * @parm current - shard where the chunk/database currently lives in
-         * @return the currently emptiest shard, if best then current, or EMPTY
-         */
-        static Shard pick();
-
-        static void reloadShardInfo();
-
-        static void removeShard( const std::string& name );
-
-        static bool isAShardNode( const std::string& ident );
-
-        static Shard EMPTY;
-        
-        static void installShard(const std::string& name, const Shard& shard);
-
-    private:
-        std::string    _name;
-        ConnectionString _cs;
-        long long _maxSizeMB;    // in MBytes, 0 is unlimited
-        bool      _isDraining; // shard is currently being removed
-    };
-
-    typedef boost::shared_ptr<Shard> ShardPtr;
-
-} // namespace mongo
+}  // namespace mongo

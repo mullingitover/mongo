@@ -36,132 +36,123 @@
 
 namespace mongo {
 
-    template <typename T> class StatusWith;
+template <typename T>
+class StatusWith;
+
+/**
+ * Represents the user-supplied options to the findAndModify command. Note that this
+ * does not offer round trip preservation. For example, for the case where
+ * output = parseBSON(input).toBSON(), 'output' is not guaranteed to be equal to 'input'.
+ * However, the semantic meaning of 'output' will be the same with 'input'.
+ *
+ * The BSONObj members contained within this struct are owned objects.
+ */
+class FindAndModifyRequest {
+public:
+    /**
+     * Creates a new instance of an 'update' type findAndModify request.
+     */
+    static FindAndModifyRequest makeUpdate(NamespaceString fullNs,
+                                           BSONObj query,
+                                           BSONObj updateObj);
 
     /**
-     * Represents the user-supplied options to the findAndModify command. Note that this
-     * does not offer round trip preservation. For example, for the case where
-     * output = parseBSON(input).toBSON(), 'output' is not guaranteed to be equal to 'input'.
-     * However, the semantic meaning of 'output' will be the same with 'input'.
-     *
-     * The BSONObj members contained within this struct are owned objects.
+     * Creates a new instance of an 'remove' type findAndModify request.
      */
-    class FindAndModifyRequest {
-    public:
+    static FindAndModifyRequest makeRemove(NamespaceString fullNs, BSONObj query);
 
-        /**
-         * Do not use! This constructor is available only because StatusWith requires the
-         * type to have one.
-         */
-        FindAndModifyRequest(); // TODO: SERVER-18007
+    /**
+     * Create a new instance of FindAndModifyRequest from a valid BSONObj.
+     * Returns an error if the BSONObj is malformed.
+     * Format:
+     *
+     * {
+     *   findAndModify: <collection-name>,
+     *   query: <document>,
+     *   sort: <document>,
+     *   remove: <boolean>,
+     *   update: <document>,
+     *   new: <boolean>,
+     *   fields: <document>,
+     *   upsert: <boolean>
+     * }
+     *
+     * Note: does not parse the writeConcern field or the findAndModify field.
+     */
+    static StatusWith<FindAndModifyRequest> parseFromBSON(NamespaceString fullNs,
+                                                          const BSONObj& cmdObj);
 
-        /**
-         * Creates a new instance of an 'update' type findAndModify request.
-         */
-        static FindAndModifyRequest makeUpdate(NamespaceString fullNs,
-                                               BSONObj query,
-                                               BSONObj updateObj);
+    /**
+     * Serializes this object into a BSON representation. Fields that are not
+     * set will not be part of the the serialized object.
+     */
+    BSONObj toBSON() const;
 
-        /**
-         * Creates a new instance of an 'remove' type findAndModify request.
-         */
-        static FindAndModifyRequest makeRemove(NamespaceString fullNs,
-                                               BSONObj query);
+    const NamespaceString& getNamespaceString() const;
+    BSONObj getQuery() const;
+    BSONObj getFields() const;
+    BSONObj getUpdateObj() const;
+    BSONObj getSort() const;
+    bool shouldReturnNew() const;
+    bool isUpsert() const;
+    bool isRemove() const;
 
-        /**
-         * Create a new instance of FindAndModifyRequest from a valid BSONObj.
-         * Returns an error if the BSONObj is malformed.
-         * Format:
-         *
-         * {
-         *   findAndModify: <collection-name>,
-         *   query: <document>,
-         *   sort: <document>,
-         *   remove: <boolean>,
-         *   update: <document>,
-         *   new: <boolean>,
-         *   fields: <document>,
-         *   upsert: <boolean>
-         * }
-         *
-         * Note: does not parse the writeConcern field or the findAndModify field.
-         */
-        static StatusWith<FindAndModifyRequest> parseFromBSON(NamespaceString fullNs,
-                                                              const BSONObj& cmdObj);
+    // Not implemented. Use extractWriteConcern() to get the setting instead.
+    WriteConcernOptions getWriteConcern() const;
 
-        /**
-         * Serializes this object into a BSON representation. Fields that are not
-         * set will not be part of the the serialized object.
-         */
-        BSONObj toBSON() const;
+    //
+    // Setters for update type request only.
+    //
 
-        const NamespaceString& getNamespaceString() const;
-        BSONObj getQuery() const;
-        BSONObj getFields() const;
-        BSONObj getUpdateObj() const;
-        BSONObj getSort() const;
-        bool shouldReturnNew() const;
-        bool isUpsert() const;
-        bool isRemove() const;
+    /**
+     * If shouldReturnNew is new, the findAndModify response should return the document
+     * after the modification was applied if the query matched a document. Otherwise,
+     * it will return the matched document before the modification.
+     */
+    void setShouldReturnNew(bool shouldReturnNew);
 
-        // Not implemented. Use extractWriteConcern() to get the setting instead.
-        WriteConcernOptions getWriteConcern() const;
+    void setUpsert(bool upsert);
 
-        //
-        // Setters for update type request only.
-        //
+    //
+    // Setters for optional parameters
+    //
 
-        /**
-         * If shouldReturnNew is new, the findAndModify response should return the document
-         * after the modification was applied if the query matched a document. Otherwise,
-         * it will return the matched document before the modification.
-         */
-        void setShouldReturnNew(bool shouldReturnNew);
+    /**
+     * Specifies the field to project on the matched document.
+     */
+    void setFieldProjection(BSONObj fields);
 
-        void setUpsert(bool upsert);
+    /**
+     * Sets the sort order for the query. In cases where the query yields multiple matches,
+     * only the first document based on the sort order will be modified/removed.
+     */
+    void setSort(BSONObj sort);
 
-        //
-        // Setters for optional parameters
-        //
+    /**
+     * Sets the write concern for this request.
+     */
+    void setWriteConcern(WriteConcernOptions writeConcern);
 
-        /**
-         * Specifies the field to project on the matched document.
-         */
-        void setFieldProjection(BSONObj fields);
+private:
+    /**
+     * Creates a new FindAndModifyRequest with the required fields.
+     */
+    FindAndModifyRequest(NamespaceString fullNs, BSONObj query, BSONObj updateObj);
 
-        /**
-         * Sets the sort order for the query. In cases where the query yields multiple matches,
-         * only the first document based on the sort order will be modified/removed.
-         */
-        void setSort(BSONObj sort);
+    // Required fields
+    const NamespaceString _ns;
+    const BSONObj _query;
 
-        /**
-         * Sets the write concern for this request.
-         */
-        void setWriteConcern(WriteConcernOptions writeConcern);
+    // Required for updates
+    const BSONObj _updateObj;
 
-    private:
-        /**
-         * Creates a new FindAndModifyRequest with the required fields.
-         */
-        FindAndModifyRequest(NamespaceString fullNs,
-                             BSONObj query,
-                             BSONObj updateObj);
+    boost::optional<bool> _isUpsert;
+    boost::optional<BSONObj> _fieldProjection;
+    boost::optional<BSONObj> _sort;
+    boost::optional<bool> _shouldReturnNew;
+    boost::optional<WriteConcernOptions> _writeConcern;
 
-        // Required fields
-        const NamespaceString _ns;
-        const BSONObj _query;
-
-        // Required for updates
-        const BSONObj _updateObj;
-
-        boost::optional<bool> _isUpsert;
-        boost::optional<BSONObj> _fieldProjection;
-        boost::optional<BSONObj> _sort;
-        boost::optional<bool> _shouldReturnNew;
-        boost::optional<WriteConcernOptions> _writeConcern;
-
-        // Flag used internally to differentiate whether this is an update or remove type request.
-        bool _isRemove;
-    };
+    // Flag used internally to differentiate whether this is an update or remove type request.
+    bool _isRemove;
+};
 }

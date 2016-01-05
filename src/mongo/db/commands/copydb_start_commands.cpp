@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/commands/copydb_start_commands.h"
+
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/dbclientinterface.h"
@@ -37,6 +39,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
@@ -45,169 +48,172 @@
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
+using std::string;
+using std::stringstream;
 
-    // SERVER-4328 todo review for concurrency
-    // :(
-    thread_specific_ptr<DBClientBase> authConn_;
+namespace {
+const auto authConnection = Client::declareDecoration<std::unique_ptr<DBClientBase>>();
+}  // namespace
 
-    /* Usage:
-     * admindb.$cmd.findOne( { copydbgetnonce: 1, fromhost: <connection string> } );
-     *
-     * Run against the mongod that is the intended target for the "copydb" command.  Used to get a
-     * nonce from the source of a "copydb" operation for authentication purposes.  See the
-     * description of the "copydb" command below.
-     */
-    class CmdCopyDbGetNonce : public Command {
-    public:
-        CmdCopyDbGetNonce() : Command("copydbgetnonce") { }
+std::unique_ptr<DBClientBase>& CopyDbAuthConnection::forClient(Client* client) {
+    return authConnection(client);
+}
 
-        virtual bool adminOnly() const {
-            return true;
+/* Usage:
+ * admindb.$cmd.findOne( { copydbgetnonce: 1, fromhost: <connection string> } );
+ *
+ * Run against the mongod that is the intended target for the "copydb" command.  Used to get a
+ * nonce from the source of a "copydb" operation for authentication purposes.  See the
+ * description of the "copydb" command below.
+ */
+class CmdCopyDbGetNonce : public Command {
+public:
+    CmdCopyDbGetNonce() : Command("copydbgetnonce") {}
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+    virtual bool isWriteCommandForConfigServer() const {
+        return false;
+    }
+
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        // No auth required
+    }
+
+    virtual void help(stringstream& help) const {
+        help << "get a nonce for subsequent copy db request from secure server\n";
+        help << "usage: {copydbgetnonce: 1, fromhost: <hostname>}";
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const string&,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        string fromhost = cmdObj.getStringField("fromhost");
+        if (fromhost.empty()) {
+            /* copy from self */
+            stringstream ss;
+            ss << "localhost:" << serverGlobalParams.port;
+            fromhost = ss.str();
         }
 
-        virtual bool slaveOk() const {
+        const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
+
+        auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
+        authConn.reset(cs.connect(errmsg));
+        if (!authConn) {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        BSONObj ret;
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            // No auth required
-        }
-
-        virtual void help( stringstream &help ) const {
-            help << "get a nonce for subsequent copy db request from secure server\n";
-            help << "usage: {copydbgetnonce: 1, fromhost: <hostname>}";
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const string&,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result) {
-
-            string fromhost = cmdObj.getStringField("fromhost");
-            if ( fromhost.empty() ) {
-                /* copy from self */
-                stringstream ss;
-                ss << "localhost:" << serverGlobalParams.port;
-                fromhost = ss.str();
-            }
-
-            const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
-
-            authConn_.reset(cs.connect(errmsg));
-            if (!authConn_.get()) {
-                return false;
-            }
-
-            BSONObj ret;
-
-            if( !authConn_->runCommand( "admin", BSON( "getnonce" << 1 ), ret ) ) {
-                errmsg = "couldn't get nonce " + ret.toString();
-                return false;
-            }
-
-            result.appendElements( ret );
-            return true;
-        }
-
-    } cmdCopyDBGetNonce;
-
-    /* Usage:
-     * admindb.$cmd.findOne( { copydbsaslstart: 1,
-     *                         fromhost: <connection string>,
-     *                         mechanism: <String>,
-     *                         payload: <BinaryOrString> } );
-     *
-     * Run against the mongod that is the intended target for the "copydb" command.  Used to
-     * initialize a SASL auth session for a "copydb" operation for authentication purposes.
-     */
-    class CmdCopyDbSaslStart : public Command {
-    public:
-        CmdCopyDbSaslStart() : Command("copydbsaslstart") { }
-
-        virtual bool adminOnly() const {
-            return true;
-        }
-
-        virtual bool slaveOk() const {
+        if (!authConn->runCommand("admin", BSON("getnonce" << 1), ret)) {
+            errmsg = "couldn't get nonce " + ret.toString();
+            authConn.reset();
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        result.appendElements(ret);
+        return true;
+    }
 
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-            // No auth required
-            return Status::OK();
+} cmdCopyDBGetNonce;
+
+/* Usage:
+ * admindb.$cmd.findOne( { copydbsaslstart: 1,
+ *                         fromhost: <connection string>,
+ *                         mechanism: <String>,
+ *                         payload: <BinaryOrString> } );
+ *
+ * Run against the mongod that is the intended target for the "copydb" command.  Used to
+ * initialize a SASL auth session for a "copydb" operation for authentication purposes.
+ */
+class CmdCopyDbSaslStart : public Command {
+public:
+    CmdCopyDbSaslStart() : Command("copydbsaslstart") {}
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+    virtual bool isWriteCommandForConfigServer() const {
+        return false;
+    }
+
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        // No auth required
+        return Status::OK();
+    }
+
+    virtual void help(stringstream& help) const {
+        help << "Initialize a SASL auth session for subsequent copy db request "
+                "from secure server\n";
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const string&,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        const string fromDb = cmdObj.getStringField("fromdb");
+
+        string fromHost = cmdObj.getStringField("fromhost");
+        if (fromHost.empty()) {
+            /* copy from self */
+            stringstream ss;
+            ss << "localhost:" << serverGlobalParams.port;
+            fromHost = ss.str();
         }
 
-        virtual void help( stringstream &help ) const {
-            help << "Initialize a SASL auth session for subsequent copy db request "
-                    "from secure server\n";
+        const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromHost)));
+
+        BSONElement mechanismElement;
+        Status status = bsonExtractField(cmdObj, saslCommandMechanismFieldName, &mechanismElement);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
         }
 
-        virtual bool run(OperationContext* txn,
-                         const string&,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result) {
-
-            const string fromDb = cmdObj.getStringField("fromdb");
-
-            string fromHost = cmdObj.getStringField("fromhost");
-            if ( fromHost.empty() ) {
-                /* copy from self */
-                stringstream ss;
-                ss << "localhost:" << serverGlobalParams.port;
-                fromHost = ss.str();
-            }
-
-            const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromHost)));
-
-            BSONElement mechanismElement;
-            Status status = bsonExtractField(cmdObj,
-                                             saslCommandMechanismFieldName,
-                                             &mechanismElement);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            BSONElement payloadElement;
-            status = bsonExtractField(cmdObj, saslCommandPayloadFieldName, &payloadElement);
-            if (!status.isOK()) {
-                log() << "Failed to extract payload: " << status;
-                return false;
-            }
-
-            authConn_.reset(cs.connect(errmsg));
-            if (!authConn_.get()) {
-                return false;
-            }
-
-            BSONObj ret;
-            if( !authConn_->runCommand( fromDb,
-                                        BSON( "saslStart" << 1 <<
-                                              mechanismElement <<
-                                              payloadElement),
-                                        ret ) ) {
-                return appendCommandStatus(result,
-                                           Command::getStatusFromCommandResult(ret));
-
-            }
-
-            result.appendElements( ret );
-            return true;
+        BSONElement payloadElement;
+        status = bsonExtractField(cmdObj, saslCommandPayloadFieldName, &payloadElement);
+        if (!status.isOK()) {
+            log() << "Failed to extract payload: " << status;
+            return false;
         }
 
-    } cmdCopyDBSaslStart;
+        auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
+        authConn.reset(cs.connect(errmsg));
+        if (!authConn.get()) {
+            return false;
+        }
 
-} // namespace mongo
+        BSONObj ret;
+        if (!authConn->runCommand(
+                fromDb, BSON("saslStart" << 1 << mechanismElement << payloadElement), ret)) {
+            authConn.reset();
+            return appendCommandStatus(result, Command::getStatusFromCommandResult(ret));
+        }
+
+        result.appendElements(ret);
+        return true;
+    }
+
+} cmdCopyDBSaslStart;
+
+}  // namespace mongo

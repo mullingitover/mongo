@@ -34,50 +34,48 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
 
-    namespace {
+namespace {
 
-        class MMAPV1Factory : public StorageEngine::Factory {
-        public:
-            virtual ~MMAPV1Factory() { }
-            virtual StorageEngine* create(const StorageGlobalParams& params,
-                                          const StorageEngineLockFile& lockFile) const {
-                return new MMAPV1Engine(lockFile);
-            }
+class MMAPV1Factory : public StorageEngine::Factory {
+public:
+    virtual ~MMAPV1Factory() {}
+    virtual StorageEngine* create(const StorageGlobalParams& params,
+                                  const StorageEngineLockFile& lockFile) const {
+        return new MMAPV1Engine(lockFile);
+    }
 
-            virtual StringData getCanonicalName() const {
-                return "mmapv1";
-            }
+    virtual StringData getCanonicalName() const {
+        return "mmapv1";
+    }
 
-            virtual Status validateMetadata(const StorageEngineMetadata& metadata,
-                                            const StorageGlobalParams& params) const {
-                Status status = metadata.validateStorageEngineOption(
-                    "directoryPerDB", params.directoryperdb);
-                if (!status.isOK()) {
-                    return status;
-                }
+    virtual Status validateMetadata(const StorageEngineMetadata& metadata,
+                                    const StorageGlobalParams& params) const {
+        Status status =
+            metadata.validateStorageEngineOption("directoryPerDB", params.directoryperdb);
+        if (!status.isOK()) {
+            return status;
+        }
 
-                return Status::OK();
-            }
-
-            virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
-                BSONObjBuilder builder;
-                builder.appendBool("directoryPerDB", params.directoryperdb);
-                return builder.obj();
-            }
-        };
-
-    } // namespace
-
-    MONGO_INITIALIZER_WITH_PREREQUISITES(MMAPV1EngineInit,
-                                         ("SetGlobalEnvironment"))
-                                         (InitializerContext* context) {
-
-        getGlobalServiceContext()->registerStorageEngine("mmapv1", new MMAPV1Factory());
         return Status::OK();
     }
+
+    virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+        BSONObjBuilder builder;
+        builder.appendBool("directoryPerDB", params.directoryperdb);
+        return builder.obj();
+    }
+};
+
+}  // namespace
+
+MONGO_INITIALIZER_WITH_PREREQUISITES(MMAPV1EngineInit, ("SetGlobalEnvironment"))
+(InitializerContext* context) {
+    getGlobalServiceContext()->registerStorageEngine("mmapv1", new MMAPV1Factory());
+    return Status::OK();
+}
 
 }  // namespace mongo

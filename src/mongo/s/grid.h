@@ -28,76 +28,115 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
 #include <string>
 #include <vector>
 
+#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class CatalogCache;
-    class CatalogManager;
-    class DBConfig;
-    class SettingsType;
-    class ShardRegistry;
-    template<typename T> class StatusWith;
+class BSONObj;
+class CatalogCache;
+class DBConfig;
+class OperationContext;
+class SettingsType;
+class ShardRegistry;
+template <typename T>
+class StatusWith;
 
+
+/**
+ * Holds the global sharding context. Single instance exists for a running server. Exists on
+ * both MongoD and MongoS.
+ */
+class Grid {
+public:
+    Grid();
 
     /**
-     * Holds the global sharding context. Single instance exists for a running server. Exists on
-     * both MongoD and MongoS.
+     * Called at startup time so the global sharding services can be set. This method must be called
+     * once and once only for the lifetime of the service.
+     *
+     * NOTE: Unit-tests are allowed to call it more than once, provided they reset the object's
+     *       state using clearForUnitTests.
      */
-    class Grid {
-    public:
-        Grid();
+    void init(std::unique_ptr<ForwardingCatalogManager> catalogManager,
+              std::unique_ptr<ShardRegistry> shardRegistry,
+              std::unique_ptr<ClusterCursorManager> cursorManager);
 
-        /**
-         * Called at startup time so the catalog manager can be set. Should be called only once
-         * for the lifetime of the grid object. Takes ownership of the passed in pointer.
-         */
-        void setCatalogManager(std::unique_ptr<CatalogManager> catalogManager);
+    /**
+     * Implicitly creates the specified database as non-sharded.
+     */
+    StatusWith<std::shared_ptr<DBConfig>> implicitCreateDb(OperationContext* txn,
+                                                           const std::string& dbName);
 
-        /**
-         * Implicitly creates the specified database as non-sharded.
-         */
-        StatusWith<boost::shared_ptr<DBConfig>> implicitCreateDb(const std::string& dbName);
+    /**
+     * @return true if shards and config servers are allowed to use 'localhost' in address
+     */
+    bool allowLocalHost() const;
 
-        /**
-         * @return true if shards and config servers are allowed to use 'localhost' in address
-         */
-        bool allowLocalHost() const;
+    /**
+     * @param whether to allow shards and config servers to use 'localhost' in address
+     */
+    void setAllowLocalHost(bool allow);
 
-        /**
-         * @param whether to allow shards and config servers to use 'localhost' in address
-         */
-        void setAllowLocalHost( bool allow );
+    /**
+     * Returns true if the balancer should be running. Caller is responsible
+     * for making sure settings has the balancer key.
+     */
+    bool shouldBalance(const SettingsType& balancerSettings) const;
 
-        /**
-         * Returns true if the balancer should be running. Caller is responsible
-         * for making sure settings has the balancer key.
-         */
-        bool shouldBalance(const SettingsType& balancerSettings) const;
+    /**
+     * Returns true if the config server settings indicate that the balancer should be active.
+     */
+    bool getConfigShouldBalance(OperationContext* txn) const;
 
-        /**
-         * Returns true if the config server settings indicate that the balancer should be active.
-         */
-        bool getConfigShouldBalance() const;
+    /**
+     * Returns a pointer to a CatalogManager to use for accessing catalog data stored on the config
+     * servers.
+     */
+    CatalogManager* catalogManager(OperationContext* txn);
 
-        CatalogManager* catalogManager() const { return _catalogManager.get(); }
-        CatalogCache* catalogCache() const { return _catalogCache.get(); }
-        ShardRegistry* shardRegistry() const { return _shardRegistry.get(); }
+    /**
+     * Returns a direct pointer to the ForwardingCatalogManager.  This should only be used for
+     * calling methods that are specific to the ForwardingCatalogManager and not part of the generic
+     * CatalogManager interface, such as for taking the distributed lock and scheduling replacement
+     * of the underlying CatalogManager that the ForwardingCatalogManager is delegating to.
+     */
+    ForwardingCatalogManager* forwardingCatalogManager();
 
-    private:
-        std::unique_ptr<CatalogManager> _catalogManager;
-        std::unique_ptr<CatalogCache> _catalogCache;
-        std::unique_ptr<ShardRegistry> _shardRegistry;
+    CatalogCache* catalogCache() {
+        return _catalogCache.get();
+    }
+    ShardRegistry* shardRegistry() {
+        return _shardRegistry.get();
+    }
 
-        // can 'localhost' be used in shard addresses?
-        bool _allowLocalShard;
-    };
+    ClusterCursorManager* getCursorManager() {
+        return _cursorManager.get();
+    }
 
-    extern Grid grid;
+    /**
+     * Clears the grid object so that it can be reused between test executions. This will not
+     * be necessary if grid is hanging off the global ServiceContext and each test gets its
+     * own service context.
+     *
+     * NOTE: Do not use this outside of unit-tests.
+     */
+    void clearForUnitTests();
 
-} // namespace mongo
+private:
+    std::unique_ptr<ForwardingCatalogManager> _catalogManager;
+    std::unique_ptr<CatalogCache> _catalogCache;
+    std::unique_ptr<ShardRegistry> _shardRegistry;
+    std::unique_ptr<ClusterCursorManager> _cursorManager;
+
+    // can 'localhost' be used in shard addresses?
+    bool _allowLocalShard;
+};
+
+extern Grid grid;
+
+}  // namespace mongo

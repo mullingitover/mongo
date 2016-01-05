@@ -29,132 +29,126 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/parsed_update.h"
+
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_planner_common.h"
 
 namespace mongo {
 
-    ParsedUpdate::ParsedUpdate(OperationContext* txn, const UpdateRequest* request) :
-        _txn(txn),
-        _request(request),
-        _driver(UpdateDriver::Options()),
-        _canonicalQuery() { }
+ParsedUpdate::ParsedUpdate(OperationContext* txn, const UpdateRequest* request)
+    : _txn(txn), _request(request), _driver(UpdateDriver::Options()), _canonicalQuery() {}
 
-    Status ParsedUpdate::parseRequest() {
-        // It is invalid to request that the UpdateStage return the prior or newly-updated version
-        // of a document during a multi-update.
-        invariant(!(_request->shouldReturnAnyDocs() && _request->isMulti()));
+Status ParsedUpdate::parseRequest() {
+    // It is invalid to request that the UpdateStage return the prior or newly-updated version
+    // of a document during a multi-update.
+    invariant(!(_request->shouldReturnAnyDocs() && _request->isMulti()));
 
-        // It is invalid to request that a ProjectionStage be applied to the UpdateStage if the
-        // UpdateStage would not return any document.
-        invariant(_request->getProj().isEmpty() || _request->shouldReturnAnyDocs());
+    // It is invalid to request that a ProjectionStage be applied to the UpdateStage if the
+    // UpdateStage would not return any document.
+    invariant(_request->getProj().isEmpty() || _request->shouldReturnAnyDocs());
 
-        // We parse the update portion before the query portion because the dispostion of the update
-        // may determine whether or not we need to produce a CanonicalQuery at all.  For example, if
-        // the update involves the positional-dollar operator, we must have a CanonicalQuery even if
-        // it isn't required for query execution.
-        Status status = parseUpdate();
-        if (!status.isOK())
-            return status;
-        status = parseQuery();
-        if (!status.isOK())
-            return status;
+    // We parse the update portion before the query portion because the dispostion of the update
+    // may determine whether or not we need to produce a CanonicalQuery at all.  For example, if
+    // the update involves the positional-dollar operator, we must have a CanonicalQuery even if
+    // it isn't required for query execution.
+    Status status = parseUpdate();
+    if (!status.isOK())
+        return status;
+    status = parseQuery();
+    if (!status.isOK())
+        return status;
+    return Status::OK();
+}
+
+Status ParsedUpdate::parseQuery() {
+    dassert(!_canonicalQuery.get());
+
+    if (!_driver.needMatchDetails() && CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
         return Status::OK();
     }
 
-    Status ParsedUpdate::parseQuery() {
-        dassert(!_canonicalQuery.get());
+    return parseQueryToCQ();
+}
 
-        if (!_driver.needMatchDetails() && CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
-            return Status::OK();
-        }
+Status ParsedUpdate::parseQueryToCQ() {
+    dassert(!_canonicalQuery.get());
 
-        return parseQueryToCQ();
-    }
+    const ExtensionsCallbackReal extensionsCallback(_txn, &_request->getNamespaceString());
 
-    Status ParsedUpdate::parseQueryToCQ() {
-        dassert(!_canonicalQuery.get());
+    // Limit should only used for the findAndModify command when a sort is specified. If a sort
+    // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
+    // limit through. Generally, a update stage expects to be able to skip documents that were
+    // deleted/modified under it, but a limit could inhibit that and give an EOF when the update
+    // has not actually updated a document. This behavior is fine for findAndModify, but should
+    // not apply to update in general.
+    long long limit = (!_request->isMulti() && !_request->getSort().isEmpty()) ? -1 : 0;
 
-        CanonicalQuery* cqRaw;
-        const WhereCallbackReal whereCallback(_txn, _request->getNamespaceString().db());
-
-        // Limit should only used for the findAndModify command when a sort is specified. If a sort
-        // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
-        // limit through. Generally, a update stage expects to be able to skip documents that were
-        // deleted/modified under it, but a limit could inhibit that and give an EOF when the update
-        // has not actually updated a document. This behavior is fine for findAndModify, but should
-        // not apply to update in general.
-        long long limit = (!_request->isMulti() && !_request->getSort().isEmpty()) ? -1 : 0;
-
-        // The projection needs to be applied after the update operation, so we specify an empty
-        // BSONObj as the projection during canonicalization.
-        const BSONObj emptyObj;
-        Status status = CanonicalQuery::canonicalize(_request->getNamespaceString().ns(),
+    // The projection needs to be applied after the update operation, so we specify an empty
+    // BSONObj as the projection during canonicalization.
+    const BSONObj emptyObj;
+    auto statusWithCQ = CanonicalQuery::canonicalize(_request->getNamespaceString(),
                                                      _request->getQuery(),
                                                      _request->getSort(),
-                                                     emptyObj, // projection
-                                                     0, // skip
+                                                     emptyObj,  // projection
+                                                     0,         // skip
                                                      limit,
-                                                     emptyObj, // hint
-                                                     emptyObj, // min
-                                                     emptyObj, // max
-                                                     false, // snapshot
+                                                     emptyObj,  // hint
+                                                     emptyObj,  // min
+                                                     emptyObj,  // max
+                                                     false,     // snapshot
                                                      _request->isExplain(),
-                                                     &cqRaw,
-                                                     whereCallback);
-        if (status.isOK()) {
-            _canonicalQuery.reset(cqRaw);
-        }
-
-        return status;
+                                                     extensionsCallback);
+    if (statusWithCQ.isOK()) {
+        _canonicalQuery = std::move(statusWithCQ.getValue());
     }
 
-    Status ParsedUpdate::parseUpdate() {
-        const NamespaceString& ns(_request->getNamespaceString());
+    return statusWithCQ.getStatus();
+}
 
-        // Should the modifiers validate their embedded docs via okForStorage
-        // Only user updates should be checked. Any system or replication stuff should pass through.
-        // Config db docs shouldn't get checked for valid field names since the shard key can have
-        // a dot (".") in it.
-        const bool shouldValidate = !(!_txn->writesAreReplicated() ||
-                                      ns.isConfigDB() ||
-                                      _request->isFromMigration());
+Status ParsedUpdate::parseUpdate() {
+    const NamespaceString& ns(_request->getNamespaceString());
 
-        _driver.setLogOp(true);
-        _driver.setModOptions(ModifierInterface::Options(!_txn->writesAreReplicated(),
-                                                         shouldValidate));
+    // Should the modifiers validate their embedded docs via okForStorage
+    // Only user updates should be checked. Any system or replication stuff should pass through.
+    // Config db docs shouldn't get checked for valid field names since the shard key can have
+    // a dot (".") in it.
+    const bool shouldValidate =
+        !(!_txn->writesAreReplicated() || ns.isConfigDB() || _request->isFromMigration());
 
-        return _driver.parse(_request->getUpdates(), _request->isMulti());
-    }
+    _driver.setLogOp(true);
+    _driver.setModOptions(ModifierInterface::Options(!_txn->writesAreReplicated(), shouldValidate));
 
-    bool ParsedUpdate::canYield() const {
-        return !_request->isGod() &&
-            PlanExecutor::YIELD_AUTO == _request->getYieldPolicy() &&
-            !isIsolated();
-    }
+    return _driver.parse(_request->getUpdates(), _request->isMulti());
+}
 
-    bool ParsedUpdate::isIsolated() const {
-        return _canonicalQuery.get()
-            ? QueryPlannerCommon::hasNode(_canonicalQuery->root(), MatchExpression::ATOMIC)
-            : LiteParsedQuery::isQueryIsolated(_request->getQuery());
-    }
+bool ParsedUpdate::canYield() const {
+    return !_request->isGod() && PlanExecutor::YIELD_AUTO == _request->getYieldPolicy() &&
+        !isIsolated();
+}
 
-    bool ParsedUpdate::hasParsedQuery() const {
-        return _canonicalQuery.get() != NULL;
-    }
+bool ParsedUpdate::isIsolated() const {
+    return _canonicalQuery.get()
+        ? QueryPlannerCommon::hasNode(_canonicalQuery->root(), MatchExpression::ATOMIC)
+        : LiteParsedQuery::isQueryIsolated(_request->getQuery());
+}
 
-    CanonicalQuery* ParsedUpdate::releaseParsedQuery() {
-        invariant(_canonicalQuery.get() != NULL);
-        return _canonicalQuery.release();
-    }
+bool ParsedUpdate::hasParsedQuery() const {
+    return _canonicalQuery.get() != NULL;
+}
 
-    const UpdateRequest* ParsedUpdate::getRequest() const {
-        return _request;
-    }
+std::unique_ptr<CanonicalQuery> ParsedUpdate::releaseParsedQuery() {
+    invariant(_canonicalQuery.get() != NULL);
+    return std::move(_canonicalQuery);
+}
 
-    UpdateDriver* ParsedUpdate::getDriver() {
-        return &_driver;
-    }
+const UpdateRequest* ParsedUpdate::getRequest() const {
+    return _request;
+}
+
+UpdateDriver* ParsedUpdate::getDriver() {
+    return &_driver;
+}
 
 }  // namespace mongo

@@ -31,22 +31,48 @@
 #include "mongo/client/remote_command_targeter_rs.h"
 
 #include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
-    RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
-                                                     const std::vector<HostAndPort>& seedHosts)
-        : _rsName(rsName),
-          _seedHosts(seedHosts) {
+RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
+                                                 const std::vector<HostAndPort>& seedHosts)
+    : _rsName(rsName) {
+    _rsMonitor = ReplicaSetMonitor::get(rsName);
+    if (!_rsMonitor) {
+        std::set<HostAndPort> seedServers(seedHosts.begin(), seedHosts.end());
 
+        ReplicaSetMonitor::createIfNeeded(rsName, seedServers);
+        _rsMonitor = ReplicaSetMonitor::get(rsName);
+
+        fassert(28711, _rsMonitor != nullptr);
     }
+}
 
-    StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(
-                                    const ReadPreferenceSetting& readPref) {
-        invariant(false);
-        return Status(ErrorCodes::IllegalOperation, "Not yet implemented");
-    }
+ConnectionString RemoteCommandTargeterRS::connectionString() {
+    return fassertStatusOK(28712, ConnectionString::parse(_rsMonitor->getServerAddress()));
+}
 
-} // namespace mongo
+StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref,
+                                                          Milliseconds maxWait) {
+    return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+}
+
+void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host);
+}
+
+void RemoteCommandTargeterRS::markHostUnreachable(const HostAndPort& host) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host);
+}
+
+}  // namespace mongo

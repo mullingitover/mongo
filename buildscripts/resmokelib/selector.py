@@ -18,23 +18,22 @@ from . import utils
 from .utils import globstar
 from .utils import jscomment
 
-
-def filter_cpp_unit_tests(root="build/unittests.txt", include_files=None, exclude_files=None):
+def _filter_cpp_tests(kind, root, include_files, exclude_files):
     """
-    Filters out what C++ unit tests to run.
+    Generic filtering logic for C++ tests that are sourced from a list
+    of test executables.
     """
-
     include_files = utils.default_if_none(include_files, [])
     exclude_files = utils.default_if_none(exclude_files, [])
 
-    unit_tests = []
+    tests = []
     with open(root, "r") as fp:
-        for unit_test_path in fp:
-            unit_test_path = unit_test_path.rstrip()
-            unit_tests.append(unit_test_path)
+        for test_path in fp:
+            test_path = test_path.rstrip()
+            tests.append(test_path)
 
-    (remaining, included, _) = _filter_by_filename("C++ unit test",
-                                                   unit_tests,
+    (remaining, included, _) = _filter_by_filename(kind,
+                                                   tests,
                                                    include_files,
                                                    exclude_files)
 
@@ -42,7 +41,22 @@ def filter_cpp_unit_tests(root="build/unittests.txt", include_files=None, exclud
         return list(included)
     elif exclude_files:
         return list(remaining)
-    return unit_tests
+    return tests
+
+def filter_cpp_unit_tests(root="build/unittests.txt", include_files=None, exclude_files=None):
+    """
+    Filters out what C++ unit tests to run.
+    """
+    return _filter_cpp_tests("C++ unit test", root, include_files, exclude_files)
+
+
+def filter_cpp_integration_tests(root="build/integration_tests.txt",
+                                 include_files=None,
+                                 exclude_files=None):
+    """
+    Filters out what C++ integration tests to run.
+    """
+    return _filter_cpp_tests("C++ integration test", root, include_files, exclude_files)
 
 
 def filter_dbtests(binary=None, include_suites=None):
@@ -102,24 +116,40 @@ def filter_jstests(roots,
     include_files = utils.default_if_none(include_files, [])
     exclude_files = utils.default_if_none(exclude_files, [])
 
-    include_with_all_tags = set(utils.default_if_none(include_with_all_tags, []))
-    include_with_any_tags = set(utils.default_if_none(include_with_any_tags, []))
-    exclude_with_all_tags = set(utils.default_if_none(exclude_with_all_tags, []))
-    exclude_with_any_tags = set(utils.default_if_none(exclude_with_any_tags, []))
+    # Command line options override the YAML options, and all should be defaulted to an empty list
+    # if not specified.
+    tags = {
+        "exclude_with_all_tags": exclude_with_all_tags,
+        "exclude_with_any_tags": exclude_with_any_tags,
+        "include_with_all_tags": include_with_all_tags,
+        "include_with_any_tags": include_with_any_tags,
+    }
+    cmd_line_values = (
+        ("exclude_with_all_tags", config.EXCLUDE_WITH_ALL_TAGS),
+        ("exclude_with_any_tags", config.EXCLUDE_WITH_ANY_TAGS),
+        ("include_with_all_tags", config.INCLUDE_WITH_ALL_TAGS),
+        ("include_with_any_tags", config.INCLUDE_WITH_ANY_TAGS),
+    )
+    for (tag_category, cmd_line_val) in cmd_line_values:
+        if cmd_line_val is not None:
+            # Ignore the empty string when it is used as a tag. Specifying an empty string on the
+            # command line allows a user to unset the list of tags specified in the YAML
+            # configuration.
+            tags[tag_category] = set([tag for tag in cmd_line_val.split(",") if tag != ""])
+        else:
+            tags[tag_category] = set(utils.default_if_none(tags[tag_category], []))
 
     using_tags = 0
-    for (name, value) in (("include_with_all_tags", include_with_all_tags),
-                          ("include_with_any_tags", include_with_any_tags),
-                          ("exclude_with_all_tags", exclude_with_all_tags),
-                          ("exclude_with_any_tags", exclude_with_any_tags)):
-        if not utils.is_string_set(value):
+    for name in tags:
+        if not utils.is_string_set(tags[name]):
             raise TypeError("%s must be a list of strings" % (name))
-        if len(value) > 0:
+        if len(tags[name]) > 0:
             using_tags += 1
 
     if using_tags > 1:
         raise ValueError("Can only specify one of 'include_with_all_tags', 'include_with_any_tags',"
-                         " 'exclude_with_all_tags', and 'exclude_with_any_tags'")
+                         " 'exclude_with_all_tags', and 'exclude_with_any_tags'. If you wish to"
+                         " unset one of these options, use --includeWithAllTags='' or similar")
 
     jstests = []
     for root in roots:
@@ -143,16 +173,16 @@ def filter_jstests(roots,
 
     for filename in jstests:
         file_tags = set(jscomment.get_tags(filename))
-        if include_with_all_tags and not include_with_all_tags - file_tags:
+        if tags["include_with_all_tags"] and not tags["include_with_all_tags"] - file_tags:
             included.add(filename)
-        elif include_with_any_tags and include_with_any_tags & file_tags:
+        elif tags["include_with_any_tags"] and tags["include_with_any_tags"] & file_tags:
             included.add(filename)
-        elif exclude_with_all_tags and not exclude_with_all_tags - file_tags:
+        elif tags["exclude_with_all_tags"] and not tags["exclude_with_all_tags"] - file_tags:
             excluded.add(filename)
-        elif exclude_with_any_tags and exclude_with_any_tags & file_tags:
+        elif tags["exclude_with_any_tags"] and tags["exclude_with_any_tags"] & file_tags:
             excluded.add(filename)
 
-    if include_with_all_tags or include_with_any_tags:
+    if tags["include_with_all_tags"] or tags["include_with_any_tags"]:
         if exclude_files:
             return list((included & jstests) - excluded)
         return list(included)

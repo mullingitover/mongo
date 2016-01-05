@@ -29,142 +29,144 @@
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/net/sock.h"
 
 namespace mongo {
 
-    const int DEFAULT_MAX_CONN = 1000000;
+const int DEFAULT_MAX_CONN = 1000000;
 
-    class MessagingPort;
+class MessagingPort;
 
-    class Listener : boost::noncopyable {
-    public:
+class Listener {
+    MONGO_DISALLOW_COPYING(Listener);
 
-        Listener(const std::string& name, const std::string &ip, int port, bool logConnect=true );
+public:
+    Listener(const std::string& name, const std::string& ip, int port, bool logConnect = true);
 
-        virtual ~Listener();
-        
-        void initAndListen(); // never returns unless error (start a thread)
+    virtual ~Listener();
 
-        /* spawn a thread, etc., then return */
-        virtual void accepted(boost::shared_ptr<Socket> psocket, long long connectionId );
-        virtual void acceptedMP(MessagingPort *mp);
+    void initAndListen();  // never returns unless error (start a thread)
 
-        const int _port;
+    /* spawn a thread, etc., then return */
+    virtual void accepted(std::shared_ptr<Socket> psocket, long long connectionId);
+    virtual void acceptedMP(MessagingPort* mp);
 
-        /**
-         * @return a rough estimate of elapsed time since the server started
-           todo: 
-           1) consider adding some sort of relaxedLoad semantic to the reading here of 
-              _elapsedTime
-           2) curTimeMillis() implementations have gotten faster. consider eliminating
-              this code?  would have to measure it first.  if eliminated be careful if 
-              syscall used isn't skewable.  Note also if #2 is done, listen() doesn't 
-              then have to keep waking up and maybe that helps on a developer's laptop 
-              battery usage...
-         */
-        long long getMyElapsedTimeMillis() const { return _elapsedTime; }
+    const int _port;
 
-        /**
-         * Allocate sockets for the listener and set _setupSocketsSuccessful to true
-         * iff the process was successful.
-         */
-        void setupSockets();
+    /**
+     * @return a rough estimate of elapsed time since the server started
+       todo:
+       1) consider adding some sort of relaxedLoad semantic to the reading here of
+          _elapsedTime
+       2) curTimeMillis() implementations have gotten faster. consider eliminating
+          this code?  would have to measure it first.  if eliminated be careful if
+          syscall used isn't skewable.  Note also if #2 is done, listen() doesn't
+          then have to keep waking up and maybe that helps on a developer's laptop
+          battery usage...
+     */
+    long long getMyElapsedTimeMillis() const {
+        return _elapsedTime;
+    }
 
-        void setAsTimeTracker() {
-            _timeTracker = this;
-        }
+    /**
+     * Allocate sockets for the listener and set _setupSocketsSuccessful to true
+     * iff the process was successful.
+     * Returns _setupSocketsSuccessful.
+     */
+    bool setupSockets();
 
-        // TODO(spencer): Remove this and get the global Listener via the
-        // globalEnvironmentExperiment
-        static const Listener* getTimeTracker() {
-            return _timeTracker;
-        }
+    void setAsTimeTracker() {
+        _timeTracker = this;
+    }
 
-        static long long getElapsedTimeMillis() {
-            if ( _timeTracker )
-                return _timeTracker->getMyElapsedTimeMillis();
+    // TODO(spencer): Remove this and get the global Listener via the
+    // globalEnvironmentExperiment
+    static const Listener* getTimeTracker() {
+        return _timeTracker;
+    }
 
-            // should this assert or throw?  seems like callers may not expect to get zero back, certainly not forever.
-            return 0;
-        }
+    static long long getElapsedTimeMillis() {
+        if (_timeTracker)
+            return _timeTracker->getMyElapsedTimeMillis();
 
-        /**
-         * Blocks until initAndListen has been called on this instance and gotten far enough that
-         * it is ready to receive incoming network requests.
-         */
-        void waitUntilListening() const;
+        // should this assert or throw?  seems like callers may not expect to get zero back,
+        // certainly not forever.
+        return 0;
+    }
 
-    private:
-        std::vector<SockAddr> _mine;
-        std::vector<SOCKET> _socks;
-        std::string _name;
-        std::string _ip;
-        bool _setupSocketsSuccessful;
-        bool _logConnect;
-        long long _elapsedTime;
-        mutable boost::mutex _readyMutex; // Protects _ready
-        mutable boost::condition_variable _readyCondition; // Used to wait for changes to _ready
-        // Boolean that indicates whether this Listener is ready to accept incoming network requests
-        bool _ready;
-        
+    /**
+     * Blocks until initAndListen has been called on this instance and gotten far enough that
+     * it is ready to receive incoming network requests.
+     */
+    void waitUntilListening() const;
+
+private:
+    std::vector<SockAddr> _mine;
+    std::vector<SOCKET> _socks;
+    std::string _name;
+    std::string _ip;
+    bool _setupSocketsSuccessful;
+    bool _logConnect;
+    long long _elapsedTime;
+    mutable stdx::mutex _readyMutex;                   // Protects _ready
+    mutable stdx::condition_variable _readyCondition;  // Used to wait for changes to _ready
+    // Boolean that indicates whether this Listener is ready to accept incoming network requests
+    bool _ready;
+
 #ifdef MONGO_CONFIG_SSL
-        SSLManagerInterface* _ssl;
+    SSLManagerInterface* _ssl;
 #endif
-        
-        void _logListen( int port , bool ssl );
 
-        static const Listener* _timeTracker;
-        
-        virtual bool useUnixSockets() const { return false; }
+    void _logListen(int port, bool ssl);
 
-    public:
-        /** the "next" connection number.  every connection to this process has a unique number */
-        static AtomicInt64 globalConnectionNumber;
+    static const Listener* _timeTracker;
 
-        /** keeps track of how many allowed connections there are and how many are being used*/
-        static TicketHolder globalTicketHolder;
+    virtual bool useUnixSockets() const {
+        return false;
+    }
 
-        /** makes sure user input is sane */
-        static void checkTicketNumbers();
-    };
+public:
+    /** the "next" connection number.  every connection to this process has a unique number */
+    static AtomicInt64 globalConnectionNumber;
 
-    class ListeningSockets {
-    public:
-        ListeningSockets()
-            : _sockets( new std::set<int>() )
-            , _socketPaths( new std::set<std::string>() )
-        { }
-        void add( int sock ) {
-            boost::lock_guard<boost::mutex> lk( _mutex );
-            _sockets->insert( sock );
-        }
-        void addPath( const std::string& path ) {
-            boost::lock_guard<boost::mutex> lk( _mutex );
-            _socketPaths->insert( path );
-        }
-        void remove( int sock ) {
-            boost::lock_guard<boost::mutex> lk( _mutex );
-            _sockets->erase( sock );
-        }
-        void closeAll();
-        static ListeningSockets* get();
-    private:
-        boost::mutex _mutex;
-        std::set<int>* _sockets;
-        std::set<std::string>* _socketPaths; // for unix domain sockets
-        static ListeningSockets* _instance;
-    };
+    /** keeps track of how many allowed connections there are and how many are being used*/
+    static TicketHolder globalTicketHolder;
 
+    /** makes sure user input is sane */
+    static void checkTicketNumbers();
+};
+
+class ListeningSockets {
+public:
+    ListeningSockets() : _sockets(new std::set<int>()), _socketPaths(new std::set<std::string>()) {}
+    void add(int sock) {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _sockets->insert(sock);
+    }
+    void addPath(const std::string& path) {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _socketPaths->insert(path);
+    }
+    void remove(int sock) {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _sockets->erase(sock);
+    }
+    void closeAll();
+    static ListeningSockets* get();
+
+private:
+    stdx::mutex _mutex;
+    std::set<int>* _sockets;
+    std::set<std::string>* _socketPaths;  // for unix domain sockets
+    static ListeningSockets* _instance;
+};
 }

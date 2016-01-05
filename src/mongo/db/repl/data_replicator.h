@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <boost/thread.hpp>
 #include <vector>
 
 #include "mongo/platform/basic.h"
@@ -41,52 +40,83 @@
 #include "mongo/db/repl/applier.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/database_cloner.h"
-#include "mongo/db/repl/fetcher.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/reporter.h"
+#include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/queue.h"
 
 namespace mongo {
+
+class QueryFetcher;
+
 namespace repl {
 
 using Operations = Applier::Operations;
-using BatchDataStatus = StatusWith<Fetcher::BatchData>;
-using CallbackData = ReplicationExecutor::CallbackData;
+using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
+using CallbackArgs = ReplicationExecutor::CallbackArgs;
 using CBHStatus = StatusWith<ReplicationExecutor::CallbackHandle>;
-using CommandCallbackData = ReplicationExecutor::RemoteCommandCallbackData;
+using CommandCallbackArgs = ReplicationExecutor::RemoteCommandCallbackArgs;
 using Event = ReplicationExecutor::EventHandle;
 using Handle = ReplicationExecutor::CallbackHandle;
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 using NextAction = Fetcher::NextAction;
-using Request = RemoteCommandRequest;
-using Response = RemoteCommandResponse;
+using Request = executor::RemoteCommandRequest;
+using Response = executor::RemoteCommandResponse;
 using TimestampStatus = StatusWith<Timestamp>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
-class QueryFetcher;
 class OplogFetcher;
 struct InitialSyncState;
-
+struct MemberState;
+class ReplicationProgressManager;
+class SyncSourceSelector;
 
 /** State for decision tree */
 enum class DataReplicatorState {
-    Steady, // Default
+    Steady,  // Default
     InitialSync,
     Rollback,
     Uninitialized,
 };
 
+std::string toString(DataReplicatorState s);
+
 // TBD -- ignore for now
-enum class DataReplicatorScope {
-    ReplicateAll,
-    ReplicateDB,
-    ReplicateCollection
-};
+enum class DataReplicatorScope { ReplicateAll, ReplicateDB, ReplicateCollection };
 
 struct DataReplicatorOptions {
-    Timestamp startOptime;
+    /**
+     * Function to rollback operations on the current node to a common point with
+     * the sync source.
+     *
+     * In production, this function should invoke syncRollback (rs_rollback.h) using the
+     * OperationContext to create a OplogInterfaceLocal; the HostAndPort to create a
+     * DBClientConnection for the RollbackSourceImpl. The reference to the ReplicationCoordinator
+     * can be provided separately.
+     * */
+    using RollbackFn = stdx::function<Status(OperationContext*, const OpTime&, const HostAndPort&)>;
+
+    /** Function to return optime of last operation applied on this node */
+    using GetMyLastOptimeFn = stdx::function<OpTime()>;
+
+    /** Function to update optime of last operation applied on this node */
+    using SetMyLastOptimeFn = stdx::function<void(const OpTime&)>;
+
+    /** Function to sets this node into a specific follower mode. */
+    using SetFollowerModeFn = stdx::function<bool(const MemberState&)>;
+
+    // Error and retry values
+    Milliseconds syncSourceRetryWait{1000};
+    Milliseconds initialSyncRetryWait{1000};
+    Seconds blacklistSyncSourcePenaltyForNetworkConnectionError{10};
+    Minutes blacklistSyncSourcePenaltyForOplogStartMissing{10};
+
+    // Replication settings
     NamespaceString localOplogNS = NamespaceString("local.oplog.rs");
     NamespaceString remoteOplogNS = NamespaceString("local.oplog.rs");
 
@@ -94,19 +124,19 @@ struct DataReplicatorOptions {
     DataReplicatorScope scope = DataReplicatorScope::ReplicateAll;
     std::string scopeNS;
     BSONObj filterCriteria;
-    HostAndPort syncSource; // for use without replCoord -- maybe some kind of rsMonitor/interface
 
-    // TODO: replace with real applier function
-    Applier::ApplyOperationFn applierFn = [] (OperationContext*, const BSONObj&) -> Status {
-        return Status::OK();
-    };
+    Applier::ApplyOperationFn applierFn;
+    RollbackFn rollbackFn;
+    Reporter::PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn;
+    GetMyLastOptimeFn getMyLastOptime;
+    SetMyLastOptimeFn setMyLastOptime;
+    SetFollowerModeFn setFollowerMode;
+    SyncSourceSelector* syncSourceSelector = nullptr;
 
     std::string toString() const {
         return str::stream() << "DataReplicatorOptions -- "
                              << " localOplogNs: " << localOplogNS.toString()
-                             << " remoteOplogNS: " << remoteOplogNS.toString()
-                             << " syncSource: " << syncSource.toString()
-                             << " startOptime: " << startOptime.toString();
+                             << " remoteOplogNS: " << remoteOplogNS.toString();
     }
 };
 
@@ -119,25 +149,26 @@ struct DataReplicatorOptions {
  */
 class DataReplicator {
 public:
-    /** Function to call when a batch is applied. */
-    using OnBatchCompleteFn = stdx::function<void (const Timestamp&)>;
-
-    DataReplicator(DataReplicatorOptions opts,
-                   ReplicationExecutor* exec,
-                   ReplicationCoordinator* replCoord);
-    /**
-     * Used by non-replication coordinator processes, like sharding.
-     */
-    DataReplicator(DataReplicatorOptions opts,
-                   ReplicationExecutor* exec);
+    DataReplicator(DataReplicatorOptions opts, ReplicationExecutor* exec);
 
     virtual ~DataReplicator();
 
     Status start();
     Status shutdown();
 
+    /**
+     * Cancels outstanding work and begins shutting down.
+     */
+    Status scheduleShutdown();
+
+    /**
+     * Waits for data replicator to finish shutting down.
+     * Data replicator will go into uninitialized state.
+     */
+    void waitForShutdown();
+
     // Resumes apply replication events from the oplog
-    Status resume(bool wait=false);
+    Status resume(bool wait = false);
 
     // Pauses replication and application
     Status pause();
@@ -154,23 +185,41 @@ public:
     // Don't use above methods before these
     TimestampStatus initialSync();
 
+    DataReplicatorState getState() const;
+
+    /**
+     * Waits until data replicator state becomes 'state'.
+     */
+    void waitForState(const DataReplicatorState& state);
+
+    HostAndPort getSyncSource() const;
+    Timestamp getLastTimestampFetched() const;
+    Timestamp getLastTimestampApplied() const;
+
+    /**
+     * Number of operations in the oplog buffer.
+     */
+    size_t getOplogBufferCount() const;
+
     std::string getDiagnosticString() const;
 
     // For testing only
+
     void _resetState_inlock(Timestamp lastAppliedOptime);
-    void __setSourceForTesting(HostAndPort src) { _syncSource = src; }
     void _setInitialSyncStorageInterface(CollectionCloner::StorageInterface* si);
 
 private:
+    void _setState(const DataReplicatorState& newState);
+    void _setState_inlock(const DataReplicatorState& newState);
 
-    // Run a member function in the executor, waiting for it to finish.
-//    Status _run(void*());
+    // Returns OK when there is a good syncSource at _syncSource.
+    Status _ensureGoodSyncSource_inlock();
 
     // Only executed via executor
-    void _resumeFinish(CallbackData cbData);
-    void _onOplogFetchFinish(const BatchDataStatus& fetchResult,
+    void _resumeFinish(CallbackArgs cbData);
+    void _onOplogFetchFinish(const QueryResponseStatus& fetchResult,
                              Fetcher::NextAction* nextAction);
-    void _doNextActionsCB(CallbackData cbData);
+    void _rollbackOperations(const CallbackArgs& cbData);
     void _doNextActions();
     void _doNextActions_InitialSync_inlock();
     void _doNextActions_Rollback_inlock();
@@ -182,24 +231,21 @@ private:
     void _pauseApplier();
 
     Operations _getNextApplierBatch_inlock();
-    void _onApplyBatchFinish(const CallbackData&,
+    void _onApplyBatchFinish(const CallbackArgs&,
                              const TimestampStatus&,
                              const Operations&,
                              const size_t numApplied);
     void _handleFailedApplyBatch(const TimestampStatus&, const Operations&);
     // Fetches the last doc from the first operation, and reschedules the apply for the ops.
     void _scheduleApplyAfterFetch(const Operations&);
-    void _onMissingFetched(const BatchDataStatus& fetchResult,
+    void _onMissingFetched(const QueryResponseStatus& fetchResult,
                            Fetcher::NextAction* nextAction,
                            const Operations& ops,
                            const NamespaceString nss);
 
-    // returns true if a rollback is needed
-    bool _needToRollback(HostAndPort source, Timestamp lastApplied);
-
     void _onDataClonerFinish(const Status& status);
     // Called after _onDataClonerFinish when the new Timestamp is avail, to use for minvalid
-    void _onApplierReadyStart(const BatchDataStatus& fetchResult,
+    void _onApplierReadyStart(const QueryResponseStatus& fetchResult,
                               Fetcher::NextAction* nextAction);
 
     Status _scheduleApplyBatch();
@@ -219,7 +265,6 @@ private:
     // Set during construction
     const DataReplicatorOptions _opts;
     ReplicationExecutor* _exec;
-    ReplicationCoordinator* _replCoord;
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -235,41 +280,40 @@ private:
     //      _mutex or be in a callback in _exec to read.
     // (I)  Independently synchronized, see member variable comment.
 
-    // Protects member data of this ReplicationCoordinator.
-    mutable stdx::mutex _mutex;                                                         // (S)
-    DataReplicatorState _state;                                                        // (MX)
+    // Protects member data of this DataReplicator.
+    mutable stdx::mutex _mutex;  // (S)
+
+    stdx::condition_variable _stateCondition;
+    DataReplicatorState _state;  // (MX)
 
     // initial sync state
-    std::unique_ptr<InitialSyncState> _initialSyncState;                                // (M)
-    CollectionCloner::StorageInterface* _storage;                                       // (M)
+    std::unique_ptr<InitialSyncState> _initialSyncState;  // (M)
+    CollectionCloner::StorageInterface* _storage;         // (M)
 
     // set during scheduling and onFinish
-    bool _fetcherPaused;                                                                // (X)
-    std::unique_ptr<OplogFetcher> _fetcher;                                             // (S)
-    std::unique_ptr<QueryFetcher> _tmpFetcher;                                          // (S)
+    bool _fetcherPaused;                        // (X)
+    std::unique_ptr<OplogFetcher> _fetcher;     // (S)
+    std::unique_ptr<QueryFetcher> _tmpFetcher;  // (S)
 
-    bool _reporterPaused;                                                               // (M)
-    Handle  _reporterHandle;                                                            // (M)
-    std::unique_ptr<Reporter> _reporter;                                                // (M)
+    bool _reporterPaused;                 // (M)
+    Handle _reporterHandle;               // (M)
+    std::unique_ptr<Reporter> _reporter;  // (M)
 
-    bool _applierActive;                                                                // (M)
-    bool _applierPaused;                                                                // (X)
-    std::unique_ptr<Applier> _applier;                                                  // (M)
-    OnBatchCompleteFn _batchCompletedFn;                                                // (M)
+    bool _applierActive;                // (M)
+    bool _applierPaused;                // (X)
+    std::unique_ptr<Applier> _applier;  // (M)
 
-
-    HostAndPort _syncSource;                                                            // (M)
-    Timestamp _lastTimestampFetched;                                                    // (MX)
-    Timestamp _lastTimestampApplied;                                                    // (MX)
-    BlockingQueue<BSONObj> _oplogBuffer;                                                // (M)
+    HostAndPort _syncSource;              // (M)
+    Timestamp _lastTimestampFetched;      // (MX)
+    Timestamp _lastTimestampApplied;      // (MX)
+    BlockingQueue<BSONObj> _oplogBuffer;  // (M)
 
     // Shutdown
-    bool _doShutdown;                                                                   // (M)
-    Event _onShutdown;                                                                  // (M)
+    Event _onShutdown;  // (M)
 
     // Rollback stuff
-    Timestamp _rollbackCommonOptime;                                                    // (MX)
+    Timestamp _rollbackCommonOptime;  // (MX)
 };
 
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

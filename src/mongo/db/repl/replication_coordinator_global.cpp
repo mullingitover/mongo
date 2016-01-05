@@ -29,21 +29,20 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 namespace repl {
 
-namespace {
-    ReplicationCoordinator* coordinator = NULL;
-} // namespace
+ReplicationCoordinator* getGlobalReplicationCoordinator() {
+    ReplicationCoordinator* globalReplCoordinator =
+        ReplicationCoordinator::get(getGlobalServiceContext());
+    return globalReplCoordinator;
+}
 
-    ReplicationCoordinator* getGlobalReplicationCoordinator() {
-        return coordinator;
-    }
-
-    void setGlobalReplicationCoordinator(ReplicationCoordinator* newCoordinator) {
-        coordinator = newCoordinator;
-    }
-
-} // namespace repl
-} // namespace mongo
+void setGlobalReplicationCoordinator(ReplicationCoordinator* coord) {
+    repl::ReplicationCoordinator::set(getGlobalServiceContext(),
+                                      std::unique_ptr<ReplicationCoordinator>(coord));
+}
+}  // namespace repl
+}  // namespace mongo

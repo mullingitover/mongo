@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,24 +36,35 @@
 
 namespace mongo {
 
+class ReplicaSetMonitor;
+
+/**
+ * Implements a replica-set backed remote command targeter, which monitors the specified
+ * replica set and responds to state changes.
+ */
+class RemoteCommandTargeterRS final : public RemoteCommandTargeter {
+public:
     /**
-     * Implements a replica-set backed remote command targeter, which monitors the specified
-     * replica set and responds to state changes.
+     * Instantiates a new targeter for the specified replica set and seed hosts. The RS name
+     * and the seed hosts must match.
      */
-    class RemoteCommandTargeterRS : public RemoteCommandTargeter {
-    public:
-        /**
-         * Instantiates a new targeter for the specified replica set and seed hosts. The RS name
-         * and the seed hosts must match.
-         */
-        RemoteCommandTargeterRS(const std::string& rsName,
-                                const std::vector<HostAndPort>& seedHosts);
+    RemoteCommandTargeterRS(const std::string& rsName, const std::vector<HostAndPort>& seedHosts);
 
-        StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref) final;
+    ConnectionString connectionString() override;
 
-    private:
-        const std::string _rsName;
-        const std::vector<HostAndPort> _seedHosts;
-    };
+    StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     Milliseconds maxWait) override;
 
-} // namespace mongo
+    void markHostNotMaster(const HostAndPort& host) override;
+
+    void markHostUnreachable(const HostAndPort& host) override;
+
+private:
+    // Name of the replica set which this targeter maintains
+    const std::string _rsName;
+
+    // Monitor for this replica set
+    std::shared_ptr<ReplicaSetMonitor> _rsMonitor;
+};
+
+}  // namespace mongo

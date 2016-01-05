@@ -33,18 +33,25 @@
 
 namespace mongo {
 
-    /**
-     * Implements a standalone instance remote command targeter, which always returns the same
-     * host regardless of the read preferences.
-     */
-    class RemoteCommandTargeterStandalone : public RemoteCommandTargeter {
-    public:
-        explicit RemoteCommandTargeterStandalone(const HostAndPort& hostAndPort);
+/**
+ * Implements a standalone instance remote command targeter, which always returns the same
+ * host regardless of the read preferences.
+ */
+class RemoteCommandTargeterStandalone final : public RemoteCommandTargeter {
+public:
+    explicit RemoteCommandTargeterStandalone(const HostAndPort& hostAndPort);
 
-        StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref) final;
+    ConnectionString connectionString() override;
 
-    private:
-        const HostAndPort _hostAndPort;
-    };
+    StatusWith<HostAndPort> findHost(const ReadPreferenceSetting& readPref,
+                                     Milliseconds maxWait) override;
 
-} // namespace mongo
+    void markHostNotMaster(const HostAndPort& host) override;
+
+    void markHostUnreachable(const HostAndPort& host) override;
+
+private:
+    const HostAndPort _hostAndPort;
+};
+
+}  // namespace mongo

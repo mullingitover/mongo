@@ -39,42 +39,23 @@ namespace repl {
 
 namespace {
 
-    const int64_t prngSeed = 1;
+const int64_t prngSeed = 1;
 
-} // namespace
+}  // namespace
 
-    void ReplicationExecutorTest::launchExecutorThread() {
-        ASSERT(!_executorThread);
-        _executorThread.reset(
-                new boost::thread(stdx::bind(&ReplicationExecutor::run, _executor.get())));
-        postExecutorThreadLaunch();
-    }
+ReplicationExecutor& ReplicationExecutorTest::getReplExecutor() {
+    return dynamic_cast<ReplicationExecutor&>(getExecutor());
+}
 
-    void ReplicationExecutorTest::postExecutorThreadLaunch() {
-        _net->enterNetwork();
-    }
+void ReplicationExecutorTest::postExecutorThreadLaunch() {
+    getNet()->enterNetwork();
+}
 
-    void ReplicationExecutorTest::joinExecutorThread() {
-        ASSERT(_executorThread);
-        getNet()->exitNetwork();
-        _executorThread->join();
-        _executorThread.reset();
-    }
-
-    void ReplicationExecutorTest::setUp() {
-        _net = new executor::NetworkInterfaceMock;
-        _storage = new StorageInterfaceMock;
-        _executor.reset(new ReplicationExecutor(_net, _storage, prngSeed));
-    }
-
-    void ReplicationExecutorTest::tearDown() {
-        if (_executorThread) {
-            _executor->shutdown();
-            joinExecutorThread();
-        }
-        _executor.reset();
-        _net = nullptr;
-    }
+std::unique_ptr<executor::TaskExecutor> ReplicationExecutorTest::makeTaskExecutor(
+    std::unique_ptr<executor::NetworkInterfaceMock> net) {
+    _storage = new StorageInterfaceMock();
+    return stdx::make_unique<ReplicationExecutor>(net.release(), _storage, prngSeed);
+}
 
 }  // namespace repl
 }  // namespace mongo

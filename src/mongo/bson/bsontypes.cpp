@@ -32,73 +32,64 @@
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
-#pragma pack(1)
-    struct MaxKeyData {
-        MaxKeyData() {
-            totsize=7;
-            maxkey=MaxKey;
-            name=0;
-            eoo=EOO;
-        }
-        int totsize;
-        char maxkey;
-        char name;
-        char eoo;
-    } maxkeydata;
-    BSONObj maxKey((const char *) &maxkeydata);
 
-    struct MinKeyData {
-        MinKeyData() {
-            totsize=7;
-            minkey=MinKey;
-            name=0;
-            eoo=EOO;
-        }
-        int totsize;
-        char minkey;
-        char name;
-        char eoo;
-    } minkeydata;
-    BSONObj minKey((const char *) &minkeydata);
+const char kMaxKeyData[] = {7, 0, 0, 0, static_cast<char>(MaxKey), 0, 0};
+const BSONObj kMaxBSONKey(kMaxKeyData);
 
-    /*
-        struct JSObj0 {
-            JSObj0() {
-                totsize = 5;
-                eoo = EOO;
-            }
-            int totsize;
-            char eoo;
-        } js0;
-    */
-#pragma pack()
+const char kMinKeyData[] = {7, 0, 0, 0, static_cast<char>(MinKey), 0, 0};
+const BSONObj kMinBSONKey(kMinKeyData);
 
-    /* take a BSONType and return the name of that type as a char* */
-    const char* typeName (BSONType type) {
-        switch (type) {
-            case MinKey: return "MinKey";
-            case EOO: return "EOO";
-            case NumberDouble: return "NumberDouble";
-            case String: return "String";
-            case Object: return "Object";
-            case Array: return "Array";
-            case BinData: return "BinaryData";
-            case Undefined: return "Undefined";
-            case jstOID: return "OID";
-            case Bool: return "Bool";
-            case Date: return "Date";
-            case jstNULL: return "NULL";
-            case RegEx: return "RegEx";
-            case DBRef: return "DBRef";
-            case Code: return "Code";
-            case Symbol: return "Symbol";
-            case CodeWScope: return "CodeWScope";
-            case NumberInt: return "NumberInt32";
-            case bsonTimestamp: return "Timestamp";
-            case NumberLong: return "NumberLong64";
-            // JSTypeMax doesn't make sense to turn into a string; overlaps with highest-valued type
-            case MaxKey: return "MaxKey";
-            default: return "Invalid";
-        }
+/* take a BSONType and return the name of that type as a char* */
+const char* typeName(BSONType type) {
+    switch (type) {
+        case MinKey:
+            return "MinKey";
+        case EOO:
+            return "EOO";
+        case NumberDouble:
+            return "NumberDouble";
+        case String:
+            return "String";
+        case Object:
+            return "Object";
+        case Array:
+            return "Array";
+        case BinData:
+            return "BinaryData";
+        case Undefined:
+            return "Undefined";
+        case jstOID:
+            return "OID";
+        case Bool:
+            return "Bool";
+        case Date:
+            return "Date";
+        case jstNULL:
+            return "NULL";
+        case RegEx:
+            return "RegEx";
+        case DBRef:
+            return "DBRef";
+        case Code:
+            return "Code";
+        case Symbol:
+            return "Symbol";
+        case CodeWScope:
+            return "CodeWScope";
+        case NumberInt:
+            return "NumberInt32";
+        case bsonTimestamp:
+            return "Timestamp";
+        case NumberLong:
+            return "NumberLong64";
+        case NumberDecimal:
+            return "NumberDecimal128";
+        // JSTypeMax doesn't make sense to turn into a string; overlaps with highest-valued type
+        case MaxKey:
+            return "MaxKey";
+        default:
+            return "Invalid";
     }
-} // namespace mongo
+}
+
+}  // namespace mongo

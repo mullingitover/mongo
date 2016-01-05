@@ -35,65 +35,79 @@
 #include <algorithm>
 
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-    using stdx::chrono::milliseconds;
+using stdx::chrono::milliseconds;
 
-    DistLockManagerMock::DistLockManagerMock() : _lockReturnStatus{Status::OK()}{}
+namespace {
 
-    void DistLockManagerMock::startUp() {}
+void NoLockFuncSet(StringData name,
+                   StringData whyMessage,
+                   milliseconds waitFor,
+                   milliseconds lockTryInterval) {
+    FAIL(str::stream() << "Lock not expected to be called. "
+                       << "Name: " << name << ", whyMessage: " << whyMessage
+                       << ", waitFor: " << waitFor << ", lockTryInterval: " << lockTryInterval);
+}
 
-    void DistLockManagerMock::shutDown() {
-        uassert(28659,
-                "DistLockManagerMock shut down with outstanding locks present",
-                _locks.empty());
+}  // namespace
+
+DistLockManagerMock::DistLockManagerMock()
+    : _lockReturnStatus{Status::OK()}, _lockChecker{NoLockFuncSet} {}
+
+void DistLockManagerMock::startUp() {}
+
+void DistLockManagerMock::shutDown(OperationContext* txn, bool allowNetworking) {
+    uassert(28659, "DistLockManagerMock shut down with outstanding locks present", _locks.empty());
+}
+
+StatusWith<DistLockManager::ScopedDistLock> DistLockManagerMock::lock(
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    milliseconds waitFor,
+    milliseconds lockTryInterval) {
+    _lockChecker(name, whyMessage, waitFor, lockTryInterval);
+    _lockChecker = NoLockFuncSet;
+
+    if (!_lockReturnStatus.isOK()) {
+        return _lockReturnStatus;
     }
 
-    StatusWith<DistLockManager::ScopedDistLock> DistLockManagerMock::lock(
-            StringData name,
-            StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
-
-        if (!_lockReturnStatus.isOK()) {
-            return _lockReturnStatus;
-        }
-
-        if (_locks.end() != std::find_if(
-                _locks.begin(),
-                _locks.end(),
-                [name](LockInfo info)->bool { return info.name == name; })) {
-            return Status(ErrorCodes::LockBusy,
-                          str::stream() << "Lock \"" << name << "\" is already taken");
-        }
-
-        LockInfo info;
-        info.name = name.toString();
-        info.lockID = DistLockHandle::gen();
-        _locks.push_back(info);
-
-        return DistLockManager::ScopedDistLock(info.lockID, this);
+    if (_locks.end() != std::find_if(_locks.begin(),
+                                     _locks.end(),
+                                     [name](LockInfo info) -> bool { return info.name == name; })) {
+        return Status(ErrorCodes::LockBusy,
+                      str::stream() << "Lock \"" << name << "\" is already taken");
     }
 
-    void DistLockManagerMock::unlock(const DistLockHandle& lockHandle) {
-        std::vector<LockInfo>::iterator it =
-                std::find_if(
-                        _locks.begin(),
-                        _locks.end(),
-                        [&lockHandle](LockInfo info)->bool { return info.lockID == lockHandle; });
-        if (it == _locks.end()) {
-            return;
-        }
-        _locks.erase(it);
-    }
+    LockInfo info;
+    info.name = name.toString();
+    info.lockID = DistLockHandle::gen();
+    _locks.push_back(info);
 
-    Status DistLockManagerMock::checkStatus(const DistLockHandle& lockHandle) {
-        return Status::OK();
-    }
+    return DistLockManager::ScopedDistLock(nullptr, info.lockID, this);
+}
 
-    void DistLockManagerMock::setLockReturnStatus(Status status) {
-        _lockReturnStatus = std::move(status);
+void DistLockManagerMock::unlock(OperationContext* txn, const DistLockHandle& lockHandle) {
+    std::vector<LockInfo>::iterator it =
+        std::find_if(_locks.begin(),
+                     _locks.end(),
+                     [&lockHandle](LockInfo info) -> bool { return info.lockID == lockHandle; });
+    if (it == _locks.end()) {
+        return;
     }
+    _locks.erase(it);
+}
 
+Status DistLockManagerMock::checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) {
+    return Status::OK();
+}
+
+void DistLockManagerMock::expectLock(LockFunc checker, Status status) {
+    _lockReturnStatus = std::move(status);
+    _lockChecker = checker;
+}
 }

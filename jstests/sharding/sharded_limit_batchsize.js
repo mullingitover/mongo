@@ -1,12 +1,15 @@
 // Tests for sharded limit + batchSize. Make sure that various combinations
 // of limit and batchSize with sort return the correct results, and do not issue
 // unnecessary getmores (see SERVER-14299).
+(function() {
+'use strict';
 
 /**
  * Test the correctness of queries with sort and batchSize on a sharded cluster,
  * running the queries against collection 'coll'.
  */
 function testBatchSize(coll) {
+	//Roll the cursor over the second batch and make sure it's correctly sized
     assert.eq(20, coll.find().sort({x: 1}).batchSize(3).itcount());
     assert.eq(15, coll.find().sort({x: 1}).batchSize(3).skip(5).itcount());
 }
@@ -48,7 +51,6 @@ var st = new ShardingTest({
     shards: 2,
     other: {shardOptions: {setParameter: "enableTestCommands=1"}}
 });
-st.stopBalancer();
 
 var db = st.s.getDB("test");
 var shardedCol = db.getCollection("sharded_limit_batchsize");
@@ -58,7 +60,7 @@ unshardedCol.drop();
 
 // Enable sharding and pre-split the sharded collection.
 assert.commandWorked(db.adminCommand({enableSharding: db.getName()}));
-db.adminCommand({movePrimary: db.getName(), to: "shard0000"});
+st.ensurePrimaryShard(db.getName(), "shard0000");
 db.adminCommand({shardCollection: shardedCol.getFullName(), key: {_id: 1}});
 assert.commandWorked(db.adminCommand({split: shardedCol.getFullName(), middle: {_id: 0}}));
 assert.commandWorked(db.adminCommand({moveChunk: shardedCol.getFullName(),
@@ -84,10 +86,12 @@ for (var i=1; i<=10; ++i) {
 //
 
 jsTest.log("Running batchSize tests against sharded collection.");
-testBatchSize(shardedCol, st.shard0);
+st.shard0.adminCommand({setParameter: 1, logLevel : 1});
+testBatchSize(shardedCol);
+st.shard0.adminCommand({setParameter: 1, logLevel : 0});
 
 jsTest.log("Running batchSize tests against non-sharded collection.");
-testBatchSize(unshardedCol, st.shard0);
+testBatchSize(unshardedCol);
 
 //
 // Run tests for limit. These should *not* issue getmores. We confirm this
@@ -111,3 +115,5 @@ jsTest.log("Running limit tests against non-sharded collection.");
 testLimit(unshardedCol, st.shard0);
 
 st.stop();
+
+})();

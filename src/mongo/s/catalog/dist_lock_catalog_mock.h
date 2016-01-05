@@ -30,103 +30,184 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/s/catalog/dist_lock_catalog.h"
-#include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_locks.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-    /**
-     * Mock implementation of DistLockCatalog for testing.
-     *
-     * Example usage:
-     *
-     * DistLockCatalogMock mock;
-     * LocksType badLock;
-     * mock.setSucceedingExpectedGrabLock([](StringData lockID,
-     *                                       const OID& lockSessionID,
-     *                                       StringData who,
-     *                                       StringData processId,
-     *                                       Date_t time,
-     *                                       StringData why) {
-     *   ASSERT_EQUALS("test", lockID);
-     * }, badLock);
-     *
-     * mock.grabLock("test", OID(), "me", "x", Date_t::now(), "end");
-     *
-     * It is also possible to chain the callbacks. For example, if we want to set the test
-     * such that grabLock can only be called once, you can do this:
-     *
-     * DistLockCatalogMock mock;
-     * mock.setSucceedingExpectedGrabLock([&mock](...) {
-     *   mock.expectNoGrabLock();
-     * }, Status::OK());
-     */
-    class DistLockCatalogMock : public DistLockCatalog {
-    public:
-        DistLockCatalogMock();
-        virtual ~DistLockCatalogMock();
+/**
+ * Mock implementation of DistLockCatalog for testing.
+ *
+ * Example usage:
+ *
+ * DistLockCatalogMock mock;
+ * LocksType badLock;
+ * mock.expectGrabLock([](StringData lockID,
+ *                                       const OID& lockSessionID,
+ *                                       StringData who,
+ *                                       StringData processId,
+ *                                       Date_t time,
+ *                                       StringData why) {
+ *   ASSERT_EQUALS("test", lockID);
+ * }, badLock);
+ *
+ * mock.grabLock("test", OID(), "me", "x", Date_t::now(), "end");
+ *
+ * It is also possible to chain the callbacks. For example, if we want to set the test
+ * such that grabLock can only be called once, you can do this:
+ *
+ * DistLockCatalogMock mock;
+ * mock.expectGrabLock([&mock](...) {
+ *   mock.expectNoGrabLock();
+ * }, Status::OK());
+ */
+class DistLockCatalogMock : public DistLockCatalog {
+public:
+    DistLockCatalogMock();
+    virtual ~DistLockCatalogMock();
 
-        using GrabLockFunc = stdx::function<void (StringData lockID,
-                                                  const OID& lockSessionID,
-                                                  StringData who,
-                                                  StringData processId,
-                                                  Date_t time,
-                                                  StringData why)>;
-        using UnlockFunc = stdx::function<void (const OID& lockSessionID)>;
+    using GrabLockFunc = stdx::function<void(StringData lockID,
+                                             const OID& lockSessionID,
+                                             StringData who,
+                                             StringData processId,
+                                             Date_t time,
+                                             StringData why)>;
+    using OvertakeLockFunc = stdx::function<void(StringData lockID,
+                                                 const OID& lockSessionID,
+                                                 const OID& currentHolderTS,
+                                                 StringData who,
+                                                 StringData processId,
+                                                 Date_t time,
+                                                 StringData why)>;
+    using UnlockFunc = stdx::function<void(const OID& lockSessionID)>;
+    using PingFunc = stdx::function<void(StringData processID, Date_t ping)>;
+    using StopPingFunc = stdx::function<void(StringData processID)>;
+    using GetPingFunc = StopPingFunc;
+    using GetLockByTSFunc = stdx::function<void(const OID& ts)>;
+    using GetLockByNameFunc = stdx::function<void(StringData name)>;
+    using GetServerInfoFunc = stdx::function<void()>;
 
-        virtual StatusWith<LockpingsType> getPing(StringData processID) override;
+    virtual StatusWith<LockpingsType> getPing(OperationContext* txn, StringData processID) override;
 
-        virtual Status ping(StringData processID, Date_t ping) override;
+    virtual Status ping(OperationContext* txn, StringData processID, Date_t ping) override;
 
-        virtual StatusWith<LocksType> grabLock(StringData lockID,
+    virtual StatusWith<LocksType> grabLock(OperationContext* txn,
+                                           StringData lockID,
+                                           const OID& lockSessionID,
+                                           StringData who,
+                                           StringData processId,
+                                           Date_t time,
+                                           StringData why) override;
+
+    virtual StatusWith<LocksType> overtakeLock(OperationContext* txn,
+                                               StringData lockID,
                                                const OID& lockSessionID,
+                                               const OID& currentHolderTS,
                                                StringData who,
                                                StringData processId,
                                                Date_t time,
                                                StringData why) override;
 
-        virtual StatusWith<LocksType> overtakeLock(StringData lockID,
-                                                   const OID& lockSessionID,
-                                                   const OID& lockTS,
-                                                   StringData who,
-                                                   StringData processId,
-                                                   Date_t time,
-                                                   StringData why) override;
+    virtual Status unlock(OperationContext* txn, const OID& lockSessionID) override;
 
-        virtual Status unlock(const OID& lockSessionID) override;
+    virtual StatusWith<ServerInfo> getServerInfo(OperationContext* txn) override;
 
-        virtual StatusWith<ServerInfo> getServerInfo() override;
+    virtual StatusWith<LocksType> getLockByTS(OperationContext* txn,
+                                              const OID& lockSessionID) override;
 
-        virtual StatusWith<LocksType> getLockByTS(const OID& ts) override;
+    virtual StatusWith<LocksType> getLockByName(OperationContext* txn, StringData name) override;
 
-        /**
-         * Sets the checker method to use and the return value for grabLock to return every
-         * time it is called.
-         */
-        void setSucceedingExpectedGrabLock(GrabLockFunc checkerFunc,
-                                           StatusWith<LocksType> returnThis);
+    virtual Status stopPing(OperationContext* txn, StringData processId) override;
 
-        /**
-         * Expect grabLock to never be called after this is called.
-         */
-        void expectNoGrabLock();
+    /**
+     * Sets the checker method to use and the return value for grabLock to return every
+     * time it is called.
+     */
+    void expectGrabLock(GrabLockFunc checkerFunc, StatusWith<LocksType> returnThis);
 
-        /**
-         * Sets the checker method to use and the return value for unlock to return every
-         * time it is called.
-         */
-        void setSucceedingExpectedUnLock(UnlockFunc checkerFunc, Status returnThis);
+    /**
+     * Expect grabLock to never be called after this is called.
+     */
+    void expectNoGrabLock();
 
-    private:
-        // Protects all the member variables.
-        stdx::mutex _mutex;
+    /**
+     * Sets the checker method to use and the return value for unlock to return every
+     * time it is called.
+     */
+    void expectUnLock(UnlockFunc checkerFunc, Status returnThis);
 
-        GrabLockFunc _grabLockChecker;
-        StatusWith<LocksType> _grabLockReturnValue;
+    /**
+     * Sets the checker method to use and its return value the every time ping is called.
+     */
+    void expectPing(PingFunc checkerFunc, Status returnThis);
 
-        UnlockFunc _unlockChecker;
-        Status _unlockReturnValue;
-    };
+    /**
+     * Sets the checker method to use and its return value the every time stopPing is called.
+     */
+    void expectStopPing(StopPingFunc checkerFunc, Status returnThis);
+
+    /**
+     * Sets the checker method to use and its return value the every time
+     * getLockByTS is called.
+     */
+    void expectGetLockByTS(GetLockByTSFunc checkerFunc, StatusWith<LocksType> returnThis);
+
+    /**
+     * Sets the checker method to use and its return value the every time
+     * getLockByName is called.
+     */
+    void expectGetLockByName(GetLockByNameFunc checkerFunc, StatusWith<LocksType> returnThis);
+
+    /**
+     * Sets the checker method to use and its return value the every time
+     * overtakeLock is called.
+     */
+    void expectOvertakeLock(OvertakeLockFunc checkerFunc, StatusWith<LocksType> returnThis);
+
+    /**
+     * Sets the checker method to use and its return value the every time
+     * getPing is called.
+     */
+    void expectGetPing(GetPingFunc checkerFunc, StatusWith<LockpingsType> returnThis);
+
+    /**
+     * Sets the checker method to use and its return value the every time
+     * getServerInfo is called.
+     */
+    void expectGetServerInfo(GetServerInfoFunc checkerFunc,
+                             StatusWith<DistLockCatalog::ServerInfo> returnThis);
+
+private:
+    // Protects all the member variables.
+    stdx::mutex _mutex;
+
+    GrabLockFunc _grabLockChecker;
+    StatusWith<LocksType> _grabLockReturnValue;
+
+    UnlockFunc _unlockChecker;
+    Status _unlockReturnValue;
+
+    PingFunc _pingChecker;
+    Status _pingReturnValue;
+
+    StopPingFunc _stopPingChecker;
+    Status _stopPingReturnValue;
+
+    GetLockByTSFunc _getLockByTSChecker;
+    StatusWith<LocksType> _getLockByTSReturnValue;
+
+    GetLockByNameFunc _getLockByNameChecker;
+    StatusWith<LocksType> _getLockByNameReturnValue;
+
+    OvertakeLockFunc _overtakeLockChecker;
+    StatusWith<LocksType> _overtakeLockReturnValue;
+
+    GetPingFunc _getPingChecker;
+    StatusWith<LockpingsType> _getPingReturnValue;
+
+    GetServerInfoFunc _getServerInfoChecker;
+    StatusWith<DistLockCatalog::ServerInfo> _getServerInfoReturnValue;
+};
 }

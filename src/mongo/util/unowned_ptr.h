@@ -28,79 +28,86 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/static_assert.hpp>
 #include <memory>
 #include <type_traits>
 
 namespace mongo {
 
-    /**
-     * A "smart" pointer that explicitly indicates a lack of ownership.
-     * It will implicitly convert from any compatible pointer type except auto_ptr.
-     *
-     * Note that like other pointer types const applies to the pointer not the pointee:
-     * - const unowned_ptr<T>  =>  T* const
-     * - unowned_ptr<const T>  =>  const T*
-     */
-    template <typename T>
-    struct unowned_ptr {
-        unowned_ptr() = default;
+/**
+ * A "smart" pointer that explicitly indicates a lack of ownership.
+ * It will implicitly convert from any compatible pointer type except auto_ptr.
+ *
+ * Note that like other pointer types const applies to the pointer not the pointee:
+ * - const unowned_ptr<T>  =>  T* const
+ * - unowned_ptr<const T>  =>  const T*
+ */
+template <typename T>
+struct unowned_ptr {
+    unowned_ptr() = default;
 
-        //
-        // Implicit conversions from compatible pointer types
-        //
+    //
+    // Implicit conversions from compatible pointer types
+    //
 
-        // Removes conversions from overload resolution if the underlying pointer types aren't
-        // convertible. This makes this class behave more like a bare pointer.
-        template <typename U>
-        using IfConvertibleFrom = typename std::enable_if<std::is_convertible<U*, T*>::value>::type;
+    // Removes conversions from overload resolution if the underlying pointer types aren't
+    // convertible. This makes this class behave more like a bare pointer.
+    template <typename U>
+    using IfConvertibleFrom = typename std::enable_if<std::is_convertible<U*, T*>::value>::type;
 
-        // Needed for NULL since it won't match U* constructor.
-        unowned_ptr(T* p) : _p(p) {}
+    // Needed for NULL since it won't match U* constructor.
+    unowned_ptr(T* p) : _p(p) {}
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(U* p) : _p(p) {}
+    template <typename U, typename = IfConvertibleFrom<U>>
+    unowned_ptr(U* p)
+        : _p(p) {}
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(const unowned_ptr<U>& p) : _p(p) {}
+    template <typename U, typename = IfConvertibleFrom<U>>
+    unowned_ptr(const unowned_ptr<U>& p)
+        : _p(p) {}
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(const std::unique_ptr<U>& p) : _p(p.get()) {}
+    template <typename U, typename = IfConvertibleFrom<U>>
+    unowned_ptr(const std::unique_ptr<U>& p)
+        : _p(p.get()) {}
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(const std::shared_ptr<U>& p) : _p(p.get()) {}
+    template <typename U, typename = IfConvertibleFrom<U>>
+    unowned_ptr(const std::shared_ptr<U>& p)
+        : _p(p.get()) {}
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(const boost::shared_ptr<U>& p) : _p(p.get()) {}
+    //
+    // Modifiers
+    //
 
-        template<typename U, typename = IfConvertibleFrom<U>>
-        unowned_ptr(const boost::scoped_ptr<U>& p) : _p(p.get()) {}
+    void reset(unowned_ptr p = nullptr) {
+        _p = p.get();
+    }
+    void swap(unowned_ptr& other) {
+        std::swap(_p, other._p);
+    }
 
-        //
-        // Modifiers
-        //
+    //
+    // Accessors
+    //
 
-        void reset(unowned_ptr p = nullptr) { _p = p.get(); }
-        void swap(unowned_ptr& other) { std::swap(_p, other._p); }
+    T* get() const {
+        return _p;
+    }
+    operator T*() const {
+        return _p;
+    }
 
-        //
-        // Accessors
-        //
+    //
+    // Pointer syntax
+    //
 
-        T* get() const { return _p; }
-        operator T*() const { return _p; }
+    T* operator->() const {
+        return _p;
+    }
+    T& operator*() const {
+        return *_p;
+    }
 
-        //
-        // Pointer syntax
-        //
+private:
+    T* _p = nullptr;
+};
 
-        T* operator->() const { return _p; }
-        T& operator*() const { return *_p; }
-
-    private:
-        T* _p = nullptr;
-    };
-
-} // namespace mongo
+}  // namespace mongo

@@ -36,7 +36,10 @@
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_string_data.h"
 #include "mongo/base/data_type_terminated.h"
+#include "mongo/base/data_type_validated.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
@@ -44,85 +47,93 @@
 namespace mongo {
 namespace rpc {
 
-    namespace {
-        // None of these include null byte
-        const std::size_t kMaxDatabaseLength = 63;
-        const std::size_t kMinDatabaseLength = 1;
+namespace {
+// None of these include null byte
+const std::size_t kMaxDatabaseLength = 63;
+const std::size_t kMinDatabaseLength = 1;
 
-        const std::size_t kMinCommandNameLength = 1;
-        const std::size_t kMaxCommandNameLength = 128;
+const std::size_t kMinCommandNameLength = 1;
+const std::size_t kMaxCommandNameLength = 128;
 
-    }  // namespace
+}  // namespace
 
-    CommandRequest::CommandRequest(const Message* message)
-        : _message(message) {
-        char* begin = _message->singleData().data();
-        std::size_t length = _message->singleData().dataLen();
+CommandRequest::CommandRequest(const Message* message) : _message(message) {
+    char* begin = _message->singleData().data();
+    std::size_t length = _message->singleData().dataLen();
 
-        // checked in message_port.cpp
-        invariant(length <= MaxMessageSizeBytes);
+    // checked in message_port.cpp
+    invariant(length <= MaxMessageSizeBytes);
 
-        const char* messageEnd = begin + length;
+    const char* messageEnd = begin + length;
 
-        ConstDataRangeCursor cur(begin, messageEnd);
+    ConstDataRangeCursor cur(begin, messageEnd);
 
-        _database = uassertStatusOK(cur.readAndAdvance<Terminated<'\0', StringData>>());
+    Terminated<'\0', StringData> str;
+    uassertStatusOK(cur.readAndAdvance<>(&str));
+    _database = std::move(str.value);
 
-        uassert(28636, str::stream() << "Database parsed in OP_COMMAND message must be between"
-                                     << kMinDatabaseLength << " and " << kMaxDatabaseLength
-                                     << " bytes. Got: " << _database,
-                (_database.size() >= kMinDatabaseLength) &&
-                (_database.size() <= kMaxDatabaseLength));
+    uassert(28636,
+            str::stream() << "Database parsed in OP_COMMAND message must be between"
+                          << kMinDatabaseLength << " and " << kMaxDatabaseLength
+                          << " bytes. Got: " << _database,
+            (_database.size() >= kMinDatabaseLength) && (_database.size() <= kMaxDatabaseLength));
 
-        _commandName = uassertStatusOK(cur.readAndAdvance<Terminated<'\0', StringData>>());
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid database name: '" << _database << "'",
+            NamespaceString::validDBName(_database));
 
-        uassert(28637, str::stream() << "Command name parsed in OP_COMMAND message must be between"
-                                     << kMinCommandNameLength << " and " << kMaxCommandNameLength
-                                     << " bytes. Got: " << _database,
-                (_commandName.size() >= kMinCommandNameLength) &&
+    uassertStatusOK(cur.readAndAdvance<>(&str));
+    _commandName = std::move(str.value);
+
+    uassert(28637,
+            str::stream() << "Command name parsed in OP_COMMAND message must be between"
+                          << kMinCommandNameLength << " and " << kMaxCommandNameLength
+                          << " bytes. Got: " << _database,
+            (_commandName.size() >= kMinCommandNameLength) &&
                 (_commandName.size() <= kMaxCommandNameLength));
 
-        uassertStatusOK(cur.readAndAdvance<BSONObj>(&_metadata));
-        uassertStatusOK(cur.readAndAdvance<BSONObj>(&_commandArgs));
-        _inputDocs = DocumentRange{cur.data(), messageEnd};
-    }
+    Validated<BSONObj> obj;
+    uassertStatusOK(cur.readAndAdvance<>(&obj));
+    _commandArgs = std::move(obj.val);
+    uassertStatusOK(cur.readAndAdvance<>(&obj));
+    _metadata = std::move(obj.val);
 
-    StringData CommandRequest::getDatabase() const {
-        return _database;
-    }
+    _inputDocs = DocumentRange{cur.data(), messageEnd};
+}
 
-    StringData CommandRequest::getCommandName() const {
-        return _commandName;
-    }
+StringData CommandRequest::getDatabase() const {
+    return _database;
+}
 
-    const BSONObj& CommandRequest::getMetadata() const {
-        return _metadata;
-    }
+StringData CommandRequest::getCommandName() const {
+    return _commandName;
+}
 
-    const BSONObj& CommandRequest::getCommandArgs() const {
-        return _commandArgs;
-    }
+const BSONObj& CommandRequest::getMetadata() const {
+    return _metadata;
+}
 
-    DocumentRange CommandRequest::getInputDocs() const {
-        return _inputDocs;
-    }
+const BSONObj& CommandRequest::getCommandArgs() const {
+    return _commandArgs;
+}
 
-    bool operator==(const CommandRequest& lhs, const CommandRequest& rhs) {
-        return std::tie(lhs._database,
-                        lhs._commandName,
-                        lhs._metadata,
-                        lhs._commandArgs,
-                        lhs._inputDocs) ==
-               std::tie(rhs._database,
-                        rhs._commandName,
-                        rhs._metadata,
-                        rhs._commandArgs,
-                        rhs._inputDocs);
-    }
+DocumentRange CommandRequest::getInputDocs() const {
+    return _inputDocs;
+}
 
-    bool operator!=(const CommandRequest& lhs, const CommandRequest& rhs) {
-        return !(lhs == rhs);
-    }
+bool operator==(const CommandRequest& lhs, const CommandRequest& rhs) {
+    return std::tie(
+               lhs._database, lhs._commandName, lhs._metadata, lhs._commandArgs, lhs._inputDocs) ==
+        std::tie(rhs._database, rhs._commandName, rhs._metadata, rhs._commandArgs, rhs._inputDocs);
+}
+
+bool operator!=(const CommandRequest& lhs, const CommandRequest& rhs) {
+    return !(lhs == rhs);
+}
+
+Protocol CommandRequest::getProtocol() const {
+    return rpc::Protocol::kOpCommandV1;
+}
 
 }  // namespace rpc
 }  // namespace mongo

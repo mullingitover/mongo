@@ -33,20 +33,27 @@ MONGO_RUNNER_SUBDIR = "mongorunner"
 
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
+    "basePort": 20000,
     "buildloggerUrl": "https://logkeeper.mongodb.org",
     "continueOnFailure": False,
     "dbpathPrefix": None,
     "dbtest": None,
     "dryRun": None,
+    "excludeWithAllTags": None,
+    "excludeWithAnyTags": None,
+    "includeWithAllTags": None,
+    "includeWithAnyTags": None,
     "jobs": 1,
     "mongo": None,
     "mongod": None,
+    "mongodSetParameters": None,
     "mongos": None,
-    "nojournal": None,
-    "nopreallocj": None,
+    "mongosSetParameters": None,
+    "nojournal": False,
     "repeat": 1,
     "reportFile": None,
     "seed": long(time.time() * 256),  # Taken from random.py code in Python 2.7.
+    "shellReadMode": None,
     "shellWriteMode": None,
     "shuffle": False,
     "storageEngine": None,
@@ -59,6 +66,10 @@ DEFAULTS = {
 ##
 # Variables that are set by the user at the command line or with --options.
 ##
+
+# The starting port number to use for mongod and mongos processes spawned by resmoke.py and the
+# mongo shell.
+BASE_PORT = None
 
 # The root url of the buildlogger server.
 BUILDLOGGER_URL = None
@@ -74,8 +85,22 @@ DBTEST_EXECUTABLE = None
 # actually running them).
 DRY_RUN = None
 
+# If set, then any jstests that have all of the specified tags will be excluded from the suite(s).
+EXCLUDE_WITH_ALL_TAGS = None
+
+# If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
+EXCLUDE_WITH_ANY_TAGS = None
+
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
+
+# If set, then only jstests that have all of the specified tags will be run during the jstest
+# portion of the suite(s).
+INCLUDE_WITH_ALL_TAGS = None
+
+# If set, then only jstests that have at least one of the specified tags will be run during the
+# jstest portion of the suite(s).
+INCLUDE_WITH_ANY_TAGS = None
 
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
@@ -86,8 +111,14 @@ MONGO_EXECUTABLE = None
 # The path to the mongod executable used by resmoke.py.
 MONGOD_EXECUTABLE = None
 
+# The --setParameter options passed to mongod.
+MONGOD_SET_PARAMETERS = None
+
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
+
+# The --setParameter options passed to mongos.
+MONGOS_SET_PARAMETERS = None
 
 # If true, then all mongod's started by resmoke.py and by the mongo shell will not have journaling
 # enabled.
@@ -106,6 +137,9 @@ REPEAT = None
 
 # If set, then resmoke.py will write out a report file with the status of each test that ran.
 REPORT_FILE = None
+
+# If set, then mongo shells started by resmoke.py will use the specified read mode.
+SHELL_READ_MODE = None
 
 # If set, then mongo shells started by resmoke.py will use the specified write mode.
 SHELL_WRITE_MODE = None

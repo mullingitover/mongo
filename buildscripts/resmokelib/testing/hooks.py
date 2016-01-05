@@ -8,6 +8,7 @@ from __future__ import absolute_import
 import os
 import sys
 
+import bson
 import pymongo
 
 from . import fixtures
@@ -123,7 +124,7 @@ class CleanEveryN(CustomBehavior):
 
             # Raise this after calling setup in case --continueOnFailure was specified.
             if not teardown_success:
-                raise errors.ServerFailure("%s did not exit cleanly" % (self.fixture))
+                raise errors.TestFailure("%s did not exit cleanly" % (self.fixture))
 
 
 class CheckReplDBHash(CustomBehavior):
@@ -363,9 +364,9 @@ class CheckReplDBHash(CustomBehavior):
 
             # 'sb' already describes which collections are missing where.
             for coll_name in missing_on_primary:
-                CheckReplDBHash._dump_all_documents(primary_db, coll_name, sb)
-            for coll_name in missing_on_secondary:
                 CheckReplDBHash._dump_all_documents(secondary_db, coll_name, sb)
+            for coll_name in missing_on_secondary:
+                CheckReplDBHash._dump_all_documents(primary_db, coll_name, sb)
             return
 
         for coll_name in primary_coll_names & secondary_coll_names:
@@ -409,8 +410,10 @@ class CheckReplDBHash(CustomBehavior):
         collection on the secondary, if any.
         """
 
-        primary_coll = primary_db[coll_name]
-        secondary_coll = secondary_db[coll_name]
+        codec_options = bson.CodecOptions(document_class=bson.SON)
+
+        primary_coll = primary_db.get_collection(coll_name, codec_options=codec_options)
+        secondary_coll = secondary_db.get_collection(coll_name, codec_options=codec_options)
 
         primary_docs = CheckReplDBHash._extract_documents(primary_coll)
         secondary_docs = CheckReplDBHash._extract_documents(secondary_coll)
@@ -460,6 +463,8 @@ class CheckReplDBHash(CustomBehavior):
                 sb.append("Mismatching document:")
                 sb.append("    primary:   %s" % (primary_doc))
                 sb.append("    secondary: %s" % (secondary_doc))
+                p_idx += 1
+                s_idx += 1
 
             # One node was missing a document. Since the documents are sorted by _id, the doc with
             # the smaller _id was the one that was skipped.
@@ -528,13 +533,13 @@ class CheckReplDBHash(CustomBehavior):
             sb.append("The following %ss were present on the secondary, but not on the"
                       " primary:" % (item_type_name))
             for item in missing_on_primary:
-                sb.append(item)
+                sb.append(str(item))
 
         if missing_on_secondary:
             sb.append("The following %ss were present on the primary, but not on the"
                       " secondary:" % (item_type_name))
             for item in missing_on_secondary:
-                sb.append(item)
+                sb.append(str(item))
 
     @staticmethod
     def _dump_all_collections(database, coll_names, sb):
